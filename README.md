@@ -22,6 +22,17 @@ Quick links:
 - [GO Docs](https://pkg.go.dev/github.com/emiago/diago)
 - [Roadmap](https://emiago.github.io/diago/docs/#core-roadmap)
 
+## WebRTC/Pion API changes
+
+For WebRTC/Pion migration details and current media API direction, read
+[WEBRTC_PION_CHANGES.md](WEBRTC_PION_CHANGES.md).
+
+**NOTE:** SIP dialog sessions and media stacks are now separated. Use returned
+media objects such as `*DialogMedia` and `*DialogWebrtc` for media operations.
+
+**NOTE:** Existing code using dialog-owned media access should be migrated to the
+new returned-media API.
+
 *If you find this project useful and you want to support/sponzor or need help with your projects, you can contact me more on*
 [mail](mailto:emirfreelance91@gmail.com).
 
