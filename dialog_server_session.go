@@ -46,7 +46,27 @@ type DialogServerSession struct {
 	// refresher and reset on an inbound refresh re-INVITE. Guarded by d.mu.
 	watchdog *peerRefreshWatchdog
 
+	// terminatingBye holds the BYE request that ended this dialog, captured by
+	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
+	// ReadBye answers 200 and drops the request, so an application observes the
+	// ending only as a Context() cancel and cannot see a cause the peer stated
+	// for itself, such as an RFC 3326 Reason header.
+	//
+	// nil until a remote BYE arrives. A local Hangup, a transport death or a
+	// cancel all leave it nil, which is the truthful "the peer stated no cause".
+	terminatingBye atomic.Pointer[sip.Request]
+
 	closed atomic.Uint32
+}
+
+// TerminatingBye returns the BYE request that ended this dialog, or nil when the
+// dialog was not ended by a remote BYE or has not ended yet. The request is
+// read-only; callers must not mutate it.
+//
+// Safe to call from any goroutine. The store happens before the dialog moves to
+// DialogStateEnded, so an observer that reacts to Context() being done sees it.
+func (d *DialogServerSession) TerminatingBye() *sip.Request {
+	return d.terminatingBye.Load()
 }
 
 func (d *DialogServerSession) Id() string {
@@ -481,6 +501,29 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
+}
+
+// ReadBye stashes the terminating BYE and then hands it to the embedded session,
+// which owns every part of BYE handling: validation, the 200, and the move to
+// DialogStateEnded. Nothing about that changes here — the request is recorded,
+// never acted upon differently — so BYE semantics are identical for every
+// caller.
+//
+// The stash must precede the delegation, because the delegate is what ends the
+// dialog: storing afterwards would let an observer woken by Context() read nil.
+// A rejected BYE is therefore rolled back rather than pre-filtered, which keeps
+// validation in one place instead of duplicating the embedded session's rules
+// here and letting the copies drift. Such a BYE is briefly visible, but it is
+// one no observer can be looking at: only a BYE the delegate accepts ends the
+// dialog, and until the dialog ends nothing has cause to read the stash.
+func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	d.terminatingBye.Store(req)
+	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
+		// Not this dialog's ending: leave no cause planted on it.
+		d.terminatingBye.CompareAndSwap(req, nil)
+		return err
+	}
+	return nil
 }
 
 func (d *DialogServerSession) Hangup(ctx context.Context) error {
