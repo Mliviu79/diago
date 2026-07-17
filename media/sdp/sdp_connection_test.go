@@ -60,8 +60,8 @@ func TestConnectionInformationSessionLevel(t *testing.T) {
 // TestConnectionInformationMultipleMediaLines documents why taking the last c=
 // is sound. Line order alone cannot bind a c= to its section, so with several m=
 // lines the last c= may belong to some other stream. MediaDescription already
-// rejects that body per RFC 3264, and ConnectionInformation rejects it for the
-// same reason rather than quietly answering with the video section's address.
+// rejects that body, and ConnectionInformation rejects it for the same reason
+// rather than quietly answering with the video section's address.
 func TestConnectionInformationMultipleMediaLines(t *testing.T) {
 	sd := SessionDescription{}
 	require.NoError(t, Unmarshal(offer(

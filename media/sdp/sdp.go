@@ -125,9 +125,9 @@ type ConnectionInformation struct {
 // media stream. Per RFC 4566 section 5.7 a c= inside the media section overrides
 // the session level one, so the last c= wins. Line order alone cannot bind a c=
 // to its section, so this is only sound while the body carries a single m= line,
-// which MediaDescription already requires per RFC 3264. Bodies with more media
-// lines are rejected here as well rather than answering with an address that may
-// belong to another stream.
+// which MediaDescription already requires. Bodies with more media lines are
+// rejected here as well rather than answering with an address that may belong to
+// another stream.
 func (sd SessionDescription) ConnectionInformation() (ci ConnectionInformation, err error) {
 	if len(sd.Values("m")) > 1 {
 		return ci, fmt.Errorf("more than 1 media line")
