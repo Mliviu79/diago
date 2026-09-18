@@ -717,6 +717,29 @@ func (d *DialogServerSession) ReferOptions(ctx context.Context, referTo sip.Uri,
 	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.OnNotify == nil, opts.Headers...)
 }
 
+// ReferAndObserve sends a blind REFER for referTo and returns what the far end
+// sent back: the REFER's final response, the status line of each NOTIFY and how
+// the wait ended. The wait for a final NOTIFY is bounded by opts.Deadline; a
+// terminal NOTIFY that arrives after the wait goes to opts.OnLate. Neither this
+// method nor any NOTIFY ends the dialog, so what follows the outcome is the
+// caller's decision. Referred-By names this side: the Contact of the 200 OK we
+// answered with. It installs no callback on the dialog, so it does not change
+// what a later Refer or ReferOptions call reports.
+func (d *DialogServerSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {
+	d.mu.Lock()
+	recipient := d.remoteContactUnsafe()
+	ourContact := d.InviteResponse.Contact()
+	d.mu.Unlock()
+	if recipient == nil {
+		return ReferObservation{}, fmt.Errorf("refer: dialog has no remote contact")
+	}
+	if ourContact == nil {
+		return ReferObservation{}, fmt.Errorf("refer: dialog has no local contact")
+	}
+	obs, _, err := dialogReferObserve(ctx, d, recipient.Address, referTo, ourContact.Address, opts)
+	return obs, err
+}
+
 func (d *DialogServerSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
 	dialogHandleReferNotify(d, req, tx)
 }

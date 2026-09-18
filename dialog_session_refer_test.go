@@ -1139,3 +1139,372 @@ func requireDialogStaysConfirmed(t *testing.T, d DialogSession, window time.Dura
 	}
 	require.Equal(t, sip.DialogStateConfirmed, d.DialogSIP().LoadState(), "the dialog left the confirmed state")
 }
+
+// observingReferrer is a dialog session that can send an observed REFER. Both
+// DialogClientSession and DialogServerSession satisfy it with one signature.
+type observingReferrer interface {
+	DialogSession
+	ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error)
+}
+
+var (
+	_ observingReferrer = (*DialogClientSession)(nil)
+	_ observingReferrer = (*DialogServerSession)(nil)
+)
+
+// observedReferCall is one answered call whose dialog refers the far end, with
+// the Contact each side put on the INVITE transaction.
+type observedReferCall struct {
+	dialog        observingReferrer
+	ourContact    sip.Uri
+	farEndContact sip.Uri
+}
+
+// observedReferTransferee is the far end of an observed REFER. For each referral
+// it records the Referred-By the referred INVITE carries, keyed by the Refer-To
+// user, then invites the target, acks and hangs up the referred leg. A referral
+// that finds a hold set waits for its release before inviting the target.
+type observedReferTransferee struct {
+	ctx      context.Context
+	handlers sync.WaitGroup
+
+	mu         sync.Mutex
+	hold       chan struct{}
+	referredBy map[string]string
+}
+
+func newObservedReferTransferee(ctx context.Context) *observedReferTransferee {
+	return &observedReferTransferee{ctx: ctx, referredBy: map[string]string{}}
+}
+
+func (tr *observedReferTransferee) onRefer(referDialog *DialogClientSession) error {
+	tr.handlers.Add(1)
+	defer tr.handlers.Done()
+
+	var referredBy string
+	if h := referDialog.InviteRequest.GetHeader("Referred-By"); h != nil {
+		referredBy = h.Value()
+	}
+	tr.mu.Lock()
+	tr.referredBy[referDialog.InviteRequest.Recipient.User] = referredBy
+	hold := tr.hold
+	tr.hold = nil
+	tr.mu.Unlock()
+
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-tr.ctx.Done():
+			return tr.ctx.Err()
+		}
+	}
+	if err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
+		return err
+	}
+	if err := referDialog.Ack(tr.ctx); err != nil {
+		return err
+	}
+	return referDialog.Hangup(referDialog.Context())
+}
+
+// holdNextReferral makes the next referral wait until release is called.
+// release is idempotent and also runs when t ends, so no referral stays held
+// past the test that set it.
+func (tr *observedReferTransferee) holdNextReferral(t *testing.T) (release func()) {
+	t.Helper()
+
+	hold := make(chan struct{})
+	tr.mu.Lock()
+	tr.hold = hold
+	tr.mu.Unlock()
+
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// referredByFor returns the Referred-By value recorded for the referral to user.
+func (tr *observedReferTransferee) referredByFor(user string) (string, bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	value, ok := tr.referredBy[user]
+	return value, ok
+}
+
+// awaitHandlers fails t unless every referral handler returned within 5s.
+func (tr *observedReferTransferee) awaitHandlers(t *testing.T) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		tr.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("a referral handler was still running 5s after the test")
+	}
+}
+
+// requireNoIntOnlyNotifyCallback fails if d carries the int-only NOTIFY
+// callback of ReferOptions: ReferAndObserve must not install it, since it is
+// sticky on the dialog and later REFERs would report to it.
+func requireNoIntOnlyNotifyCallback(t *testing.T, d DialogSession) {
+	t.Helper()
+
+	med := d.Media()
+	med.mu.Lock()
+	installed := med.onReferNotify != nil
+	med.mu.Unlock()
+	require.False(t, installed, "ReferAndObserve installed the int-only NOTIFY callback")
+}
+
+// TestIntegrationDialogReferAndObserve runs ReferAndObserve over real UAs with
+// each session type as the referrer. A refused transfer and a late outcome both
+// leave the referring dialog confirmed, the late outcome reaches OnLate for its
+// own attempt, and the Referred-By the transferee receives names our Contact.
+func TestIntegrationDialogReferAndObserve(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	transferee := newObservedReferTransferee(ctx)
+	target := sip.Uri{Host: "127.0.0.1", Port: 15090}
+
+	// Refer target: refuses the busy user and answers any other.
+	{
+		ua, _ := sipgo.NewUA()
+		t.Cleanup(func() { ua.Close() })
+
+		dg := NewDiago(ua, WithTransport(
+			Transport{
+				Transport: "udp",
+				BindHost:  "127.0.0.1",
+				BindPort:  15090,
+			},
+		))
+		require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			if d.ToUser() == "busy" {
+				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+				return
+			}
+			d.Answer()
+			<-d.Context().Done()
+		}))
+	}
+
+	t.Run("client session", func(t *testing.T) {
+		// Transferee: answers our INVITE and acts on the REFER.
+		{
+			ua, _ := sipgo.NewUA()
+			t.Cleanup(func() { ua.Close() })
+
+			dg := NewDiago(ua, WithTransport(
+				Transport{
+					Transport: "udp",
+					BindHost:  "127.0.0.1",
+					BindPort:  15091,
+					ID:        "udp",
+				},
+			))
+			require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {
+				d.AnswerOptions(AnswerOptions{OnRefer: transferee.onRefer})
+				<-d.Context().Done()
+			}))
+		}
+
+		ua, _ := sipgo.NewUA()
+		t.Cleanup(func() { ua.Close() })
+
+		referrer := NewDiago(ua, WithTransport(
+			Transport{
+				Transport: "udp",
+				BindHost:  "127.0.0.1",
+				BindPort:  15092,
+			},
+		))
+		require.NoError(t, referrer.ServeBackground(ctx, nil))
+		t.Cleanup(func() { transferee.awaitHandlers(t) })
+
+		dial := func(t *testing.T) observedReferCall {
+			d, err := referrer.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15091}, InviteOptions{})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				d.Hangup(ctx)
+				d.Close()
+			})
+			return observedReferCall{
+				dialog:        d,
+				ourContact:    d.InviteRequest.Contact().Address,
+				farEndContact: d.InviteResponse.Contact().Address,
+			}
+		}
+		runObservedReferCases(t, dial, transferee, target, "client")
+	})
+
+	t.Run("server session", func(t *testing.T) {
+		// Dialer: calls the referrer and is the transferee of its REFER.
+		var dialer *Diago
+		{
+			ua, _ := sipgo.NewUA()
+			t.Cleanup(func() { ua.Close() })
+
+			dialer = NewDiago(ua, WithTransport(
+				Transport{
+					Transport: "udp",
+					BindHost:  "127.0.0.1",
+					BindPort:  15094,
+					ID:        "udp",
+				},
+			))
+			require.NoError(t, dialer.ServeBackground(ctx, nil))
+		}
+
+		ua, _ := sipgo.NewUA()
+		t.Cleanup(func() { ua.Close() })
+
+		referrer := NewDiago(ua, WithTransport(
+			Transport{
+				Transport: "udp",
+				BindHost:  "127.0.0.1",
+				BindPort:  15093,
+			},
+		))
+		received := make(chan *DialogServerSession)
+		require.NoError(t, referrer.ServeBackground(ctx, func(d *DialogServerSession) {
+			select {
+			case received <- d:
+			case <-ctx.Done():
+				return
+			}
+			<-d.Context().Done()
+		}))
+		t.Cleanup(func() { transferee.awaitHandlers(t) })
+
+		dial := func(t *testing.T) observedReferCall {
+			dialog, err := dialer.NewDialog(sip.Uri{User: "referrer", Host: "127.0.0.1", Port: 15093}, NewDialogOptions{})
+			require.NoError(t, err)
+			t.Cleanup(func() { dialog.Close() })
+
+			dialed := make(chan error, 1)
+			go func() {
+				err := dialog.Invite(ctx, InviteClientOptions{OnRefer: transferee.onRefer})
+				if err == nil {
+					err = dialog.Ack(ctx)
+				}
+				dialed <- err
+			}()
+
+			var d *DialogServerSession
+			select {
+			case d = <-received:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the referrer did not receive the INVITE within 5s")
+			}
+			t.Cleanup(func() {
+				d.Hangup(ctx)
+				d.Close()
+			})
+			require.NoError(t, d.Answer())
+
+			select {
+			case err := <-dialed:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the dialer's INVITE did not complete within 5s")
+			}
+			return observedReferCall{
+				dialog:        d,
+				ourContact:    d.InviteResponse.Contact().Address,
+				farEndContact: d.InviteRequest.Contact().Address,
+			}
+		}
+		runObservedReferCases(t, dial, transferee, target, "server")
+	})
+}
+
+// runObservedReferCases runs the ReferAndObserve cases on calls from dial.
+// userSuffix keeps each group's Refer-To users apart in the transferee's record.
+func runObservedReferCases(t *testing.T, dial func(t *testing.T) observedReferCall, transferee *observedReferTransferee, target sip.Uri, userSuffix string) {
+	t.Run("a refusal keeps the dialog", func(t *testing.T) {
+		call := dial(t)
+
+		busy := target
+		busy.User = "busy"
+		obs, err := call.dialog.ReferAndObserve(call.dialog.Context(), busy, ReferObserveOptions{Deadline: 5 * time.Second})
+		require.NoError(t, err)
+
+		assert.Equal(t, ReferEndFinalNotify, obs.End)
+		assert.True(t, obs.ResponseReceived, "the REFER's final response is recorded")
+		assert.True(t, obs.Response.Status >= 200 && obs.Response.Status < 300, "the REFER was accepted, got %d", obs.Response.Status)
+		require.NotEmpty(t, obs.Notifies, "the far end's NOTIFYs are recorded")
+		assert.Equal(t, 100, obs.Notifies[0].Status)
+		last, ok := obs.LastNotify()
+		require.True(t, ok)
+		assert.Equal(t, sip.StatusBusyHere, last.Status)
+		requireNoIntOnlyNotifyCallback(t, call.dialog)
+
+		requireDialogStaysConfirmed(t, call.dialog, 750*time.Millisecond)
+	})
+
+	t.Run("a late outcome reaches OnLate and keeps the dialog", func(t *testing.T) {
+		call := dial(t)
+
+		late := make(chan ReferLateNotify, 4)
+		release := transferee.holdNextReferral(t)
+		answering := target
+		answering.User = "late-" + userSuffix
+		obs, err := call.dialog.ReferAndObserve(call.dialog.Context(), answering, ReferObserveOptions{
+			Deadline: 300 * time.Millisecond,
+			OnLate: func(n ReferLateNotify) {
+				select {
+				case late <- n:
+				default:
+				}
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, ReferEndDeadline, obs.End, "a held referral ends the wait on the deadline")
+
+		release()
+		select {
+		case n := <-late:
+			assert.Equal(t, obs.CSeq, n.CSeq, "the late NOTIFY is delivered for this attempt")
+			assert.True(t, n.CSeqKnown)
+			assert.Equal(t, 200, n.Notify.Status)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no terminal NOTIFY reached OnLate within 5s of releasing the referral")
+		}
+		requireNoIntOnlyNotifyCallback(t, call.dialog)
+
+		requireDialogStaysConfirmed(t, call.dialog, 750*time.Millisecond)
+	})
+
+	t.Run("Referred-By names our own contact", func(t *testing.T) {
+		call := dial(t)
+
+		answering := target
+		answering.User = "referred-by-" + userSuffix
+		obs, err := call.dialog.ReferAndObserve(call.dialog.Context(), answering, ReferObserveOptions{Deadline: 5 * time.Second})
+		require.NoError(t, err)
+		require.Equal(t, ReferEndFinalNotify, obs.End)
+		requireNoIntOnlyNotifyCallback(t, call.dialog)
+
+		value, ok := transferee.referredByFor(answering.User)
+		require.True(t, ok, "the transferee received no referral")
+		require.NotEmpty(t, value, "the referred INVITE carried no Referred-By")
+
+		var referrer sip.Uri
+		params := sip.NewParams()
+		_, err = sip.ParseAddressValue(value, &referrer, &params)
+		require.NoError(t, err)
+
+		assert.Equal(t, call.ourContact.User, referrer.User)
+		assert.Equal(t, call.ourContact.Host, referrer.Host)
+		assert.Equal(t, call.ourContact.Port, referrer.Port)
+		farEnd := call.farEndContact
+		assert.False(t, referrer.User == farEnd.User && referrer.Host == farEnd.Host && referrer.Port == farEnd.Port,
+			"Referred-By names the far end %s", farEnd.String())
+	})
+}
