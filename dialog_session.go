@@ -63,6 +63,55 @@ func (e *ReferFailureError) Error() string {
 	return fmt.Sprintf("refer transfer failed: %d %s", e.Status, e.Reason)
 }
 
+// referCarryError is what the observing REFER returns when the REFER could not
+// be carried. sipgo builds that error from the REFER's request line, which is
+// the far end's Contact URI with its user part, and from socket addresses, so
+// its text is dropped and only its class is kept.
+//
+// The type has no unwrapping method and implements neither fmt.Formatter nor an
+// error-list method: errors.As, %+v and structured loggers reach Error() only.
+type referCarryError struct {
+	cause error
+}
+
+// Error renders fixed text, followed by the transaction or context class the
+// failure wrapped when it is one this package names. It never renders the
+// cause's own text.
+func (e *referCarryError) Error() string {
+	class := referCarryClass(e.cause)
+	if class == nil {
+		return "refer: the REFER could not be carried"
+	}
+	return "refer: the REFER could not be carried: " + class.Error()
+}
+
+// Is matches the sipgo transaction sentinel or context error the failure
+// wrapped, including classes this package does not name.
+func (e *referCarryError) Is(target error) bool {
+	return errors.Is(e.cause, target)
+}
+
+// referCarryClass returns the class a carry error names in its text: the first
+// sipgo transaction sentinel or context error err wraps, or nil. It names only
+// the sentinels every supported sipgo defines.
+func referCarryClass(err error) error {
+	switch {
+	case errors.Is(err, sip.ErrTransactionTimeout):
+		return sip.ErrTransactionTimeout
+	case errors.Is(err, sip.ErrTransactionTransport):
+		return sip.ErrTransactionTransport
+	case errors.Is(err, sip.ErrTransactionCanceled):
+		return sip.ErrTransactionCanceled
+	case errors.Is(err, sip.ErrTransactionTerminated):
+		return sip.ErrTransactionTerminated
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	}
+	return nil
+}
+
 // ReferEnd is how an observed REFER attempt ended. Its zero value is not a kind.
 // Deadline, cancellation and an ended subscription are kinds of their own and
 // never a SIP status.
@@ -306,7 +355,9 @@ func dialogReferSend(ctx context.Context, d DialogSession, recipient, referTo, r
 // A context that ends before the REFER's final response is reported as
 // ReferEndCancelled with a nil error. The error return is for a REFER that could
 // not be carried for any other reason: a non-positive deadline, a dialog that is
-// not confirmed, a bad header or a transport failure.
+// not confirmed, a bad header or a transport failure. A transport failure comes
+// back as an error that keeps its class for errors.Is and none of sipgo's text,
+// which carries the REFER's request line and socket addresses.
 func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, opts ReferObserveOptions, headers ...sip.Header) (ReferObservation, *sip.Response, error) {
 	if opts.Deadline <= 0 {
 		return ReferObservation{}, nil, fmt.Errorf("refer deadline must be positive, got %s", opts.Deadline)
@@ -338,7 +389,11 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 			return med.finishReferAttempt(attempt, ReferEndCancelled), nil, nil
 		}
 		med.dropReferAttempt(attempt)
-		return ReferObservation{}, nil, err
+		if req == nil {
+			// The REFER was never built; the error is this package's own text.
+			return ReferObservation{}, nil, err
+		}
+		return ReferObservation{}, nil, &referCarryError{cause: err}
 	}
 
 	response := ReferResponse{Status: res.StatusCode, Reason: res.Reason}

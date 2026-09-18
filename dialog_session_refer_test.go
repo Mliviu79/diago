@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -889,6 +890,116 @@ func TestReferObservationCarriesNoRoutingInternals(t *testing.T) {
 	_, _, err = observeRefer(t.Context(), d, ReferObserveOptions{Deadline: time.Second})
 	require.Error(t, err)
 	requireClean(t, "the dialog state error", err.Error())
+
+	fresh := newReferObserveDialog(t, 202, "Accepted")
+	fresh.doErr = sipgoReferWriteFailure(nil)
+	_, _, err = observeRefer(t.Context(), fresh, ReferObserveOptions{Deadline: time.Second})
+	require.Error(t, err)
+	requireClean(t, "the carry error", err.Error())
+	requireClean(t, "the carry error", fmt.Sprintf("%+v", err))
+}
+
+// sipgoReferWriteFailure builds the error sipgo returns when a REFER's first
+// write fails: its text carries the request line, which names the far end's
+// Contact with its user part, and the socket error with the far end's address.
+// notSent, when set, is wrapped beside the socket error.
+func sipgoReferWriteFailure(notSent error) error {
+	line := "REFER sip:secret@10.9.8.7:5099 SIP/2.0"
+	writeErr := &net.OpError{
+		Op: "write", Net: "udp",
+		Addr: &net.UDPAddr{IP: net.IPv4(10, 9, 8, 7), Port: 5099},
+		Err:  errors.New("network is unreachable"),
+	}
+	if notSent != nil {
+		return fmt.Errorf("%w. %w", fmt.Errorf("fail to write request on init req=%q: %w: %w", line, notSent, writeErr), sip.ErrTransactionTransport)
+	}
+	return fmt.Errorf("%w. %w", fmt.Errorf("fail to write request on init req=%q: %w", line, writeErr), sip.ErrTransactionTransport)
+}
+
+// TestReferObserveCarryErrorKeepsOnlyItsClass checks a REFER that could not be
+// carried comes back with its class and none of sipgo's text, which carries the
+// REFER's request line and socket addresses.
+func TestReferObserveCarryErrorKeepsOnlyItsClass(t *testing.T) {
+	dialErr := &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(10, 9, 8, 7), Port: 5099},
+		Err:  errors.New("connect: connection refused"),
+	}
+	// errNotNamed plays a sentinel a newer sipgo defines and this module does
+	// not name.
+	errNotNamed := errors.New("transaction request not sent")
+	banned := []string{"10.9.8.7", "5099", "sip:", "@", "secret", "Via", "Contact"}
+
+	tests := []struct {
+		name      string
+		doErr     error
+		wantText  string
+		wantIs    []error
+		wantNotIs []error
+	}{
+		{
+			name:      "a failed write keeps the transport class",
+			doErr:     sipgoReferWriteFailure(nil),
+			wantText:  "refer: the REFER could not be carried: transaction transport error",
+			wantIs:    []error{sip.ErrTransactionTransport},
+			wantNotIs: []error{sip.ErrTransactionTimeout},
+		},
+		{
+			name:      "a failed connection request names no class",
+			doErr:     fmt.Errorf("client transcation failed to request connection: %w", dialErr),
+			wantText:  "refer: the REFER could not be carried",
+			wantNotIs: []error{sip.ErrTransactionTransport},
+		},
+		{
+			name:     "timer B keeps the timeout class",
+			doErr:    fmt.Errorf("Timer_B timed out. %w", sip.ErrTransactionTimeout),
+			wantText: "refer: the REFER could not be carried: transaction timeout",
+			wantIs:   []error{sip.ErrTransactionTimeout},
+		},
+		{
+			name:     "a context error from the dialog under a live context is an error",
+			doErr:    fmt.Errorf("dialog request: %w", context.DeadlineExceeded),
+			wantText: "refer: the REFER could not be carried: context deadline exceeded",
+			wantIs:   []error{context.DeadlineExceeded},
+		},
+		{
+			name:     "a class this package does not name stays matchable",
+			doErr:    sipgoReferWriteFailure(errNotNamed),
+			wantText: "refer: the REFER could not be carried: transaction transport error",
+			wantIs:   []error{errNotNamed, sip.ErrTransactionTransport},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newReferObserveDialog(t, 202, "Accepted")
+			d.doErr = tt.doErr
+
+			obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: time.Second})
+			require.Error(t, err)
+			assert.Equal(t, tt.wantText, err.Error())
+			for _, class := range tt.wantIs {
+				assert.ErrorIs(t, err, class)
+			}
+			for _, class := range tt.wantNotIs {
+				assert.NotErrorIs(t, err, class)
+			}
+			for _, rendered := range []string{err.Error(), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err)} {
+				for _, b := range banned {
+					assert.NotContains(t, rendered, b, "the carry error carries %q: %s", b, rendered)
+				}
+			}
+			var op *net.OpError
+			assert.False(t, errors.As(err, &op), "the socket error is reachable: %v", op)
+			var failure *ReferFailureError
+			assert.False(t, errors.As(err, &failure), "a REFER that could not be carried is not a ReferFailureError")
+
+			assert.Equal(t, ReferObservation{}, obs)
+			assert.Zero(t, registeredReferAttempts(d.media), "a REFER that could not be carried leaves no attempt")
+			assert.Equal(t, int32(1), d.refersSent.Load(), "REFERs sent")
+			assert.Zero(t, d.hangups.Load(), "the REFER path never ends the dialog")
+		})
+	}
 }
 
 // TestDialogReferKeepsTheFailureContract checks the upstream Refer and
