@@ -74,14 +74,18 @@ type DialogMedia struct {
 
 	onReferNotify func(statusCode int)
 
-	// referMu guards referInFlight. It is separate from mu so delivering a REFER
-	// outcome never contends with media state.
+	// referMu guards referAttempts, referLatest and the attempts they hold. It is
+	// separate from mu so observing a REFER NOTIFY never contends with media
+	// state.
 	referMu sync.Mutex
-	// referInFlight is the waiter for the REFER attempt currently awaiting its
-	// terminal sipfrag NOTIFY, or nil when no synchronous transfer is in flight.
-	// Only dialogRefer callers that opted into waiting register one; the
-	// onReferNotify callback path leaves this nil.
-	referInFlight *referWaiter
+	// referAttempts are the registered REFER attempts, oldest first: those
+	// waiting for their outcome, and those whose wait ended on the deadline or
+	// on cancellation and can still receive a late terminal NOTIFY.
+	referAttempts []*referAttempt
+	// referLatest is the attempt begun most recently. It is kept after it is
+	// dropped, so a NOTIFY without an Event id is never given to an older
+	// attempt once a newer one has started.
+	referLatest *referAttempt
 
 	// releaseRTPPort returns this dialog RTP port to the allocator that handed
 	// it out. Nil when no allocator is installed, as the OS takes the port back
@@ -94,75 +98,184 @@ type DialogMedia struct {
 	closed bool
 }
 
-// referWaiter is one in-flight REFER attempt's terminal-outcome mailbox. ch is
-// buffered so dialogHandleReferNotify never blocks delivering an outcome, even
-// if the waiter has already given up on the deadline.
-type referWaiter struct {
+// referAttempt is one REFER sent on the dialog and what has been observed for
+// it. Every field is guarded by DialogMedia.referMu.
+type referAttempt struct {
 	// cseq is the CSeq of the sent REFER. RFC 3515 makes the NOTIFY's Event id
 	// the CSeq of the REFER that created the subscription, so this is what an
 	// id-carrying NOTIFY is matched against.
 	cseq uint32
 	// cseqKnown is false until setReferAttemptCSeq records the sent REFER's CSeq.
-	// Until then an id-carrying NOTIFY cannot be rejected as stale.
+	// Until then an id-carrying NOTIFY cannot be told apart from this attempt's.
 	cseqKnown bool
-	// ch carries the terminal outcome to the dialogRefer waiter.
-	ch chan referTerminal
+	// registered is true while the attempt is in referAttempts.
+	registered bool
+	// end is how the attempt ended, zero while its wait is open.
+	end ReferEnd
+	// notifies are the NOTIFYs recorded while the wait was open, at most
+	// maxReferNotifies, and dropped counts the ones not kept.
+	notifies []ReferNotify
+	dropped  int
+	// wake tells the waiting REFER that a NOTIFY ended the attempt. Capacity 1,
+	// sent to without blocking.
+	wake chan struct{}
+	// onLate receives a terminal NOTIFY that arrives after the wait ended on the
+	// deadline or on cancellation.
+	onLate func(ReferLateNotify)
 }
 
-// beginReferAttempt registers a fresh in-flight REFER waiter, replacing any
-// prior one, and returns it. Called before the REFER is sent so a terminal
-// NOTIFY that races ahead of the wait is buffered rather than lost.
-func (d *DialogMedia) beginReferAttempt() *referWaiter {
-	w := &referWaiter{ch: make(chan referTerminal, 1)}
+// beginReferAttempt registers a new REFER attempt as the most recent one and
+// returns it. Called before the REFER is sent so a NOTIFY that races ahead of
+// the REFER's response is recorded rather than lost.
+func (d *DialogMedia) beginReferAttempt(onLate func(ReferLateNotify)) *referAttempt {
+	a := &referAttempt{registered: true, wake: make(chan struct{}, 1), onLate: onLate}
 	d.referMu.Lock()
-	d.referInFlight = w
+	d.referAttempts = append(d.referAttempts, a)
+	d.referLatest = a
 	d.referMu.Unlock()
-	return w
+	return a
 }
 
-// setReferAttemptCSeq records the sent REFER's CSeq on w, but only while w is
-// still the registered attempt, so it can never stamp a newer one.
-func (d *DialogMedia) setReferAttemptCSeq(w *referWaiter, cseq uint32) {
+// setReferAttemptCSeq records the sent REFER's CSeq on a, but only while a is
+// registered.
+func (d *DialogMedia) setReferAttemptCSeq(a *referAttempt, cseq uint32) {
 	d.referMu.Lock()
-	if d.referInFlight == w {
-		w.cseq = cseq
-		w.cseqKnown = true
+	if a.registered {
+		a.cseq = cseq
+		a.cseqKnown = true
 	}
 	d.referMu.Unlock()
 }
 
-// endReferAttempt unregisters w, but only if it is still the registered attempt.
-// dialogRefer defers this on every return path so a late NOTIFY for a finished
-// attempt finds no waiter and can never be inherited by a later attempt on the
-// same still-live dialog.
-func (d *DialogMedia) endReferAttempt(w *referWaiter) {
-	d.referMu.Lock()
-	if d.referInFlight == w {
-		d.referInFlight = nil
-	}
-	d.referMu.Unlock()
-}
-
-// deliverReferResult routes a terminal sipfrag outcome to the in-flight REFER
-// waiter, if any. A NOTIFY carrying an RFC 3515 Event id is delivered only when
-// that id matches the in-flight attempt's CSeq, so a stale NOTIFY from a prior
-// REFER on the same dialog is dropped. A NOTIFY without an id falls back to the
-// single in-flight attempt, since peers MAY omit it. The send is non-blocking so
-// a NOTIFY handler is never held up by a waiter that has already timed out.
-func (d *DialogMedia) deliverReferResult(notifyID uint32, hasID bool, term referTerminal) {
+// observeReferNotify routes one parsed NOTIFY to the REFER attempt it belongs
+// to. With an Event id that is the registered attempt whose known CSeq equals
+// it, or else the most recent attempt while its CSeq is still unknown; without
+// an id it is the most recent attempt. A NOTIFY with no such attempt is
+// dropped.
+//
+// While the attempt's wait is open the NOTIFY is recorded, and a terminal one
+// ends the wait. After the wait ended on the deadline or on cancellation a
+// terminal NOTIFY is late: the attempt is dropped and its late callback is
+// returned with the late NOTIFY, for the caller to run once the lock is
+// released. The returned callback is nil when there is nothing to deliver.
+func (d *DialogMedia) observeReferNotify(n ReferNotify) (onLate func(ReferLateNotify), late ReferLateNotify) {
 	d.referMu.Lock()
 	defer d.referMu.Unlock()
-	w := d.referInFlight
-	if w == nil {
-		return
+
+	a := d.referNotifyTargetLocked(n)
+	if a == nil {
+		return nil, ReferLateNotify{}
 	}
-	if hasID && w.cseqKnown && notifyID != w.cseq {
+	switch a.end {
+	case 0:
+		a.recordLocked(n)
+	case ReferEndDeadline, ReferEndCancelled:
+		if !n.endsSubscription() {
+			return nil, ReferLateNotify{}
+		}
+		d.removeReferAttemptLocked(a)
+		return a.onLate, ReferLateNotify{CSeq: a.cseq, CSeqKnown: a.cseqKnown, Notify: n}
+	case ReferEndFinalNotify, ReferEndRefused, ReferEndSubscriptionEnded:
+		// The attempt's outcome is already decided and about to be collected.
+	}
+	return nil, ReferLateNotify{}
+}
+
+// referNotifyTargetLocked returns the registered attempt n belongs to, or nil.
+// Called with referMu held.
+func (d *DialogMedia) referNotifyTargetLocked(n ReferNotify) *referAttempt {
+	if n.HasEventID {
+		for _, a := range d.referAttempts {
+			if a.cseqKnown && a.cseq == n.EventID {
+				return a
+			}
+		}
+		// The NOTIFY raced ahead of the REFER's response, so the most recent
+		// attempt's CSeq is not known yet.
+		if latest := d.referLatest; latest != nil && latest.registered && !latest.cseqKnown {
+			return latest
+		}
+		return nil
+	}
+	if latest := d.referLatest; latest != nil && latest.registered {
+		return latest
+	}
+	return nil
+}
+
+// recordLocked records n on an attempt whose wait is open, and ends the wait
+// when n is terminal. Past maxReferNotifies a non-terminal NOTIFY is only
+// counted, and a terminal one takes the last slot so it is always last.
+// Called with referMu held.
+func (a *referAttempt) recordLocked(n ReferNotify) {
+	switch {
+	case len(a.notifies) < maxReferNotifies:
+		a.notifies = append(a.notifies, n)
+	case n.endsSubscription():
+		a.notifies[len(a.notifies)-1] = n
+		a.dropped++
+	default:
+		a.dropped++
+	}
+
+	switch {
+	case n.isFinal():
+		a.end = ReferEndFinalNotify
+	case n.endsSubscription():
+		a.end = ReferEndSubscriptionEnded
+	default:
 		return
 	}
 	select {
-	case w.ch <- term:
+	case a.wake <- struct{}{}:
 	default:
 	}
+}
+
+// finishReferAttempt ends a's wait with end unless a NOTIFY already ended it,
+// or with ReferEndRefused regardless, and returns what a observed. An attempt
+// that ended on a final NOTIFY, an ended subscription or a refused REFER is
+// dropped; one that ended on the deadline or on cancellation stays registered
+// for a late terminal NOTIFY.
+func (d *DialogMedia) finishReferAttempt(a *referAttempt, end ReferEnd) ReferObservation {
+	d.referMu.Lock()
+	defer d.referMu.Unlock()
+
+	// A refused REFER created no subscription, so its response decides the end
+	// even if a NOTIFY claiming an outcome raced ahead of it.
+	if a.end == 0 || end == ReferEndRefused {
+		a.end = end
+	}
+	switch a.end {
+	case ReferEndFinalNotify, ReferEndSubscriptionEnded, ReferEndRefused:
+		d.removeReferAttemptLocked(a)
+	case ReferEndDeadline, ReferEndCancelled:
+		// Stays registered, so a late terminal NOTIFY finds this attempt.
+	}
+	return ReferObservation{
+		End:             a.end,
+		CSeq:            a.cseq,
+		CSeqKnown:       a.cseqKnown,
+		Notifies:        slices.Clone(a.notifies),
+		NotifiesDropped: a.dropped,
+	}
+}
+
+// dropReferAttempt unregisters a. Dropping an attempt never affects another.
+func (d *DialogMedia) dropReferAttempt(a *referAttempt) {
+	d.referMu.Lock()
+	d.removeReferAttemptLocked(a)
+	d.referMu.Unlock()
+}
+
+// removeReferAttemptLocked unregisters a, leaving referLatest as it is. Called
+// with referMu held.
+func (d *DialogMedia) removeReferAttemptLocked(a *referAttempt) {
+	if !a.registered {
+		return
+	}
+	a.registered = false
+	d.referAttempts = slices.DeleteFunc(d.referAttempts, func(r *referAttempt) bool { return r == a })
 }
 
 func (d *DialogMedia) Close() error {
@@ -183,6 +296,15 @@ func (d *DialogMedia) Close() error {
 	d.releaseRTPPort = nil
 
 	d.mu.Unlock()
+
+	// A NOTIFY after close finds no REFER attempt, late ones included.
+	d.referMu.Lock()
+	for _, a := range d.referAttempts {
+		a.registered = false
+	}
+	d.referAttempts = nil
+	d.referLatest = nil
+	d.referMu.Unlock()
 
 	var e1, e2, e3 error
 	if onClose != nil {

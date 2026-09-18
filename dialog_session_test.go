@@ -6,8 +6,10 @@ package diago
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/require"
 )
@@ -181,4 +183,96 @@ func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 			require.Zero(t, d.hangups, "a %s NOTIFY ended the dialog", tc.name)
 		})
 	}
+}
+
+// referObserveDialog is a DialogSession that answers a REFER with a canned
+// response and counts what the REFER path does to the dialog. Its SIP dialog is
+// a bare sipgo dialog put in the confirmed state, unless a test changes it.
+type referObserveDialog struct {
+	DialogSession
+	media     *DialogMedia
+	sipDialog *sipgo.Dialog
+
+	// status and reason are the REFER's final response.
+	status int
+	reason string
+	// nextCSeq is stamped on a REFER sent without a CSeq.
+	nextCSeq uint32
+	// doErr, when set, is returned by Do instead of a response.
+	doErr error
+	// onDo runs once the REFER is counted as sent, before it is answered.
+	onDo func(req *sip.Request)
+
+	hangups    atomic.Int32
+	refersSent atomic.Int32
+}
+
+func newReferObserveDialog(t *testing.T, status int, reason string) *referObserveDialog {
+	t.Helper()
+
+	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: "bob", Host: "127.0.0.1", Port: 5060})
+	sipDialog := &sipgo.Dialog{InviteRequest: invite}
+	sipDialog.InitWithState(sip.DialogStateConfirmed)
+	return &referObserveDialog{
+		media:     &DialogMedia{},
+		sipDialog: sipDialog,
+		status:    status,
+		reason:    reason,
+		nextCSeq:  1,
+	}
+}
+
+func (d *referObserveDialog) Media() *DialogMedia { return d.media }
+
+func (d *referObserveDialog) DialogSIP() *sipgo.Dialog { return d.sipDialog }
+
+func (d *referObserveDialog) Hangup(ctx context.Context) error {
+	d.hangups.Add(1)
+	return nil
+}
+
+func (d *referObserveDialog) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if req.CSeq() == nil {
+		req.AppendHeader(&sip.CSeqHeader{SeqNo: d.nextCSeq, MethodName: sip.REFER})
+	}
+	d.refersSent.Add(1)
+	if d.onDo != nil {
+		d.onDo(req)
+	}
+	if d.doErr != nil {
+		return nil, d.doErr
+	}
+	return sip.NewResponseFromRequest(req, d.status, d.reason, nil), nil
+}
+
+// sendReferNotify hands d a REFER NOTIFY carrying the sipfrag body, plus the
+// Event and Subscription-State headers when they are not empty, and returns the
+// status of the response it was answered with.
+func sendReferNotify(t *testing.T, d DialogSession, body, event, subscriptionState string) int {
+	t.Helper()
+
+	req := newReferNotifyRequest(t, "message/sipfrag", body)
+	if event != "" {
+		req.AppendHeader(sip.NewHeader("Event", event))
+	}
+	if subscriptionState != "" {
+		req.AppendHeader(sip.NewHeader("Subscription-State", subscriptionState))
+	}
+	tx, conn := newReferNotifyTx(t, req)
+
+	dialogHandleReferNotify(d, req, tx)
+
+	if len(conn.msgs) != 1 {
+		t.Errorf("a REFER NOTIFY was answered %d times, want once", len(conn.msgs))
+		return 0
+	}
+	res, ok := conn.msgs[0].(*sip.Response)
+	if !ok {
+		t.Errorf("a REFER NOTIFY was answered with %T, want a response", conn.msgs[0])
+		return 0
+	}
+	return res.StatusCode
 }

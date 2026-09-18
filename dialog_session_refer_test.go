@@ -6,7 +6,10 @@ package diago
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +36,10 @@ func TestParseSipfragStatus(t *testing.T) {
 		{name: "non numeric code", frag: "SIP/2.0 4x6 Busy", wantOK: false},
 		{name: "code out of range", frag: "SIP/2.0 999 Nope", wantOK: false},
 		{name: "code below range", frag: "SIP/2.0 42 Nope", wantOK: false},
+		{name: "lowest status accepted", frag: "SIP/2.0 100 Trying", wantStatus: 100, wantReason: "Trying", wantOK: true},
+		{name: "highest status accepted", frag: "SIP/2.0 699 Custom", wantStatus: 699, wantReason: "Custom", wantOK: true},
+		{name: "one below the lowest status", frag: "SIP/2.0 99 Nope", wantOK: false},
+		{name: "one above the highest status class", frag: "SIP/2.0 700 Nope", wantOK: false},
 	}
 
 	for _, tt := range tests {
@@ -65,6 +72,8 @@ func TestParseReferNotifyEventID(t *testing.T) {
 		{name: "no id param", event: "refer", wantHasID: false},
 		{name: "no event header", event: "", wantHasID: false},
 		{name: "non numeric id", event: "refer;id=abc", wantHasID: false},
+		{name: "largest 32 bit id", event: "refer;id=4294967295", wantID: 4294967295, wantHasID: true},
+		{name: "id past 32 bits is not wrapped", event: "refer;id=4294967296", wantHasID: false},
 	}
 
 	for _, tt := range tests {
@@ -72,6 +81,40 @@ func TestParseReferNotifyEventID(t *testing.T) {
 			id, hasID := parseReferNotifyEventID(newReq(tt.event))
 			assert.Equal(t, tt.wantHasID, hasID)
 			assert.Equal(t, tt.wantID, id)
+		})
+	}
+}
+
+// TestParseReferSubscriptionState checks the Subscription-State header is kept
+// exactly as received, that an absent header is its own fact, and that only
+// the state token decides whether the subscription is terminated.
+func TestParseReferSubscriptionState(t *testing.T) {
+	tests := []struct {
+		name           string
+		header         string
+		wantPresent    bool
+		wantTerminated bool
+	}{
+		{name: "terminated with a reason", header: "terminated;reason=noresource", wantPresent: true, wantTerminated: true},
+		{name: "terminated in another case", header: "Terminated", wantPresent: true, wantTerminated: true},
+		{name: "terminated with spacing", header: " terminated ; reason=timeout", wantPresent: true, wantTerminated: true},
+		{name: "active", header: "active;expires=60", wantPresent: true, wantTerminated: false},
+		{name: "pending", header: "pending", wantPresent: true, wantTerminated: false},
+		{name: "a reason that reads terminated is not the state", header: "active;reason=terminated", wantPresent: true, wantTerminated: false},
+		{name: "header absent", wantPresent: false, wantTerminated: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := sip.NewRequest(sip.NOTIFY, sip.Uri{Host: "127.0.0.1"})
+			if tt.wantPresent {
+				req.AppendHeader(sip.NewHeader("Subscription-State", tt.header))
+			}
+
+			value, present := parseReferSubscriptionState(req)
+			assert.Equal(t, tt.wantPresent, present)
+			assert.Equal(t, tt.header, value, "the value is kept as received")
+			assert.Equal(t, tt.wantTerminated, referSubscriptionTerminated(value))
 		})
 	}
 }
@@ -89,87 +132,837 @@ func TestReferFailureErrorMessageHidesSIPInternals(t *testing.T) {
 	}
 }
 
-// TestReferWaiterCorrelation covers the delivery rules of the in-flight REFER
-// waiter without needing a full dialog: an Event id must match the attempt's
-// CSeq, a NOTIFY with no id falls back to the single in-flight attempt, and a
-// finished attempt must not absorb a late NOTIFY.
-func TestReferWaiterCorrelation(t *testing.T) {
-	term := referTerminal{status: 486, reason: "Busy Here"}
+// TestReferAttemptRegistry covers how a REFER NOTIFY is routed to the attempt
+// it belongs to, one invariant per subtest. The locked invariant for a
+// NOTIFY that arrives after an attempt stopped waiting is delivery to that
+// attempt as a late notify, and to no other attempt.
+func TestReferAttemptRegistry(t *testing.T) {
+	final := ReferNotify{Status: 486, Reason: "Busy Here"}
+	withID := func(n ReferNotify, id uint32) ReferNotify {
+		n.EventID = id
+		n.HasEventID = true
+		return n
+	}
 
-	t.Run("no id delivers to single in flight attempt", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
-		d.setReferAttemptCSeq(w, 5)
+	t.Run("a NOTIFY without an id goes to the most recent attempt", func(t *testing.T) {
+		m := &DialogMedia{}
+		older := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(older, 1)
+		newer := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(newer, 2)
 
-		d.deliverReferResult(0, false, term)
-		assert.Equal(t, term, <-w.ch)
+		onLate, _ := m.observeReferNotify(final)
+		assert.Nil(t, onLate)
+		assert.Equal(t, []ReferNotify{final}, newer.notifies)
+		assert.Equal(t, ReferEndFinalNotify, newer.end)
+		assert.Empty(t, older.notifies)
+		assert.Zero(t, older.end)
 	})
 
-	t.Run("matching id delivers", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
-		d.setReferAttemptCSeq(w, 5)
+	t.Run("a matching id delivers", func(t *testing.T) {
+		m := &DialogMedia{}
+		a := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(a, 5)
 
-		d.deliverReferResult(5, true, term)
-		assert.Equal(t, term, <-w.ch)
+		m.observeReferNotify(withID(final, 5))
+		assert.Equal(t, []ReferNotify{withID(final, 5)}, a.notifies)
+		assert.Equal(t, ReferEndFinalNotify, a.end)
+		assert.Len(t, a.wake, 1, "a final NOTIFY wakes the waiting REFER")
 	})
 
-	t.Run("stale id is dropped", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
-		d.setReferAttemptCSeq(w, 5)
+	t.Run("a stale id is never given to a newer attempt", func(t *testing.T) {
+		m := &DialogMedia{}
+		older := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(older, 4)
+		m.finishReferAttempt(older, ReferEndRefused)
+		newer := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(newer, 5)
 
-		// A NOTIFY for an earlier REFER on the same dialog must not resolve this one.
-		d.deliverReferResult(4, true, term)
-		assert.Empty(t, w.ch)
+		onLate, _ := m.observeReferNotify(withID(final, 4))
+		assert.Nil(t, onLate)
+		assert.Empty(t, newer.notifies)
+		assert.Zero(t, newer.end)
 	})
 
-	t.Run("id before cseq known is delivered", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
+	t.Run("an id arriving before the CSeq is known goes to the most recent attempt", func(t *testing.T) {
+		m := &DialogMedia{}
+		a := m.beginReferAttempt(nil)
 
-		// NOTIFY racing ahead of the CSeq being recorded cannot be judged stale.
-		d.deliverReferResult(9, true, term)
-		assert.Equal(t, term, <-w.ch)
+		// A NOTIFY racing ahead of the REFER's response cannot be judged stale.
+		m.observeReferNotify(withID(final, 9))
+		assert.Equal(t, []ReferNotify{withID(final, 9)}, a.notifies)
+		assert.Equal(t, ReferEndFinalNotify, a.end)
 	})
 
-	t.Run("finished attempt does not absorb late notify", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
-		d.endReferAttempt(w)
+	t.Run("a terminal NOTIFY after the wait ended is delivered late to its own attempt", func(t *testing.T) {
+		m := &DialogMedia{}
+		var lates lateRecorder
+		older := m.beginReferAttempt(lates.record)
+		m.setReferAttemptCSeq(older, 3)
+		obs := m.finishReferAttempt(older, ReferEndDeadline)
+		require.Equal(t, ReferEndDeadline, obs.End)
+		newer := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(newer, 4)
 
-		d.deliverReferResult(0, false, term)
-		assert.Empty(t, w.ch)
+		onLate, late := m.observeReferNotify(withID(final, 3))
+		require.NotNil(t, onLate, "the late NOTIFY is handed back for its own attempt")
+		onLate(late)
+		assert.Equal(t, []ReferLateNotify{{CSeq: 3, CSeqKnown: true, Notify: withID(final, 3)}}, lates.calls())
+		assert.Empty(t, newer.notifies, "a late NOTIFY is never given to a newer attempt")
+		assert.Zero(t, newer.end)
+
+		again, _ := m.observeReferNotify(withID(final, 3))
+		assert.Nil(t, again, "a late NOTIFY is delivered once")
 	})
 
-	t.Run("ended attempt does not clear a newer one", func(t *testing.T) {
-		d := &DialogMedia{}
-		old := d.beginReferAttempt()
-		fresh := d.beginReferAttempt()
-		d.endReferAttempt(old)
+	t.Run("a refused REFER decides the end over a NOTIFY that raced ahead of it", func(t *testing.T) {
+		m := &DialogMedia{}
+		a := m.beginReferAttempt(nil)
+		m.observeReferNotify(final)
 
-		d.deliverReferResult(0, false, term)
-		assert.Equal(t, term, <-fresh.ch)
+		obs := m.finishReferAttempt(a, ReferEndRefused)
+		assert.Equal(t, ReferEndRefused, obs.End)
+		assert.Equal(t, []ReferNotify{final}, obs.Notifies, "the NOTIFY is still recorded")
+		assert.Zero(t, registeredReferAttempts(m), "a refused attempt is dropped")
+	})
+
+	t.Run("an older attempt never clears a newer one", func(t *testing.T) {
+		m := &DialogMedia{}
+		older := m.beginReferAttempt(nil)
+		newer := m.beginReferAttempt(nil)
+		m.dropReferAttempt(older)
+		m.finishReferAttempt(older, ReferEndRefused)
+		m.setReferAttemptCSeq(older, 8)
+
+		m.observeReferNotify(final)
+		assert.Equal(t, []ReferNotify{final}, newer.notifies)
+		assert.False(t, older.cseqKnown, "a dropped attempt's CSeq is not recorded")
 	})
 
 	t.Run("delivery never blocks", func(t *testing.T) {
-		d := &DialogMedia{}
-		w := d.beginReferAttempt()
-		d.setReferAttemptCSeq(w, 1)
+		m := &DialogMedia{}
+		a := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(a, 1)
 
-		// Second delivery must not block once the mailbox is full.
-		d.deliverReferResult(0, false, term)
 		done := make(chan struct{})
 		go func() {
-			d.deliverReferResult(0, false, term)
-			close(done)
+			defer close(done)
+			for range 3 {
+				m.observeReferNotify(final)
+			}
 		}()
 		select {
 		case <-done:
 		case <-time.After(time.Second):
-			t.Fatal("deliverReferResult blocked on a full waiter mailbox")
+			t.Fatal("observeReferNotify blocked on an attempt nobody is waiting for")
 		}
+		assert.Len(t, a.wake, 1)
+		assert.Equal(t, []ReferNotify{final}, a.notifies, "an ended attempt records nothing more")
 	})
+}
+
+// lateRecorder collects the late notifies an attempt's OnLate receives.
+type lateRecorder struct {
+	mu  sync.Mutex
+	got []ReferLateNotify
+}
+
+func (r *lateRecorder) record(n ReferLateNotify) {
+	r.mu.Lock()
+	r.got = append(r.got, n)
+	r.mu.Unlock()
+}
+
+func (r *lateRecorder) calls() []ReferLateNotify {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]ReferLateNotify(nil), r.got...)
+}
+
+// referNotifySpec is one NOTIFY the far end sends for a REFER.
+type referNotifySpec struct {
+	body  string
+	event string
+	state string
+}
+
+// notifyAfterRefer has d receive notifies, in order, from a goroutine started
+// once the REFER goes out. The returned wait blocks, bounded, until every one
+// has been answered, and returns the response statuses.
+func notifyAfterRefer(t *testing.T, d *referObserveDialog, notifies ...referNotifySpec) (wait func() []int) {
+	t.Helper()
+
+	done := make(chan []int, 1)
+	d.onDo = func(*sip.Request) {
+		go func() {
+			codes := make([]int, 0, len(notifies))
+			for _, n := range notifies {
+				codes = append(codes, sendReferNotify(t, d, n.body, n.event, n.state))
+			}
+			done <- codes
+		}()
+	}
+	return func() []int {
+		t.Helper()
+		select {
+		case codes := <-done:
+			return codes
+		case <-time.After(5 * time.Second):
+			t.Fatal("the far end's NOTIFYs were not all answered")
+			return nil
+		}
+	}
+}
+
+// referURIs are the recipient, Refer-To and Referred-By the engine tests send.
+var (
+	referTestRecipient  = sip.Uri{User: "bob", Host: "127.0.0.1", Port: 5060}
+	referTestTarget     = sip.Uri{User: "carol", Host: "127.0.0.1", Port: 5070}
+	referTestReferredBy = sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5080}
+)
+
+func observeRefer(ctx context.Context, d DialogSession, opts ReferObserveOptions) (ReferObservation, *sip.Response, error) {
+	return dialogReferObserve(ctx, d, referTestRecipient, referTestTarget, referTestReferredBy, opts)
+}
+
+func notifyStatuses(obs ReferObservation) []int {
+	var statuses []int
+	for _, n := range obs.Notifies {
+		statuses = append(statuses, n.Status)
+	}
+	return statuses
+}
+
+func registeredReferAttempts(m *DialogMedia) int {
+	m.referMu.Lock()
+	defer m.referMu.Unlock()
+	return len(m.referAttempts)
+}
+
+// TestReferObserveEnds covers each way an observed REFER ends. Every kind is its
+// own value, none is a SIP status, and nothing on the path ends the dialog.
+func TestReferObserveEnds(t *testing.T) {
+	t.Run("the five kinds are distinct, non-zero and named", func(t *testing.T) {
+		kinds := map[ReferEnd]string{
+			ReferEndFinalNotify:       "final_notify",
+			ReferEndRefused:           "refused",
+			ReferEndDeadline:          "deadline",
+			ReferEndCancelled:         "cancelled",
+			ReferEndSubscriptionEnded: "subscription_ended",
+		}
+		require.Len(t, kinds, 5, "two kinds share a value")
+		for kind, slug := range kinds {
+			assert.NotZero(t, kind)
+			assert.Equal(t, slug, kind.String())
+		}
+		assert.Equal(t, "ReferEnd(0)", ReferEnd(0).String())
+	})
+
+	const long = 5 * time.Second
+	const (
+		cancelNone = iota
+		cancelBefore
+		cancelDuringWait
+		cancelBeforeResponse
+	)
+	trying := referNotifySpec{body: "SIP/2.0 100 Trying", event: "refer", state: "active;expires=60"}
+
+	tests := []struct {
+		name                 string
+		status               int
+		reason               string
+		deadline             time.Duration
+		notifies             []referNotifySpec
+		cancel               int
+		notConfirmed         bool
+		doErr                error
+		wantErr              bool
+		wantEnd              ReferEnd
+		wantResponse         ReferResponse
+		wantResponseReceived bool
+		wantStatuses         []int
+		wantSent             int32
+		within               time.Duration
+	}{
+		{
+			name: "a final NOTIFY in time ends as final_notify", status: 202, reason: "Accepted", deadline: long,
+			notifies: []referNotifySpec{trying, {body: "SIP/2.0 486 Busy Here", event: "refer", state: "terminated;reason=noresource"}},
+			wantEnd:  ReferEndFinalNotify, wantResponse: ReferResponse{202, "Accepted"}, wantResponseReceived: true,
+			wantStatuses: []int{100, 486}, wantSent: 1, within: time.Second,
+		},
+		{
+			name: "a REFER answered 403 is refused at once", status: 403, reason: "Forbidden", deadline: long,
+			wantEnd: ReferEndRefused, wantResponse: ReferResponse{403, "Forbidden"}, wantResponseReceived: true,
+			wantSent: 1, within: time.Second,
+		},
+		{
+			name: "a REFER answered 300 is refused", status: 300, reason: "Multiple Choices", deadline: long,
+			wantEnd: ReferEndRefused, wantResponse: ReferResponse{300, "Multiple Choices"}, wantResponseReceived: true,
+			wantSent: 1, within: time.Second,
+		},
+		{
+			name: "an accepted REFER with no NOTIFY ends on the deadline", status: 202, reason: "Accepted", deadline: 50 * time.Millisecond,
+			wantEnd: ReferEndDeadline, wantResponse: ReferResponse{202, "Accepted"}, wantResponseReceived: true, wantSent: 1,
+		},
+		{
+			name: "a REFER answered 299 opens the wait", status: 299, reason: "Custom", deadline: 50 * time.Millisecond,
+			wantEnd: ReferEndDeadline, wantResponse: ReferResponse{299, "Custom"}, wantResponseReceived: true, wantSent: 1,
+		},
+		{
+			name: "a REFER answered 200 waits like a 202", status: 200, reason: "OK", deadline: long,
+			notifies: []referNotifySpec{{body: "SIP/2.0 200 OK", event: "refer", state: "terminated;reason=noresource"}},
+			wantEnd:  ReferEndFinalNotify, wantResponse: ReferResponse{200, "OK"}, wantResponseReceived: true,
+			wantStatuses: []int{200}, wantSent: 1, within: time.Second,
+		},
+		{
+			name: "a 199 sipfrag is progress and a 200 sipfrag ends the wait", status: 202, reason: "Accepted", deadline: long,
+			notifies: []referNotifySpec{{body: "SIP/2.0 199 Early Dialog Terminated", event: "refer", state: "active"}, {body: "SIP/2.0 200 OK", event: "refer", state: "active"}},
+			wantEnd:  ReferEndFinalNotify, wantResponse: ReferResponse{202, "Accepted"}, wantResponseReceived: true,
+			wantStatuses: []int{199, 200}, wantSent: 1, within: time.Second,
+		},
+		{
+			name: "a 1xx with the subscription terminated ends the subscription", status: 202, reason: "Accepted", deadline: long,
+			notifies: []referNotifySpec{trying, {body: "SIP/2.0 100 Trying", event: "refer", state: "terminated;reason=noresource"}},
+			wantEnd:  ReferEndSubscriptionEnded, wantResponse: ReferResponse{202, "Accepted"}, wantResponseReceived: true,
+			wantStatuses: []int{100, 100}, wantSent: 1, within: time.Second,
+		},
+		{
+			name: "a context cancelled during the wait ends as cancelled", status: 202, reason: "Accepted", deadline: long,
+			cancel: cancelDuringWait, wantEnd: ReferEndCancelled, wantResponse: ReferResponse{202, "Accepted"},
+			wantResponseReceived: true, wantSent: 1, within: time.Second,
+		},
+		{
+			name: "an already cancelled context sends nothing", status: 202, reason: "Accepted", deadline: long,
+			cancel: cancelBefore, wantEnd: ReferEndCancelled, wantSent: 0, within: time.Second,
+		},
+		{
+			name: "a context cancelled before the response ends as cancelled", status: 202, reason: "Accepted", deadline: long,
+			cancel: cancelBeforeResponse, doErr: context.Canceled, wantEnd: ReferEndCancelled, wantSent: 1, within: time.Second,
+		},
+		{name: "a zero deadline is an error", status: 202, reason: "Accepted", deadline: 0, wantErr: true},
+		{name: "a negative deadline is an error", status: 202, reason: "Accepted", deadline: -time.Nanosecond, wantErr: true},
+		{
+			name: "a 1 ms deadline is accepted", status: 202, reason: "Accepted", deadline: time.Millisecond,
+			wantEnd: ReferEndDeadline, wantResponse: ReferResponse{202, "Accepted"}, wantResponseReceived: true, wantSent: 1,
+		},
+		{name: "a dialog that is not confirmed is an error", status: 202, reason: "Accepted", deadline: long, notConfirmed: true, wantErr: true},
+		{
+			name: "a transport failure is an error", status: 202, reason: "Accepted", deadline: long,
+			doErr: errors.New("transport closed"), wantErr: true, wantSent: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newReferObserveDialog(t, tt.status, tt.reason)
+			d.doErr = tt.doErr
+			if tt.notConfirmed {
+				d.sipDialog.InitWithState(sip.DialogStateEstablished)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var waitNotifies func() []int
+			switch tt.cancel {
+			case cancelBefore:
+				cancel()
+			case cancelDuringWait:
+				d.onDo = func(*sip.Request) { time.AfterFunc(20*time.Millisecond, cancel) }
+			case cancelBeforeResponse:
+				d.onDo = func(*sip.Request) { cancel() }
+			}
+			if len(tt.notifies) > 0 {
+				waitNotifies = notifyAfterRefer(t, d, tt.notifies...)
+			}
+
+			started := time.Now()
+			obs, _, err := observeRefer(ctx, d, ReferObserveOptions{Deadline: tt.deadline})
+			elapsed := time.Since(started)
+
+			if waitNotifies != nil && d.refersSent.Load() > 0 {
+				for _, code := range waitNotifies() {
+					assert.Equal(t, sip.StatusOK, code, "every NOTIFY is answered 200")
+				}
+			}
+			assert.Equal(t, tt.wantSent, d.refersSent.Load(), "REFERs sent")
+			assert.Zero(t, d.hangups.Load(), "the REFER path never ends the dialog")
+			assert.Nil(t, d.media.onReferNotify, "the observing REFER never installs the int-only callback")
+
+			if tt.wantErr {
+				require.Error(t, err)
+				var failure *ReferFailureError
+				assert.False(t, errors.As(err, &failure), "the observing REFER never reports its outcome as a ReferFailureError")
+				assert.Equal(t, ReferObservation{}, obs)
+				assert.Zero(t, registeredReferAttempts(d.media), "a REFER that could not be carried leaves no attempt")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantEnd, obs.End)
+			assert.Equal(t, tt.wantResponse, obs.Response)
+			assert.Equal(t, tt.wantResponseReceived, obs.ResponseReceived)
+			assert.Equal(t, tt.wantStatuses, notifyStatuses(obs))
+			_, hasLast := obs.LastNotify()
+			assert.Equal(t, len(tt.wantStatuses) > 0, hasLast)
+			if tt.wantSent > 0 {
+				assert.True(t, obs.CSeqKnown, "the sent REFER's CSeq is recorded")
+				assert.Equal(t, uint32(1), obs.CSeq)
+			}
+			if tt.within > 0 {
+				assert.Less(t, elapsed, tt.within, "the wait ended on its kind, not on the deadline")
+			}
+		})
+	}
+}
+
+// TestReferObserveRecordsEveryNotify checks every NOTIFY is recorded in the
+// order it was handled with its Subscription-State and Event id as received,
+// duplicates kept, and that the record is bounded with the terminal NOTIFY
+// always last.
+func TestReferObserveRecordsEveryNotify(t *testing.T) {
+	run := func(t *testing.T, notifies ...referNotifySpec) ReferObservation {
+		t.Helper()
+		d := newReferObserveDialog(t, 202, "Accepted")
+		wait := notifyAfterRefer(t, d, notifies...)
+		obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 5 * time.Second})
+		require.NoError(t, err)
+		wait()
+		assert.Zero(t, d.hangups.Load(), "the REFER path never ends the dialog")
+		return obs
+	}
+
+	t.Run("subscription state and event id are kept as received", func(t *testing.T) {
+		obs := run(t,
+			referNotifySpec{body: "SIP/2.0 100 Trying", event: "refer;id=1", state: "active;expires=60"},
+			referNotifySpec{body: "SIP/2.0 200 OK", event: "refer;id=1", state: "terminated;reason=noresource"},
+		)
+		assert.Equal(t, ReferEndFinalNotify, obs.End)
+		assert.Equal(t, []ReferNotify{
+			{Status: 100, Reason: "Trying", SubscriptionState: "active;expires=60", HasSubscriptionState: true, EventID: 1, HasEventID: true},
+			{Status: 200, Reason: "OK", SubscriptionState: "terminated;reason=noresource", HasSubscriptionState: true, EventID: 1, HasEventID: true},
+		}, obs.Notifies)
+		assert.Zero(t, obs.NotifiesDropped)
+	})
+
+	t.Run("an absent Subscription-State and Event id are recorded as absent", func(t *testing.T) {
+		obs := run(t, referNotifySpec{body: "SIP/2.0 200 OK"})
+		assert.Equal(t, ReferEndFinalNotify, obs.End)
+		assert.Equal(t, []ReferNotify{{Status: 200, Reason: "OK"}}, obs.Notifies)
+	})
+
+	t.Run("identical NOTIFYs are both kept", func(t *testing.T) {
+		ringing := referNotifySpec{body: "SIP/2.0 180 Ringing", event: "refer", state: "active"}
+		obs := run(t, ringing, ringing, referNotifySpec{body: "SIP/2.0 200 OK", event: "refer", state: "terminated"})
+		assert.Equal(t, []int{180, 180, 200}, notifyStatuses(obs))
+		require.Len(t, obs.Notifies, 3)
+		assert.Equal(t, obs.Notifies[0], obs.Notifies[1])
+	})
+
+	t.Run("past the bound the terminal NOTIFY is still last", func(t *testing.T) {
+		var notifies []referNotifySpec
+		for range 37 {
+			notifies = append(notifies, referNotifySpec{body: "SIP/2.0 100 Trying", event: "refer", state: "active"})
+		}
+		notifies = append(notifies, referNotifySpec{body: "SIP/2.0 486 Busy Here", event: "refer", state: "terminated"})
+
+		obs := run(t, notifies...)
+		assert.Equal(t, ReferEndFinalNotify, obs.End)
+		require.Len(t, obs.Notifies, maxReferNotifies)
+		last, ok := obs.LastNotify()
+		require.True(t, ok)
+		assert.Equal(t, 486, last.Status)
+		for _, n := range obs.Notifies[:maxReferNotifies-1] {
+			assert.Equal(t, 100, n.Status)
+		}
+		assert.Equal(t, 6, obs.NotifiesDropped)
+	})
+}
+
+// endReferOnDeadline runs an observed REFER on d that is accepted and ends on
+// its deadline, and returns the observation.
+func endReferOnDeadline(t *testing.T, d *referObserveDialog, onLate func(ReferLateNotify)) ReferObservation {
+	t.Helper()
+	obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 20 * time.Millisecond, OnLate: onLate})
+	require.NoError(t, err)
+	require.Equal(t, ReferEndDeadline, obs.End)
+	return obs
+}
+
+// TestReferObserveLateNotify checks a terminal NOTIFY that arrives after the
+// wait ended is answered 200, delivered once to that attempt's OnLate with the
+// attempt's CSeq, and never touches the dialog.
+func TestReferObserveLateNotify(t *testing.T) {
+	t.Run("a final NOTIFY after the deadline is delivered once", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		d.nextCSeq = 7
+		var lates lateRecorder
+		endReferOnDeadline(t, d, lates.record)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=7", "terminated;reason=noresource"))
+		assert.Equal(t, []ReferLateNotify{{CSeq: 7, CSeqKnown: true, Notify: ReferNotify{
+			Status: 200, Reason: "OK", SubscriptionState: "terminated;reason=noresource", HasSubscriptionState: true, EventID: 7, HasEventID: true,
+		}}}, lates.calls())
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=7", "terminated;reason=noresource"))
+		assert.Len(t, lates.calls(), 1, "a duplicate late NOTIFY is not delivered again")
+		assert.Zero(t, d.hangups.Load(), "a late NOTIFY never ends the dialog")
+	})
+
+	t.Run("a late 1xx is not delivered", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		endReferOnDeadline(t, d, lates.record)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 180 Ringing", "refer;id=1", "active"))
+		assert.Empty(t, lates.calls())
+
+		// The attempt still takes its terminal NOTIFY.
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer;id=1", "terminated"))
+		require.Len(t, lates.calls(), 1)
+		assert.Equal(t, 486, lates.calls()[0].Notify.Status)
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("a late 1xx that terminates the subscription is delivered", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		endReferOnDeadline(t, d, lates.record)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 100 Trying", "", "terminated;reason=timeout"))
+		require.Len(t, lates.calls(), 1)
+		late := lates.calls()[0]
+		assert.Equal(t, 100, late.Notify.Status)
+		assert.Equal(t, "terminated;reason=timeout", late.Notify.SubscriptionState)
+		assert.Equal(t, uint32(1), late.CSeq)
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("a final NOTIFY after cancellation is delivered", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		d.onDo = func(*sip.Request) { time.AfterFunc(20*time.Millisecond, cancel) }
+		obs, _, err := observeRefer(ctx, d, ReferObserveOptions{Deadline: 5 * time.Second, OnLate: lates.record})
+		require.NoError(t, err)
+		require.Equal(t, ReferEndCancelled, obs.End)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", "terminated"))
+		require.Len(t, lates.calls(), 1)
+		assert.Equal(t, 200, lates.calls()[0].Notify.Status)
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("nothing is delivered after the media is closed", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		endReferOnDeadline(t, d, lates.record)
+		require.NoError(t, d.media.Close())
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", "terminated"))
+		assert.Empty(t, lates.calls())
+		assert.Zero(t, registeredReferAttempts(d.media))
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("without OnLate a late NOTIFY is answered and dropped", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		endReferOnDeadline(t, d, nil)
+		require.Equal(t, 1, registeredReferAttempts(d.media), "an attempt that ended on the deadline waits for a late NOTIFY")
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", "terminated"))
+		assert.Zero(t, registeredReferAttempts(d.media))
+		assert.Zero(t, d.hangups.Load())
+	})
+}
+
+// referRun is the result of an observed REFER run on its own goroutine.
+type referRun struct {
+	obs ReferObservation
+	err error
+}
+
+// TestReferObserveStaleEventID checks a NOTIFY for an older REFER attempt on
+// the same dialog is never attributed to a newer attempt, and that a NOTIFY
+// without an id goes to the newest attempt only.
+func TestReferObserveStaleEventID(t *testing.T) {
+	// startNewer ends attempt A (CSeq 1) on its deadline, then starts attempt B
+	// (CSeq 2) waiting on its own goroutine, and returns once B's REFER is out.
+	startNewer := func(t *testing.T, d *referObserveDialog, lates *lateRecorder) <-chan referRun {
+		t.Helper()
+		endReferOnDeadline(t, d, lates.record)
+
+		d.nextCSeq = 2
+		sent := make(chan struct{})
+		d.onDo = func(*sip.Request) { close(sent) }
+		done := make(chan referRun, 1)
+		go func() {
+			obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 5 * time.Second})
+			done <- referRun{obs, err}
+		}()
+		select {
+		case <-sent:
+		case <-time.After(time.Second):
+			t.Fatal("the newer REFER was not sent")
+		}
+		return done
+	}
+	awaitRun := func(t *testing.T, done <-chan referRun) referRun {
+		t.Helper()
+		select {
+		case run := <-done:
+			require.NoError(t, run.err)
+			return run
+		case <-time.After(time.Second):
+			t.Fatal("the newer attempt did not end on its final NOTIFY")
+			return referRun{}
+		}
+	}
+
+	t.Run("an older attempt's id goes to that attempt and the newer keeps waiting", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		done := startNewer(t, d, &lates)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer;id=1", "terminated"))
+		require.Len(t, lates.calls(), 1)
+		assert.Equal(t, uint32(1), lates.calls()[0].CSeq)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=2", "terminated"))
+		run := awaitRun(t, done)
+		assert.Equal(t, ReferEndFinalNotify, run.obs.End)
+		require.Len(t, run.obs.Notifies, 1, "the older attempt's NOTIFY was recorded on the newer one")
+		assert.Equal(t, uint32(2), run.obs.Notifies[0].EventID)
+		assert.Equal(t, 200, run.obs.Notifies[0].Status)
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("a NOTIFY without an id goes to the newer attempt, never the older", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var lates lateRecorder
+		done := startNewer(t, d, &lates)
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer", "terminated"))
+		run := awaitRun(t, done)
+		assert.Equal(t, ReferEndFinalNotify, run.obs.End)
+		assert.Equal(t, []int{486}, notifyStatuses(run.obs))
+		assert.Empty(t, lates.calls(), "the older attempt received a NOTIFY without an id")
+		assert.Zero(t, d.hangups.Load())
+	})
+}
+
+// TestReferObserveLateCallbackRunsOutsideTheLock checks OnLate is called after
+// every lock the NOTIFY path takes has been released: an OnLate that takes
+// those locks itself must complete.
+func TestReferObserveLateCallbackRunsOutsideTheLock(t *testing.T) {
+	d := newReferObserveDialog(t, 202, "Accepted")
+	var calls, registeredDuringLate atomic.Int32
+	endReferOnDeadline(t, d, func(ReferLateNotify) {
+		d.media.referMu.Lock()
+		registeredDuringLate.Store(int32(len(d.media.referAttempts)))
+		d.media.referMu.Unlock()
+		d.media.mu.Lock()
+		closed := d.media.closed
+		d.media.mu.Unlock()
+		assert.False(t, closed)
+		calls.Add(1)
+	})
+
+	done := make(chan int, 1)
+	go func() { done <- sendReferNotify(t, d, "SIP/2.0 200 OK", "", "terminated") }()
+	select {
+	case code := <-done:
+		assert.Equal(t, sip.StatusOK, code)
+	case <-time.After(time.Second):
+		t.Fatal("the NOTIFY handler blocked: OnLate ran while a lock it needs was held")
+	}
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Zero(t, registeredDuringLate.Load(), "the attempt is dropped before its late callback runs")
+	assert.Zero(t, d.hangups.Load())
+}
+
+// TestReferObserveDeadlineRace checks a final NOTIFY arriving as the deadline
+// fires is either in the observation or delivered once as late, never both and
+// never neither. The NOTIFY leaves between 0 and 2 ms after the REFER, around
+// the 1 ms deadline, so both halves occur.
+func TestReferObserveDeadlineRace(t *testing.T) {
+	var inTime, late int
+	for i := range 200 {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		sent := make(chan struct{})
+		d.onDo = func(*sip.Request) { close(sent) }
+		notified := make(chan struct{})
+		delay := time.Duration(i%5) * 500 * time.Microsecond
+		go func() {
+			defer close(notified)
+			select {
+			case <-sent:
+			case <-time.After(5 * time.Second):
+				return
+			}
+			time.Sleep(delay)
+			sendReferNotify(t, d, "SIP/2.0 200 OK", "", "terminated;reason=noresource")
+		}()
+
+		var lates atomic.Int32
+		obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{
+			Deadline: time.Millisecond,
+			OnLate:   func(ReferLateNotify) { lates.Add(1) },
+		})
+		require.NoError(t, err)
+		select {
+		case <-notified:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: the NOTIFY was not answered", i)
+		}
+
+		inObservation := obs.End == ReferEndFinalNotify
+		delivered := lates.Load()
+		switch {
+		case inObservation && delivered == 0:
+			inTime++
+		case obs.End == ReferEndDeadline && delivered == 1:
+			late++
+		default:
+			t.Fatalf("iteration %d: end %s with %d late deliveries, want the final in the observation or delivered once as late", i, obs.End, delivered)
+		}
+		require.Zero(t, d.hangups.Load())
+	}
+	t.Logf("in time %d, late %d", inTime, late)
+}
+
+// TestReferObservationCarriesNoRoutingInternals checks neither an observation,
+// a late notify nor an error from the observing REFER carries a host, a URI,
+// Via or Contact, even when every NOTIFY carries them.
+func TestReferObservationCarriesNoRoutingInternals(t *testing.T) {
+	secret := sip.Uri{User: "secret", Host: "10.9.8.7", Port: 5099}
+	sendWithRouting := func(t *testing.T, d DialogSession, body, event, state string) {
+		req := newReferNotifyRequest(t, "message/sipfrag", body)
+		req.PrependHeader(&sip.ViaHeader{
+			ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+			Host: secret.Host, Port: secret.Port, Params: sip.NewParams(),
+		})
+		req.AppendHeader(&sip.ContactHeader{Address: secret})
+		req.AppendHeader(sip.NewHeader("Event", event))
+		req.AppendHeader(sip.NewHeader("Subscription-State", state))
+		tx, _ := newReferNotifyTx(t, req)
+		dialogHandleReferNotify(d, req, tx)
+	}
+	banned := []string{"10.9.8.7", "sip:", "@", "Via", "Contact", "secret"}
+	requireClean := func(t *testing.T, what, rendered string) {
+		t.Helper()
+		for _, b := range banned {
+			assert.NotContains(t, rendered, b, "%s carries %q: %s", what, b, rendered)
+		}
+	}
+
+	d := newReferObserveDialog(t, 202, "Accepted")
+	done := make(chan struct{})
+	d.onDo = func(*sip.Request) {
+		go func() {
+			defer close(done)
+			sendWithRouting(t, d, "SIP/2.0 100 Trying", "refer;id=1", "active;expires=60")
+			sendWithRouting(t, d, "SIP/2.0 486 Busy Here", "refer;id=1", "terminated;reason=noresource")
+		}()
+	}
+	obs, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 5 * time.Second})
+	require.NoError(t, err)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the NOTIFYs were not answered")
+	}
+	require.Len(t, obs.Notifies, 2)
+	requireClean(t, "the observation", fmt.Sprintf("%+v", obs))
+
+	var lates lateRecorder
+	d.onDo = nil
+	d.nextCSeq = 2
+	endReferOnDeadline(t, d, lates.record)
+	sendWithRouting(t, d, "SIP/2.0 200 OK", "refer;id=2", "terminated;reason=noresource")
+	require.Len(t, lates.calls(), 1)
+	requireClean(t, "the late notify", fmt.Sprintf("%+v", lates.calls()[0]))
+
+	_, _, err = observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 0})
+	require.Error(t, err)
+	requireClean(t, "the deadline error", err.Error())
+	d.sipDialog.InitWithState(sip.DialogStateEstablished)
+	_, _, err = observeRefer(t.Context(), d, ReferObserveOptions{Deadline: time.Second})
+	require.Error(t, err)
+	requireClean(t, "the dialog state error", err.Error())
+}
+
+// TestDialogReferKeepsTheFailureContract checks the upstream Refer and
+// ReferOptions, which run over the observing REFER, keep their return contract:
+// nil on a successful final NOTIFY, *ReferFailureError for a failed or missing
+// outcome, sipgo.ErrDialogResponse for a refused REFER, and a return at the
+// acceptance when the int-only callback is in use.
+func TestDialogReferKeepsTheFailureContract(t *testing.T) {
+	orig := referAnswerDeadline
+	referAnswerDeadline = 50 * time.Millisecond
+	defer func() { referAnswerDeadline = orig }()
+
+	terminated := "terminated;reason=noresource"
+	tests := []struct {
+		name        string
+		status      int
+		reason      string
+		wait        bool
+		notifies    []referNotifySpec
+		cancel      bool
+		wantNil     bool
+		wantFailure *ReferFailureError
+		wantRefused int
+	}{
+		{name: "a successful final NOTIFY returns nil", status: 202, reason: "Accepted", wait: true,
+			notifies: []referNotifySpec{{body: "SIP/2.0 200 OK", event: "refer", state: terminated}}, wantNil: true},
+		{name: "a busy final NOTIFY is a failure with its status", status: 202, reason: "Accepted", wait: true,
+			notifies:    []referNotifySpec{{body: "SIP/2.0 100 Trying", event: "refer", state: "active"}, {body: "SIP/2.0 486 Busy Here", event: "refer", state: terminated}},
+			wantFailure: &ReferFailureError{Status: 486, Reason: "Busy Here"}},
+		{name: "no final NOTIFY is a timeout", status: 202, reason: "Accepted", wait: true,
+			wantFailure: &ReferFailureError{Status: 0, Reason: "timeout"}},
+		{name: "an ended subscription is a failure without a status", status: 202, reason: "Accepted", wait: true,
+			notifies:    []referNotifySpec{{body: "SIP/2.0 100 Trying", event: "refer", state: terminated}},
+			wantFailure: &ReferFailureError{Status: 0, Reason: "subscription ended"}},
+		{name: "a cancelled context is a failure without a status", status: 202, reason: "Accepted", wait: true, cancel: true,
+			wantFailure: &ReferFailureError{Status: 0, Reason: "cancelled"}},
+		{name: "a refused REFER is the dialog response error", status: 403, reason: "Forbidden", wait: true, wantRefused: 403},
+		{name: "with the callback an accepted REFER returns at once", status: 200, reason: "OK", wantNil: true},
+		{name: "with the callback a refused REFER is the dialog response error", status: 403, reason: "Forbidden", wantRefused: 403},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newReferObserveDialog(t, tt.status, tt.reason)
+			var waitNotifies func() []int
+			if len(tt.notifies) > 0 {
+				waitNotifies = notifyAfterRefer(t, d, tt.notifies...)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancel {
+				cancel()
+			}
+
+			err := dialogRefer(ctx, d, referTestRecipient, referTestTarget, referTestReferredBy, tt.wait)
+			if waitNotifies != nil {
+				waitNotifies()
+			}
+			assert.Zero(t, d.hangups.Load(), "the REFER path never ends the dialog")
+
+			switch {
+			case tt.wantNil:
+				require.NoError(t, err)
+			case tt.wantFailure != nil:
+				var failure *ReferFailureError
+				require.True(t, errors.As(err, &failure), "want *ReferFailureError, got %T: %v", err, err)
+				assert.Equal(t, tt.wantFailure, failure)
+			default:
+				var refused sipgo.ErrDialogResponse
+				require.True(t, errors.As(err, &refused), "want sipgo.ErrDialogResponse, got %T: %v", err, err)
+				assert.Equal(t, tt.wantRefused, refused.Res.StatusCode)
+			}
+		})
+	}
 }
 
 // TestIntegrationDialogReferWaitsForOutcome asserts the whole loop: a plain
