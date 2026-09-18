@@ -185,6 +185,41 @@ func TestReferAttemptRegistry(t *testing.T) {
 		assert.Zero(t, newer.end)
 	})
 
+	t.Run("a stale id is never given to a newer attempt whose CSeq is not yet known", func(t *testing.T) {
+		m := &DialogMedia{}
+		older := m.beginReferAttempt(nil)
+		m.setReferAttemptCSeq(older, 4)
+		m.observeReferNotify(withID(final, 4))
+		m.finishReferAttempt(older, 0)
+		require.Zero(t, registeredReferAttempts(m), "the older attempt ended on its final NOTIFY and is dropped")
+		newer := m.beginReferAttempt(nil)
+
+		onLate, _ := m.observeReferNotify(withID(final, 4))
+		assert.Nil(t, onLate)
+		assert.Empty(t, newer.notifies, "the older attempt's NOTIFY was recorded on the newer one")
+		assert.Zero(t, newer.end)
+
+		m.observeReferNotify(withID(final, 5))
+		assert.Equal(t, []ReferNotify{withID(final, 5)}, newer.notifies)
+		assert.Equal(t, ReferEndFinalNotify, newer.end)
+	})
+
+	t.Run("an id arriving while two attempts await their CSeq goes to neither", func(t *testing.T) {
+		m := &DialogMedia{}
+		a := m.beginReferAttempt(nil)
+		b := m.beginReferAttempt(nil)
+
+		m.observeReferNotify(withID(final, 1))
+		assert.Empty(t, a.notifies)
+		assert.Empty(t, b.notifies, "a NOTIFY that may be the older attempt's was recorded on the newer one")
+
+		m.setReferAttemptCSeq(a, 1)
+		m.observeReferNotify(withID(final, 1))
+		m.observeReferNotify(withID(final, 2))
+		assert.Equal(t, []ReferNotify{withID(final, 1)}, a.notifies)
+		assert.Equal(t, []ReferNotify{withID(final, 2)}, b.notifies)
+	})
+
 	t.Run("an id arriving before the CSeq is known goes to the most recent attempt", func(t *testing.T) {
 		m := &DialogMedia{}
 		a := m.beginReferAttempt(nil)
@@ -747,6 +782,40 @@ func TestReferObserveStaleEventID(t *testing.T) {
 		assert.Equal(t, ReferEndFinalNotify, run.obs.End)
 		assert.Equal(t, []int{486}, notifyStatuses(run.obs))
 		assert.Empty(t, lates.calls(), "the older attempt received a NOTIFY without an id")
+		assert.Zero(t, d.hangups.Load())
+	})
+
+	t.Run("a stale id arriving while the newer REFER is in flight is never given to it", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var answers []int
+		d.nextCSeq = 4
+		d.onDo = func(*sip.Request) {
+			answers = append(answers, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer;id=4", "terminated;reason=noresource"))
+		}
+		older, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 5 * time.Second})
+		require.NoError(t, err)
+		require.Equal(t, ReferEndFinalNotify, older.End)
+		require.Equal(t, []int{486}, notifyStatuses(older))
+		require.Zero(t, registeredReferAttempts(d.media), "the older attempt is dropped")
+
+		// Both NOTIFYs arrive while the newer REFER is in flight, so its CSeq is
+		// not known yet.
+		d.nextCSeq = 5
+		d.onDo = func(*sip.Request) {
+			answers = append(answers,
+				sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer;id=4", "terminated"),
+				sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=5", "terminated"))
+		}
+		started := time.Now()
+		newer, _, err := observeRefer(t.Context(), d, ReferObserveOptions{Deadline: 5 * time.Second})
+		require.NoError(t, err)
+		assert.Less(t, time.Since(started), time.Second, "the newer attempt did not end on its final NOTIFY")
+		assert.Equal(t, ReferEndFinalNotify, newer.End)
+		assert.Equal(t, []int{200}, notifyStatuses(newer), "the older attempt's NOTIFY was recorded on the newer one")
+		require.Len(t, newer.Notifies, 1)
+		assert.Equal(t, uint32(5), newer.Notifies[0].EventID)
+		assert.Equal(t, []int{sip.StatusOK, sip.StatusOK, sip.StatusOK}, answers, "every NOTIFY is answered 200")
+		assert.Zero(t, registeredReferAttempts(d.media))
 		assert.Zero(t, d.hangups.Load())
 	})
 }

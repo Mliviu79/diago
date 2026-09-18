@@ -74,14 +74,18 @@ type DialogMedia struct {
 
 	onReferNotify func(statusCode int)
 
-	// referMu guards referAttempts, referLatest and the attempts they hold. It is
-	// separate from mu so observing a REFER NOTIFY never contends with media
-	// state.
+	// referMu guards referAttempts, referHighestCSeq, referLatest and the
+	// attempts they hold. It is separate from mu so observing a REFER NOTIFY
+	// never contends with media state.
 	referMu sync.Mutex
 	// referAttempts are the registered REFER attempts, oldest first: those
 	// waiting for their outcome, and those whose wait ended on the deadline or
 	// on cancellation and can still receive a late terminal NOTIFY.
 	referAttempts []*referAttempt
+	// referHighestCSeq is the highest CSeq recorded for a REFER sent on this
+	// dialog, dropped attempts included. In-dialog CSeqs only grow, so an Event
+	// id at or below it belongs to an earlier REFER.
+	referHighestCSeq uint32
 	// referLatest is the attempt begun most recently. It is kept after it is
 	// dropped, so a NOTIFY without an Event id is never given to an older
 	// attempt once a newer one has started.
@@ -136,10 +140,13 @@ func (d *DialogMedia) beginReferAttempt(onLate func(ReferLateNotify)) *referAtte
 	return a
 }
 
-// setReferAttemptCSeq records the sent REFER's CSeq on a, but only while a is
-// registered.
+// setReferAttemptCSeq records the sent REFER's CSeq: on the dialog's high-water
+// mark whatever a's state, and on a only while a is registered.
 func (d *DialogMedia) setReferAttemptCSeq(a *referAttempt, cseq uint32) {
 	d.referMu.Lock()
+	if cseq > d.referHighestCSeq {
+		d.referHighestCSeq = cseq
+	}
 	if a.registered {
 		a.cseq = cseq
 		a.cseqKnown = true
@@ -149,9 +156,10 @@ func (d *DialogMedia) setReferAttemptCSeq(a *referAttempt, cseq uint32) {
 
 // observeReferNotify routes one parsed NOTIFY to the REFER attempt it belongs
 // to. With an Event id that is the registered attempt whose known CSeq equals
-// it, or else the most recent attempt while its CSeq is still unknown; without
-// an id it is the most recent attempt. A NOTIFY with no such attempt is
-// dropped.
+// it, or else the most recent attempt while its CSeq is still unknown, provided
+// no other attempt awaits its CSeq and the id is above every REFER CSeq the
+// dialog has recorded; without an id it is the most recent attempt. A NOTIFY
+// with no such attempt is dropped.
 //
 // While the attempt's wait is open the NOTIFY is recorded, and a terminal one
 // ends the wait. After the wait ended on the deadline or on cancellation a
@@ -185,14 +193,24 @@ func (d *DialogMedia) observeReferNotify(n ReferNotify) (onLate func(ReferLateNo
 // Called with referMu held.
 func (d *DialogMedia) referNotifyTargetLocked(n ReferNotify) *referAttempt {
 	if n.HasEventID {
+		awaitingCSeq := 0
 		for _, a := range d.referAttempts {
-			if a.cseqKnown && a.cseq == n.EventID {
+			if !a.cseqKnown {
+				awaitingCSeq++
+				continue
+			}
+			if a.cseq == n.EventID {
 				return a
 			}
 		}
-		// The NOTIFY raced ahead of the REFER's response, so the most recent
-		// attempt's CSeq is not known yet.
-		if latest := d.referLatest; latest != nil && latest.registered && !latest.cseqKnown {
+		// The NOTIFY may have raced ahead of the REFER's response, while the
+		// most recent attempt's CSeq is not known yet. In-dialog CSeqs only
+		// grow, so an id at or below the highest REFER CSeq recorded belongs to
+		// an earlier REFER, even one already dropped. With a second attempt
+		// also awaiting its CSeq the id may be that attempt's, so it is given
+		// to neither.
+		if latest := d.referLatest; latest != nil && latest.registered && !latest.cseqKnown &&
+			awaitingCSeq == 1 && n.EventID > d.referHighestCSeq {
 			return latest
 		}
 		return nil
