@@ -242,6 +242,10 @@ func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTra
 	// Only a final sipfrag is a transfer outcome; 1xx is progress. Delivering just
 	// the terminal keeps the waiter's single-slot mailbox from being occupied by a
 	// 100 Trying and dropping the real result.
+	//
+	// The result is handed to the waiting Refer and to any installed OnNotify
+	// callback, and the dialog is left to its owner: what follows a transfer
+	// result, success or failure, is the caller's decision.
 	if code >= 200 {
 		id, hasID := parseReferNotifyEventID(req)
 		med.deliverReferResult(id, hasID, referTerminal{status: code, reason: reason})
@@ -249,8 +253,6 @@ func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTra
 
 	if onNot != nil {
 		onNot(code)
-	} else if code >= 200 {
-		d.Hangup(context.TODO())
 	}
 }
 

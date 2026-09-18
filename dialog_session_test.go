@@ -125,7 +125,7 @@ func TestDialogHandleReferNotifyContentType(t *testing.T) {
 			} else {
 				require.Equal(t, -1, notified, "OnNotify must not fire on a rejected NOTIFY")
 			}
-			require.Zero(t, d.hangups, "OnNotify handler set, so no implicit hangup")
+			require.Zero(t, d.hangups, "a REFER NOTIFY never ends the dialog")
 		})
 	}
 }
@@ -142,4 +142,43 @@ func TestDialogHandleReferNotifyShortBody(t *testing.T) {
 	require.Len(t, conn.msgs, 1)
 	res := conn.msgs[0].(*sip.Response)
 	require.Equal(t, sip.StatusBadRequest, res.StatusCode)
+}
+
+// TestDialogHandleReferNotifyLeavesTheDialogAlone checks a REFER NOTIFY hands
+// the result on and never ends the dialog, whoever sent it and whenever it
+// arrives. Each row has no Refer waiting and no OnNotify callback, which is the
+// shape of a NOTIFY arriving after Refer stopped waiting: what follows a
+// transfer result is the dialog owner's decision.
+func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		headers []sip.Header
+	}{
+		{name: "final failure", body: "SIP/2.0 486 Busy Here"},
+		{name: "final success", body: "SIP/2.0 200 OK"},
+		{
+			name:    "progress with the subscription terminated",
+			body:    "SIP/2.0 100 Trying",
+			headers: []sip.Header{sip.NewHeader("Subscription-State", "terminated;reason=noresource")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &referNotifyDialog{media: &DialogMedia{}}
+
+			req := newReferNotifyRequest(t, "message/sipfrag", tc.body)
+			for _, h := range tc.headers {
+				req.AppendHeader(h)
+			}
+			tx, conn := newReferNotifyTx(t, req)
+
+			dialogHandleReferNotify(d, req, tx)
+
+			require.Len(t, conn.msgs, 1)
+			res, ok := conn.msgs[0].(*sip.Response)
+			require.True(t, ok)
+			require.Equal(t, sip.StatusOK, res.StatusCode)
+			require.Zero(t, d.hangups, "a %s NOTIFY ended the dialog", tc.name)
+		})
+	}
 }

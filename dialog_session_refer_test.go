@@ -301,6 +301,9 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 		require.True(t, errors.As(err, &referErr), "want *ReferFailureError, got %T: %v", err, err)
 		assert.Equal(t, sip.StatusBusyHere, referErr.Status)
 		assert.NotContains(t, referErr.Error(), "127.0.0.1")
+
+		// A refused transfer leaves the referring dialog to its owner.
+		requireDialogStaysConfirmed(t, d, 750*time.Millisecond)
 	})
 
 	t.Run("NoTerminalNotifyTimesOut", func(t *testing.T) {
@@ -325,4 +328,21 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 		assert.Equal(t, 0, referErr.Status, "a timeout carries no SIP status")
 		assert.True(t, strings.Contains(referErr.Reason, "timeout") || strings.Contains(referErr.Reason, "cancelled"))
 	})
+}
+
+// requireDialogStaysConfirmed fails if d ends within window, then requires it
+// is still confirmed. The bounded wait is what gives the negative assertion a
+// meaning: an ending dialog cancels its context, and the state check covers a
+// dialog that has left confirmed without cancelling yet.
+func requireDialogStaysConfirmed(t *testing.T, d DialogSession, window time.Duration) {
+	t.Helper()
+
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case <-d.Context().Done():
+		t.Fatalf("the dialog ended within %s of the REFER outcome", window)
+	case <-timer.C:
+	}
+	require.Equal(t, sip.DialogStateConfirmed, d.DialogSIP().LoadState(), "the dialog left the confirmed state")
 }
