@@ -59,7 +59,9 @@ func newReferNotifyRequest(t *testing.T, contentType string, body string) *sip.R
 	callid := sip.CallIDHeader("refer-notify-test")
 	req.AppendHeader(&callid)
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.NOTIFY})
-	req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	if contentType != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
 	req.SetBody([]byte(body))
 	return req
 }
@@ -144,6 +146,40 @@ func TestDialogHandleReferNotifyShortBody(t *testing.T) {
 	require.Len(t, conn.msgs, 1)
 	res := conn.msgs[0].(*sip.Response)
 	require.Equal(t, sip.StatusBadRequest, res.StatusCode)
+}
+
+// TestDialogHandleReferNotifyWithoutContentType checks an in-dialog NOTIFY that
+// carries no Content-Type is rejected rather than panicking on the missing
+// header, and that the rejection is never recorded as a transfer outcome.
+func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
+	notified := -1
+	d := &referNotifyDialog{media: &DialogMedia{}}
+	d.media.onReferNotify = func(statusCode int) { notified = statusCode }
+	attempt := d.media.beginReferAttempt(nil)
+
+	req := newReferNotifyRequest(t, "", "SIP/2.0 200 OK")
+	require.Nil(t, req.ContentType(), "the NOTIFY must reach the handler without Content-Type")
+	tx, conn := newReferNotifyTx(t, req)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		dialogHandleReferNotify(d, req, tx)
+	}()
+	require.Nil(t, recovered, "dialogHandleReferNotify panicked")
+
+	require.Len(t, conn.msgs, 1)
+	res, ok := conn.msgs[0].(*sip.Response)
+	require.True(t, ok)
+	require.Equal(t, sip.StatusBadRequest, res.StatusCode)
+	require.Equal(t, -1, notified, "OnNotify must not fire on a rejected NOTIFY")
+
+	d.media.referMu.Lock()
+	notifies, end := len(attempt.notifies), attempt.end
+	d.media.referMu.Unlock()
+	require.Zero(t, notifies, "a rejected NOTIFY must not be recorded on the REFER attempt")
+	require.Zero(t, end, "a rejected NOTIFY must not end the REFER attempt")
+	require.Zero(t, d.hangups, "a REFER NOTIFY never ends the dialog")
 }
 
 // TestDialogHandleReferNotifyLeavesTheDialogAlone checks a REFER NOTIFY hands

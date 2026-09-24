@@ -475,9 +475,9 @@ func referAccepted(status int) bool {
 
 func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
 	// TODO how to know this is refer
-	contentType := req.ContentType().Value()
+	contentType := req.ContentType()
 	// For now very basic check
-	if !strings.HasPrefix(contentType, "message/sipfrag") {
+	if contentType == nil || !strings.HasPrefix(contentType.Value(), "message/sipfrag") {
 		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
 		return
 	}
