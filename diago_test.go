@@ -299,6 +299,128 @@ func TestDiagoInfoWithoutContentType(t *testing.T) {
 	}
 }
 
+// TestDiagoFailedRequestWithoutFromOrTo sends real BYE, NOTIFY and INVITE
+// requests lacking From or To to the handlers over a loopback socket. Dialog
+// matching and INVITE reading fail exactly when either header is missing, so
+// the failure path must not read them unchecked. A middleware recovers any
+// panic from every handler run so the failure is reported instead of ending
+// the test binary, and signals when the first run has returned, because the
+// 400 goes out before the failure is logged.
+func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
+	var mu sync.Mutex
+	panics := map[string][]string{}
+	handlerDone := map[string]chan struct{}{}
+	recoverPanic := func(next sipgo.RequestHandler) sipgo.RequestHandler {
+		return func(req *sip.Request, tx sip.ServerTransaction) {
+			callID := req.CallID().Value()
+			defer func() {
+				r := recover()
+				mu.Lock()
+				if r != nil {
+					panics[callID] = append(panics[callID], fmt.Sprint(r))
+				}
+				done := handlerDone[callID]
+				delete(handlerDone, callID)
+				mu.Unlock()
+				if r != nil {
+					_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
+				}
+				if done != nil {
+					close(done)
+				}
+			}()
+			next(req, tx)
+		}
+	}
+
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua, WithServerRequestMiddleware(recoverPanic))
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		method  sip.RequestMethod
+		absent  string
+		headers []sip.Header
+	}{
+		{name: "BYE without From", method: sip.BYE, absent: "From"},
+		{name: "BYE without To", method: sip.BYE, absent: "To"},
+		{name: "NOTIFY without To", method: sip.NOTIFY, absent: "To", headers: []sip.Header{sip.NewHeader("Event", "refer")}},
+		{name: "INVITE without From", method: sip.INVITE, absent: "From"},
+		{name: "INVITE without To", method: sip.INVITE, absent: "To"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			callID := fmt.Sprintf("no-from-to-%d", i)
+			req := sip.NewRequest(tc.method, sip.Uri{User: "dg", Host: "127.0.0.1", Port: port})
+			if tc.absent != "From" {
+				req.AppendHeader(sip.NewHeader("From", "<sip:peer@127.0.0.1>;tag=peer"))
+			}
+			if tc.absent != "To" {
+				req.AppendHeader(sip.NewHeader("To", "<sip:dg@127.0.0.1>;tag=dg"))
+			}
+			req.AppendHeader(sip.NewHeader("Call-ID", callID))
+			req.AppendHeader(sip.NewHeader("CSeq", "1 "+tc.method.String()))
+			req.AppendHeader(sip.NewHeader("Contact", "<sip:peer@127.0.0.1>"))
+			for _, h := range tc.headers {
+				req.AppendHeader(h)
+			}
+			if tc.absent == "From" {
+				require.Nil(t, req.From(), "the request must reach the handler without From")
+			} else {
+				require.Nil(t, req.To(), "the request must reach the handler without To")
+			}
+
+			done := make(chan struct{})
+			mu.Lock()
+			handlerDone[callID] = done
+			mu.Unlock()
+
+			isInvite := tc.method == sip.INVITE
+			timeout := 5 * time.Second
+			if isInvite {
+				timeout = time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			res, err := client.Do(ctx, req, sipgo.ClientRequestAddVia)
+			if !isInvite {
+				require.NoError(t, err)
+			}
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "handler did not return")
+			}
+
+			mu.Lock()
+			recovered := panics[callID]
+			mu.Unlock()
+			require.Empty(t, recovered, "%s handler panicked", tc.method)
+
+			if isInvite {
+				// ReadInvite rejects the INVITE and the handler sends no final response.
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				assert.Nil(t, res)
+				return
+			}
+			assert.Equal(t, sip.StatusBadRequest, res.StatusCode)
+		})
+	}
+}
+
 func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 	tran := Transport{
 		Transport: "udp",

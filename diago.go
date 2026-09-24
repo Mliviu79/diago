@@ -326,7 +326,15 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	errHandler := func(f func(req *sip.Request, tx sip.ServerTransaction) error) sipgo.RequestHandler {
 		handler := func(req *sip.Request, tx sip.ServerTransaction) {
 			if err := f(req, tx); err != nil {
-				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", req.From().String(), "req.to", req.To().Value())
+				// The request may have failed because From or To is absent
+				var from, to string
+				if h := req.From(); h != nil {
+					from = h.String()
+				}
+				if h := req.To(); h != nil {
+					to = h.Value()
+				}
+				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", from, "req.to", to)
 				return
 			}
 			// Termination gracefull will be done by sipgo now
