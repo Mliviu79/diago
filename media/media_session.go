@@ -45,6 +45,16 @@ var (
 	// reached: a transport we do not speak, or an address and port that cannot
 	// carry RTP.
 	ErrNoCommonMedia = errors.New("no common media")
+
+	// ErrICERestartUnsupported means a session renegotiating over an
+	// established ICE pair was sent a different ice-ufrag or ice-pwd, which is
+	// how a peer asks for an ICE restart. This session cannot restart ICE: the
+	// agent that would run the new connectivity checks belongs to the session
+	// it was forked from, and the fork only continues the pair that agent
+	// nominated. The offer is well formed, so the caller should answer it with
+	// 488 Not Acceptable Here and keep its current session. Match it with
+	// errors.Is.
+	ErrICERestartUnsupported = errors.New("ice restart unsupported")
 )
 
 // RTPTracer receives decoded RTP packets when RTPDebug is enabled.
@@ -253,6 +263,14 @@ type MediaSession struct {
 	rtcpMux        bool
 	remoteICEUfrag string
 	remoteICEPwd   string
+	// establishedICE describes the pair the agent nominated and the DTLS
+	// association built over it. Finalize sets it once SRTP is keyed and Fork
+	// shares it, because a fork has no agent: without this record a
+	// renegotiating fork has nothing to compare the peer's credentials against
+	// and nothing to put in its own SDP. It is never written after it is set,
+	// which is what makes sharing one pointer between a session and its forks
+	// safe.
+	establishedICE *establishedICE
 
 	onFinalize func() error
 
@@ -510,6 +528,14 @@ func (s *MediaSession) StartRTP(rw int8) error {
 
 // Fork is special call to be used in case when there is session update
 // It preserves pointer to same conneciton but rest is removed
+//
+// An ICE session is forked onto the same transport: the fork shares the ICE
+// mux, and so the nominated pair, but never the agent. Once the pair is
+// established the fork also carries a read-only record of it and the SRTP
+// contexts in use, so it renegotiates over that pair and its DTLS association
+// instead of running checks or a handshake: RemoteSDP accepts the same remote
+// credentials and returns ErrICERestartUnsupported for different ones, and
+// LocalSDP keeps describing the pair.
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
 		Laddr:          s.Laddr, // TODO clone it although it is read only
@@ -525,12 +551,12 @@ func (s *MediaSession) Fork() *MediaSession {
 		ICEConf:        s.ICEConf,
 		DTLSRole:       s.DTLSRole,
 		rtcpMux:        s.rtcpMux,
-		// The mux is shared like rtpConn and rtcpConn above, so a renegotiated
-		// session keeps sending DTLS to the right stream. The agent is
-		// deliberately not carried over: it owns the socket, and a fork closing
-		// it would tear down the media of the session it was forked from. That
-		// means a fork renegotiates over the existing pair rather than
-		// restarting ICE.
+		// The mux is shared like rtpConn and rtcpConn above, so the fork keeps
+		// the nominated pair. The agent is deliberately not carried over: it
+		// owns the socket, and a fork closing it would tear down the media of
+		// the session it was forked from. A fork therefore renegotiates over
+		// the existing pair, described by establishedICE below, and refuses an
+		// ICE restart.
 		iceMux: s.iceMux,
 		// ExternalIP is what LocalSDP publishes as the c= address, and LocalSDP
 		// regenerates on every call for a negotiated session. Dropping it here
@@ -552,6 +578,22 @@ func (s *MediaSession) Fork() *MediaSession {
 		// answer as a downgrade attack and drop the call.
 		SecureRTP: s.SecureRTP,
 		SRTPAlg:   s.SRTPAlg,
+	}
+
+	// A fork of an established ICE pair continues its DTLS association, so it
+	// keeps the SRTP contexts as well. They are handed over rather than
+	// derived again from the same keying material, because a context is more
+	// than its keys: it holds the rollover counter and highest sequence number
+	// of every stream already in flight (RFC 3711 section 3.3.1). The peer
+	// continues its own contexts, so a fresh one here would put a stream that
+	// had already wrapped its sequence number back at a rollover counter of
+	// zero while the peer's stayed where it was, and that stream would stop
+	// authenticating. The old session stops using them when the dialog swaps
+	// the fork in.
+	if s.establishedICE != nil {
+		cp.establishedICE = s.establishedICE
+		cp.localCtxSRTP = s.localCtxSRTP
+		cp.remoteCtxSRTP = s.remoteCtxSRTP
 	}
 	return &cp
 }
@@ -725,20 +767,28 @@ func (s *MediaSession) LocalSDP() []byte {
 		rtpProfile = s.remoteProto
 	}
 
+	// A fork has no agent, but when it continues an established pair it must
+	// still describe that pair: an offer or answer without ICE attributes tells
+	// the peer ICE is gone from the session.
 	var iceSet *iceSetup
-	if s.iceAgent != nil {
-		ufrag, pwd := s.iceAgent.Credentials()
-		candidates := s.iceAgent.Candidates()
-		attrs := make([]string, 0, len(candidates))
-		for _, c := range candidates {
-			attrs = append(attrs, iceCandidateSDP(c))
-		}
-		iceSet = &iceSetup{
-			ufrag:      ufrag,
-			pwd:        pwd,
-			candidates: attrs,
-			rtcpMux:    s.rtcpMux,
-		}
+	switch {
+	case s.iceAgent != nil:
+		set := s.agentICESetup()
+		iceSet = &set
+	case s.establishedICE != nil:
+		set := s.establishedICE.local
+		iceSet = &set
+	}
+
+	// RFC 8842 section 5.3: an answer to a subsequent offer that continues the
+	// association "MUST insert an SDP "setup" attribute with an attribute value
+	// that does not change the previously negotiated DTLS roles". Deriving the
+	// role afresh from the offer gets this wrong exactly when we were passive,
+	// because the actpass a subsequent offer carries (section 5.5) derives
+	// active. A re-offer of our own keeps actpass from localDTLSSetup, which is
+	// what section 5.5 asks of the offerer.
+	if dtlsSet != nil && s.establishedICE != nil && s.answeringOffer() {
+		dtlsSet.setup = s.establishedICE.dtlsSetup
 	}
 
 	if s.sessionID == 0 {
@@ -1045,116 +1095,19 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		// this switch made us the client, so both endpoints sent a ClientHello.
 		s.dtlsRemoteSetup = setup
 
-		// THIS may need external or after SIP ACK establishment
-		dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
-		role := "server"
-		if s.dtlsActsAsClient() {
-			role = "client"
-		}
-
-		// dialDTLS builds the DTLS conn over the media transport.
-		dialDTLS := func() error {
-			var err error
-			s.dtlsTr = s.dtlsTransport()
-			if role == "server" {
-				s.dtlsConn, err = dtls.Server(s.dtlsTr, &s.Raddr, dtlsConf)
-			} else {
-				s.dtlsConn, err = dtls.Client(s.dtlsTr, &s.Raddr, dtlsConf)
-			}
-			if err != nil {
-				return fmt.Errorf("failed to setup dlts %s conn: %w", role, err)
-			}
-			return nil
-		}
-
-		// Without ICE the transport already exists, so the conn is built now:
-		// a server conn must be able to buffer a ClientHello that arrives
-		// between our answer and Finalize. An ICE session has no transport
-		// until connectivity checks nominate a pair, so it defers this.
-		if !s.iceEnabled() {
-			if err := dialDTLS(); err != nil {
+		// RFC 8842 section 3.1 needs a new DTLS association only when the
+		// roles change, a fingerprint changes, or tls-id asks for one. A
+		// session continuing an established pair is renegotiating codecs or
+		// direction over the association it already has, so it keeps it and
+		// the SRTP keys Fork handed over, and arms no handshake. Arming one
+		// would not even run: the server re-INVITE path never calls Finalize
+		// on the fork, so the media after the re-INVITE would go out and come
+		// in unkeyed with nothing reporting it. The attributes above are still
+		// parsed and validated, and the peer's a=setup is still recorded.
+		if s.establishedICE == nil {
+			if err := s.armDTLSHandshake(setup, fingerprints); err != nil {
 				return err
 			}
-		}
-
-		s.onFinalize = func() error {
-			if s.iceEnabled() {
-				if err := s.startICE(); err != nil {
-					return err
-				}
-				if err := dialDTLS(); err != nil {
-					return err
-				}
-			}
-
-			DefaultLogger().Debug("Starting dtls handshake",
-				"setup", setup,
-				"role", role,
-				"laddr", s.dtlsConn.LocalAddr().String(),
-				"raddr", s.dtlsConn.RemoteAddr().String(),
-			)
-			if err := s.dtlsConn.Handshake(); err != nil {
-				return fmt.Errorf("dtls conn handshake: %w", err)
-			}
-
-			// The exchange is over, so the stack must let the socket go before it
-			// can take a single SRTP packet off it. This is the first statement
-			// after the handshake for that reason: nothing may come between.
-			if err := s.retireDTLS(); err != nil {
-				return err
-			}
-
-			DefaultLogger().Debug("Handshake finished. Checking DTLS State")
-
-			state, ok := s.dtlsConn.ConnectionState()
-			if !ok {
-				return fmt.Errorf("failed to get dtls client state")
-			}
-
-			// Setup now SRTP for encryption
-			prof, _ := s.dtlsConn.SelectedSRTPProtectionProfile()
-			p := srtp.ProtectionProfile(prof)
-			masterKeyLen, err := p.KeyLen()
-			if err != nil {
-				return fmt.Errorf("dtls - failed to get master keylen: %w", err)
-			}
-			masterSaltLen, err := p.SaltLen()
-			if err != nil {
-				return fmt.Errorf("dtls - failed to get master saltlen: %w", err)
-			}
-			keyingMaterial, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 2*(masterKeyLen+masterSaltLen))
-			if err != nil {
-				return fmt.Errorf("dtls - failed to export keying material: %w", err)
-			}
-
-			clientKey := keyingMaterial[:masterKeyLen]
-			serverKey := keyingMaterial[masterKeyLen : 2*masterKeyLen]
-			clientSalt := keyingMaterial[2*masterKeyLen : 2*masterKeyLen+masterSaltLen]
-			serverSalt := keyingMaterial[2*masterKeyLen+masterSaltLen:]
-
-			if role == "server" {
-				// Change order
-				clientKey, serverKey = serverKey, clientKey
-				clientSalt, serverSalt = serverSalt, clientSalt
-			}
-
-			s.localCtxSRTP, err = srtp.CreateContext(clientKey, clientSalt, p)
-			if err != nil {
-				return fmt.Errorf("failed to create SRTP context: %w", err)
-			}
-
-			// s.localCtxSRTP, err = srtp.CreateContext(serverKey, serverSalt, p)
-			s.remoteCtxSRTP, err = srtp.CreateContext(serverKey, serverSalt, p)
-			if err != nil {
-				return fmt.Errorf("failed to create SRTP context: %w", err)
-			}
-
-			if s.localCtxSRTP == nil && s.remoteCtxSRTP == nil {
-				panic("no context setup")
-			}
-
-			DefaultLogger().Debug("DTLS SRTP setuped")
-			return nil
 		}
 	}
 
@@ -1171,33 +1124,191 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	return nil
 }
 
+// armDTLSHandshake prepares the DTLS association RemoteSDP negotiated and arms
+// Finalize to run the handshake and key SRTP from it. setup is the peer's
+// a=setup value and fingerprints are the certificate fingerprints it sent.
+func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerprints) error {
+	// THIS may need external or after SIP ACK establishment
+	dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
+	role := "server"
+	if s.dtlsActsAsClient() {
+		role = "client"
+	}
+
+	// dialDTLS builds the DTLS conn over the media transport.
+	dialDTLS := func() error {
+		var err error
+		s.dtlsTr = s.dtlsTransport()
+		if role == "server" {
+			s.dtlsConn, err = dtls.Server(s.dtlsTr, &s.Raddr, dtlsConf)
+		} else {
+			s.dtlsConn, err = dtls.Client(s.dtlsTr, &s.Raddr, dtlsConf)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to setup dlts %s conn: %w", role, err)
+		}
+		return nil
+	}
+
+	// Without ICE the transport already exists, so the conn is built now:
+	// a server conn must be able to buffer a ClientHello that arrives
+	// between our answer and Finalize. An ICE session has no transport
+	// until connectivity checks nominate a pair, so it defers this.
+	if !s.iceEnabled() {
+		if err := dialDTLS(); err != nil {
+			return err
+		}
+	}
+
+	s.onFinalize = func() error {
+		if s.iceEnabled() {
+			if err := s.startICE(); err != nil {
+				return err
+			}
+			if err := dialDTLS(); err != nil {
+				return err
+			}
+		}
+
+		DefaultLogger().Debug("Starting dtls handshake",
+			"setup", setup,
+			"role", role,
+			"laddr", s.dtlsConn.LocalAddr().String(),
+			"raddr", s.dtlsConn.RemoteAddr().String(),
+		)
+		if err := s.dtlsConn.Handshake(); err != nil {
+			return fmt.Errorf("dtls conn handshake: %w", err)
+		}
+
+		// The exchange is over, so the stack must let the socket go before it
+		// can take a single SRTP packet off it. This is the first statement
+		// after the handshake for that reason: nothing may come between.
+		if err := s.retireDTLS(); err != nil {
+			return err
+		}
+
+		DefaultLogger().Debug("Handshake finished. Checking DTLS State")
+
+		state, ok := s.dtlsConn.ConnectionState()
+		if !ok {
+			return fmt.Errorf("failed to get dtls client state")
+		}
+
+		// Setup now SRTP for encryption
+		prof, _ := s.dtlsConn.SelectedSRTPProtectionProfile()
+		p := srtp.ProtectionProfile(prof)
+		masterKeyLen, err := p.KeyLen()
+		if err != nil {
+			return fmt.Errorf("dtls - failed to get master keylen: %w", err)
+		}
+		masterSaltLen, err := p.SaltLen()
+		if err != nil {
+			return fmt.Errorf("dtls - failed to get master saltlen: %w", err)
+		}
+		keyingMaterial, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 2*(masterKeyLen+masterSaltLen))
+		if err != nil {
+			return fmt.Errorf("dtls - failed to export keying material: %w", err)
+		}
+
+		clientKey := keyingMaterial[:masterKeyLen]
+		serverKey := keyingMaterial[masterKeyLen : 2*masterKeyLen]
+		clientSalt := keyingMaterial[2*masterKeyLen : 2*masterKeyLen+masterSaltLen]
+		serverSalt := keyingMaterial[2*masterKeyLen+masterSaltLen:]
+
+		if role == "server" {
+			// Change order
+			clientKey, serverKey = serverKey, clientKey
+			clientSalt, serverSalt = serverSalt, clientSalt
+		}
+
+		s.localCtxSRTP, err = srtp.CreateContext(clientKey, clientSalt, p)
+		if err != nil {
+			return fmt.Errorf("failed to create SRTP context: %w", err)
+		}
+
+		// s.localCtxSRTP, err = srtp.CreateContext(serverKey, serverSalt, p)
+		s.remoteCtxSRTP, err = srtp.CreateContext(serverKey, serverSalt, p)
+		if err != nil {
+			return fmt.Errorf("failed to create SRTP context: %w", err)
+		}
+
+		if s.localCtxSRTP == nil && s.remoteCtxSRTP == nil {
+			panic("no context setup")
+		}
+
+		// Recorded only now, with the handshake done and both directions
+		// keyed: a fork that finds this record continues the pair without
+		// checks or a handshake of its own, so it must never see a pair that
+		// is not yet usable.
+		if s.iceEnabled() {
+			established := &establishedICE{
+				local:       s.agentICESetup(),
+				remoteUfrag: s.remoteICEUfrag,
+				remotePwd:   s.remoteICEPwd,
+				dtlsSetup:   dtlsSetupPassive,
+			}
+			if role == "client" {
+				established.dtlsSetup = dtlsSetupActive
+			}
+			s.establishedICE = established
+		}
+
+		DefaultLogger().Debug("DTLS SRTP setuped")
+		return nil
+	}
+	return nil
+}
+
+// agentICESetup renders our side of ICE from the agent: the credentials, the
+// gathered candidates and rtcp-mux. It is the one place that happens, both for
+// LocalSDP and for the record a fork carries, so the two cannot describe the
+// pair differently. The caller guarantees the agent exists.
+func (s *MediaSession) agentICESetup() iceSetup {
+	ufrag, pwd := s.iceAgent.Credentials()
+	candidates := s.iceAgent.Candidates()
+	attrs := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		attrs = append(attrs, iceCandidateSDP(c))
+	}
+	return iceSetup{
+		ufrag:      ufrag,
+		pwd:        pwd,
+		candidates: attrs,
+		rtcpMux:    s.rtcpMux,
+	}
+}
+
 // remoteICE reads the remote ICE credentials and candidates out of the SDP
-// attributes and feeds them to the agent. Connectivity checks are not started
-// here: they belong to Finalize, once the offer/answer exchange is complete.
+// attributes. Connectivity checks are not started here: they belong to
+// Finalize, once the offer/answer exchange is complete.
+//
+// With an agent they are fed to it. A fork has none, and instead compares them
+// with the pair it continues: the same credentials mean the peer is
+// renegotiating codecs, direction or keys over the pair already in use, so
+// nothing is fed anywhere; different ones mean it wants an ICE restart, which
+// is refused with ErrICERestartUnsupported.
 func (s *MediaSession) remoteICE(attrs []string) error {
 	// Tracked separately from s.rtcpMux: that one records our own intent and
 	// listenICE has already set it for every ICE session, so it says nothing
 	// about what the remote agreed to.
 	remoteRTCPMux := false
+	var ufrag, pwd string
+	var candidates []string
 
 	for _, v := range attrs {
 		switch {
 		case strings.HasPrefix(v, "ice-ufrag:"):
-			s.remoteICEUfrag = strings.TrimSpace(v[len("ice-ufrag:"):])
+			ufrag = strings.TrimSpace(v[len("ice-ufrag:"):])
 		case strings.HasPrefix(v, "ice-pwd:"):
-			s.remoteICEPwd = strings.TrimSpace(v[len("ice-pwd:"):])
+			pwd = strings.TrimSpace(v[len("ice-pwd:"):])
 		case strings.HasPrefix(v, "candidate:"):
-			if err := s.iceAgent.AddRemoteCandidate(strings.TrimSpace(v)); err != nil {
-				// One malformed candidate must not fail the session: ICE can
-				// still nominate a pair from the others.
-				DefaultLogger().Warn("Skipping bad ICE candidate", "attr", v, "error", err)
-			}
+			candidates = append(candidates, strings.TrimSpace(v))
 		case v == "rtcp-mux":
 			remoteRTCPMux = true
 		}
 	}
 
-	if s.remoteICEUfrag == "" || s.remoteICEPwd == "" {
+	if ufrag == "" || pwd == "" {
 		return fmt.Errorf("sdp: ICE enabled but remote sent no ice-ufrag/ice-pwd")
 	}
 
@@ -1207,8 +1318,40 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 		return fmt.Errorf("sdp: ICE requires rtcp-mux, remote did not offer it")
 	}
 
-	s.iceAgent.SetRemoteCredentials(s.remoteICEUfrag, s.remoteICEPwd)
-	return nil
+	switch {
+	case s.iceAgent != nil:
+		s.remoteICEUfrag = ufrag
+		s.remoteICEPwd = pwd
+		for _, c := range candidates {
+			if err := s.iceAgent.AddRemoteCandidate(c); err != nil {
+				// One malformed candidate must not fail the session: ICE can
+				// still nominate a pair from the others.
+				DefaultLogger().Warn("Skipping bad ICE candidate", "attr", c, "error", err)
+			}
+		}
+		s.iceAgent.SetRemoteCredentials(ufrag, pwd)
+		return nil
+
+	case s.establishedICE != nil:
+		if ufrag != s.establishedICE.remoteUfrag || pwd != s.establishedICE.remotePwd {
+			// The values stay out of the error: it may be logged or reach a
+			// response, and ice-pwd is the key the peer's connectivity checks
+			// are authenticated with.
+			return fmt.Errorf("sdp: remote ICE credentials changed on an established pair: %w", ErrICERestartUnsupported)
+		}
+		// Candidates are ignored on purpose. The pair is already nominated,
+		// and adopting a new remote address from an offer without checks
+		// would let the offer redirect media wherever it names.
+		s.remoteICEUfrag = ufrag
+		s.remoteICEPwd = pwd
+		return nil
+
+	default:
+		// A fork of a session whose checks never completed: there is neither
+		// an agent to run them nor a pair to continue. Not a restart, since
+		// nothing was ever established to restart.
+		return fmt.Errorf("sdp: ICE session has no agent and no established pair to renegotiate over")
+	}
 }
 
 // startICE runs connectivity checks and installs the nominated pair as the
@@ -1218,6 +1361,13 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 // nominated, rtpConn and rtcpConn become views on the one ICE connection, so
 // the rest of MediaSession reads and writes over ICE without further changes.
 func (s *MediaSession) startICE() error {
+	// Only the session that created the agent can run checks. A fork reaching
+	// here would be a fault in RemoteSDP, which never arms Finalize for one, so
+	// it is refused rather than dereferenced.
+	if s.iceAgent == nil {
+		return fmt.Errorf("media session: ICE connectivity checks need an agent, this session has none")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), ICEConnectTimeout)
 	defer cancel()
 
@@ -1848,6 +1998,24 @@ type iceSetup struct {
 	// candidates are rendered a=candidate values, without the "a=" prefix
 	candidates []string
 	rtcpMux    bool
+}
+
+// establishedICE is what a session knows about the ICE pair its agent
+// nominated and the DTLS association built over it, and nothing more. It
+// deliberately never refers to the agent: the agent belongs to the session that
+// created it, and a fork that could reach it could also restart or close it
+// under the session whose media still runs on the pair.
+type establishedICE struct {
+	// local is our side of the pair as LocalSDP renders it: the credentials
+	// and candidates the peer checked against, and rtcp-mux.
+	local iceSetup
+	// remoteUfrag and remotePwd are the peer credentials the pair was checked
+	// with. A renegotiation carrying anything else asks for an ICE restart.
+	remoteUfrag string
+	remotePwd   string
+	// dtlsSetup is the a=setup role the association was actually built with,
+	// dtlsSetupActive or dtlsSetupPassive, never actpass.
+	dtlsSetup string
 }
 
 // formatRTPMap renders the a=rtpmap line describing codec, followed by its
