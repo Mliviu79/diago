@@ -366,6 +366,11 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return dg.handleReInvite(req, tx, id)
 		}
 
+		if reason := describeMissingInviteHeader(req); reason != "" {
+			res := sip.NewResponseFromRequest(req, sip.StatusBadRequest, reason, nil)
+			return errors.Join(fmt.Errorf("%w: %s", errInviteMissingHeader, reason), tx.Respond(res))
+		}
+
 		tran, _ := dg.getTransport(req.Transport())
 
 		// Proceed as new call
@@ -576,6 +581,34 @@ func (dg *Diago) handleReInvite(req *sip.Request, tx sip.ServerTransaction, id s
 	}
 
 	return s.handleReInvite(req, tx)
+}
+
+var errInviteMissingHeader = errors.New("new INVITE rejected with 400 Bad Request")
+
+// describeMissingInviteHeader returns the reason phrase for the first header a
+// new INVITE lacks among those sipgo.DialogUA.ReadInvite needs: From, the From
+// tag, To, Call-ID, CSeq and Contact. It returns "" when all are present. The
+// check runs before ReadInvite so a malformed INVITE is answered, because most
+// of the errors ReadInvite returns for these headers carry no type to match on.
+func describeMissingInviteHeader(req *sip.Request) string {
+	from := req.From()
+	switch {
+	case from == nil:
+		return "Missing From Header Field"
+	case !from.Params.Has("tag"):
+		return "Missing From Tag"
+	case req.To() == nil:
+		return "Missing To Header Field"
+	case req.CallID() == nil:
+		return "Missing Call-ID Header Field"
+	case req.CSeq() == nil:
+		// The transaction layer answers a request without CSeq before any
+		// handler runs; the case keeps the list complete for ReadInvite.
+		return "Missing CSeq Header Field"
+	case req.Contact() == nil:
+		return "Missing Contact Header Field"
+	}
+	return ""
 }
 
 // Serve starts 'Server' handle for SIP.
