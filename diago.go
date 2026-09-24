@@ -611,9 +611,10 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 					dg.transports[i] = tran
 				}
 				// This callback is itself the proof that the listener holds
-				// tran.BindPort. sipgo invokes it before ServeUDP records the
-				// port, so ListenPorts cannot vouch for it yet: tell createClient
-				// directly, and swap the client before anyone is told we are ready.
+				// tran.BindPort. Not every sipgo release has recorded the port in
+				// ListenPorts by the time it fires, so ListenPorts cannot vouch for
+				// it: tell createClient directly, and swap the client before anyone
+				// is told we are ready.
 				tran.client.Store(dg.createClient(tran, true))
 				readyCh()
 
@@ -971,9 +972,10 @@ func (dg *Diago) RegisterTransaction(ctx context.Context, recipient sip.Uri, opt
 // an unrelated process on the same port into a failed REGISTER rather than the
 // intended reuse. Returning 0 asks for an ephemeral port, which always binds.
 //
-// The serve path does not ask it. sipgo reports a listener ready before it
-// records the port, so the answer there would be 0 even though the port is held;
-// the ready callback tells createClient instead.
+// The serve path does not ask it. Depending on the sipgo release, a listener
+// can be reported ready before its port is recorded, so the answer there could
+// be 0 even though the port is held; the ready callback tells createClient
+// instead.
 func clientSourcePort(ua *sipgo.UserAgent, want int) int {
 	if want == 0 {
 		return 0
