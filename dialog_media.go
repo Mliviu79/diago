@@ -489,6 +489,13 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 	// checked rather than nilness.
 	if len(req.Body()) > 0 {
 		if err := d.sdpReInviteUnsafe(req.Body()); err != nil {
+			// The offer is well formed but asks for an ICE restart, which this
+			// session cannot perform. The fork was never installed, so the call
+			// carries on over its current pair. The reason phrase is fixed and
+			// carries no error text, so nothing internal reaches the peer.
+			if errors.Is(err, media.ErrICERestartUnsupported) {
+				return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+			}
 			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
 		}
 

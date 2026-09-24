@@ -215,3 +215,23 @@ func TestDialogICEForkEarlyMediaRestartSurfaced(t *testing.T) {
 	require.True(t, errors.Is(err, media.ErrICERestartUnsupported), "want ErrICERestartUnsupported, got %v", err)
 	require.Same(t, e.offerer, d.MediaSession(), "a refused update must leave the session unchanged")
 }
+
+// TestDialogICEForkRestartReinviteAnswers488 is a peer's re-INVITE asking for
+// an ICE restart on an established ICE call. The offer is well formed and
+// cannot be met, so it is answered 488 with a fixed reason phrase, and the
+// call carries on over its current session (RFC 3261 section 14.2).
+func TestDialogICEForkRestartReinviteAnswers488(t *testing.T) {
+	e := newEstablishedICEMedia(t)
+	d := newICEDialogMedia(t, e.answerer)
+	tx := &fakeServerTransaction{}
+	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
+
+	err := handleMediaUpdateNoPanic(d, newReInvite(t, replaceICECredentials(t, e.offer)), tx, contact)
+	requireNoRecoveredPanic(t, err)
+	require.NoError(t, err)
+	require.NotNil(t, tx.res)
+	require.Equal(t, sip.StatusNotAcceptableHere, tx.res.StatusCode, "reason: %s", tx.res.Reason)
+	require.Equal(t, "Not Acceptable Here", tx.res.Reason)
+	require.Empty(t, tx.res.Body())
+	require.Same(t, e.answerer, d.MediaSession(), "a refused re-INVITE must leave the session unchanged")
+}
