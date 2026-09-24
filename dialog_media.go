@@ -52,6 +52,15 @@ type DialogMedia struct {
 	// rtp session is created for usage with RTPPacketReader and RTPPacketWriter
 	// it adds RTCP layer and RTP monitoring before passing packets to MediaSession
 	rtpSession *media.RTPSession
+
+	// iceAgentOwner is the media session that created this dialog's ICE agent,
+	// kept after a re-INVITE replaced it with a fork. The fork shares the ICE
+	// pair but not the agent, and closing the pair does not release the UDP
+	// mux or the socket it wraps; only the owner's Close does. Dropping the
+	// owner on the swap would leak that socket and its mux goroutine for the
+	// life of the process, and hand the port back to the allocator while it is
+	// still bound. Nil until a swap, and for a dialog without ICE.
+	iceAgentOwner *media.MediaSession
 	// Packet reader is default reader for RTP audio stream
 	// Use always AudioReader to get current Audio reader
 	// Use this only as read only
@@ -310,6 +319,8 @@ func (d *DialogMedia) Close() error {
 	d.onClose = nil
 	m := d.mediaSession
 	rtpSess := d.rtpSession
+	iceOwner := d.iceAgentOwner
+	d.iceAgentOwner = nil
 	releasePort := d.releaseRTPPort
 	d.releaseRTPPort = nil
 
@@ -324,7 +335,7 @@ func (d *DialogMedia) Close() error {
 	d.referLatest = nil
 	d.referMu.Unlock()
 
-	var e1, e2, e3 error
+	var e1, e2, e3, e4 error
 	if onClose != nil {
 		e1 = onClose()
 	}
@@ -337,6 +348,13 @@ func (d *DialogMedia) Close() error {
 		e3 = m.Close()
 	}
 
+	// The agent goes after the session using its pair, so nothing is still
+	// reading or writing on the socket it releases, and before the port is
+	// returned below.
+	if iceOwner != nil && iceOwner != m {
+		e4 = iceOwner.Close()
+	}
+
 	// After the sockets are closed, never before. An allocator may hold the port
 	// for a drain window so late RTP from this call can not land on the next
 	// call socket, and that window has to start when the wire is actually down.
@@ -344,7 +362,7 @@ func (d *DialogMedia) Close() error {
 	if releasePort != nil {
 		releasePort()
 	}
-	return errors.Join(e1, e2, e3)
+	return errors.Join(e1, e2, e3, e4)
 }
 
 func (d *DialogMedia) OnClose(f func() error) {
@@ -555,6 +573,13 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	d.RTPPacketReader.UpdateRTPSession(rtpSess)
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
 
+	// Every path forks from the session installed at setup, so exactly one
+	// session ever owns an ICE agent, and it is the one replaced first. It is
+	// kept for Close rather than closed here, because the fork's media still
+	// runs on the pair that agent holds open.
+	if old := d.mediaSession; old != nil && old != msess && old.OwnsICEAgent() && d.iceAgentOwner == nil {
+		d.iceAgentOwner = old
+	}
 	d.mediaSession = msess
 	d.rtpSession = rtpSess
 	return nil

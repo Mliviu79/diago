@@ -598,6 +598,13 @@ func (s *MediaSession) Fork() *MediaSession {
 	return &cp
 }
 
+// OwnsICEAgent reports whether Close on this session releases an ICE agent and
+// the socket its UDP mux wraps. Only the session that created the agent owns
+// it; a fork never does, although it shares the pair the agent nominated.
+func (s *MediaSession) OwnsICEAgent() bool {
+	return s.iceAgent != nil
+}
+
 func (s *MediaSession) Close() error {
 	// panic("calling close")
 	var e1, e2, e3 error
