@@ -575,6 +575,22 @@ func (dg *Diago) Serve(ctx context.Context, f ServeDialogFunc) error {
 	return dg.serve(ctx, f, func() {})
 }
 
+// ServeWithReady serves like Serve: it blocks until serving ends and returns
+// Serve's error. It also calls ready exactly once, after every transport's
+// listener has reported ready and that transport's client has been rebuilt for
+// its listener, so a request built once ready has run uses the rebuilt client.
+// ready runs on a listener goroutine and must not block. If serving fails before
+// every listener is up, ready is never called.
+func (dg *Diago) ServeWithReady(ctx context.Context, f ServeDialogFunc, ready func()) error {
+	var pending atomic.Int64
+	pending.Store(int64(len(dg.transports)))
+	return dg.serve(ctx, f, func() {
+		if pending.Add(-1) == 0 {
+			ready()
+		}
+	})
+}
+
 func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) error {
 	server := dg.server
 	dg.HandleFunc(f)
