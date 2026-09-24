@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -218,6 +219,84 @@ func TestDiagoNewDialog(t *testing.T) {
 	// if assert.Error(t, err) {
 	// 	assert.Equal(t, "no SDP in response", err.Error())
 	// }
+}
+
+// TestDiagoInfoWithoutContentType sends real INFO requests to the INFO handler
+// over a loopback socket. A body-less INFO is valid SIP and carries no
+// Content-Type (RFC 3261 §20.15), so the handler must answer it rather than
+// fail on the missing header. A middleware recovers any panic from the handler
+// so the failure is reported instead of ending the test binary.
+func TestDiagoInfoWithoutContentType(t *testing.T) {
+	var mu sync.Mutex
+	panics := map[string]string{}
+	recoverPanic := func(next sipgo.RequestHandler) sipgo.RequestHandler {
+		return func(req *sip.Request, tx sip.ServerTransaction) {
+			defer func() {
+				if r := recover(); r != nil {
+					mu.Lock()
+					panics[req.CallID().Value()] = fmt.Sprint(r)
+					mu.Unlock()
+					_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
+				}
+			}()
+			next(req, tx)
+		}
+	}
+
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua, WithServerRequestMiddleware(recoverPanic))
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		contentType string
+		toTag       string
+		body        []byte
+		wantStatus  int
+	}{
+		{name: "no Content-Type", wantStatus: sip.StatusNotAcceptable},
+		{name: "not DTMF relay", contentType: "text/plain", body: []byte("hello"), wantStatus: sip.StatusNotAcceptable},
+		{name: "DTMF relay outside any dialog", contentType: "application/dtmf-relay", toTag: ";tag=nodialog", body: []byte("Signal=1\r\nDuration=100\r\n"), wantStatus: sip.StatusCallTransactionDoesNotExists},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			callID := fmt.Sprintf("info-no-ctype-%d", i)
+			req := sip.NewRequest(sip.INFO, sip.Uri{User: "dg", Host: "127.0.0.1", Port: port})
+			req.AppendHeader(sip.NewHeader("From", "<sip:peer@127.0.0.1>;tag=peer"))
+			req.AppendHeader(sip.NewHeader("To", "<sip:dg@127.0.0.1>"+tc.toTag))
+			req.AppendHeader(sip.NewHeader("Call-ID", callID))
+			req.AppendHeader(sip.NewHeader("CSeq", "1 INFO"))
+			if tc.contentType != "" {
+				req.AppendHeader(sip.NewHeader("Content-Type", tc.contentType))
+			}
+			req.SetBody(tc.body)
+			if tc.contentType == "" {
+				require.Nil(t, req.ContentType(), "the request must reach the handler without Content-Type")
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, err := client.Do(ctx, req)
+			require.NoError(t, err)
+
+			mu.Lock()
+			recovered := panics[callID]
+			mu.Unlock()
+			require.Empty(t, recovered, "INFO handler panicked")
+			assert.Equal(t, tc.wantStatus, res.StatusCode)
+		})
+	}
 }
 
 func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
