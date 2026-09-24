@@ -631,7 +631,11 @@ func (d *DialogServerSession) reInviteDo(ctx context.Context, req *sip.Request) 
 		}
 
 		// Now do ACK on new Contact
-		if err := d.ack(ctx, res.Contact().Address, nil); err != nil {
+		cont := res.Contact()
+		if cont == nil {
+			return res, fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
+		}
+		if err := d.ack(ctx, cont.Address, nil); err != nil {
 			return res, err
 		}
 
