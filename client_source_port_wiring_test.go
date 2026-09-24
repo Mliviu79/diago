@@ -73,7 +73,7 @@ func TestCreateClientDoesNotSourceFromAnUnlistenedPort(t *testing.T) {
 	if len(dg.transports) != 1 {
 		t.Fatalf("expected one transport, got %d", len(dg.transports))
 	}
-	client := dg.transports[0].client
+	client := dg.getClient(&dg.transports[0])
 	if client == nil {
 		t.Fatal("transport has no client")
 	}
@@ -115,7 +115,7 @@ func TestCreateClientPinsAPortItListensOn(t *testing.T) {
 		BindPort:  port,
 	}))
 
-	client := dg.transports[0].client
+	client := dg.getClient(&dg.transports[0])
 	if client == nil {
 		t.Fatal("transport has no client")
 	}

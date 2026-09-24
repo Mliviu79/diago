@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -83,7 +84,12 @@ type Transport struct {
 
 	RewriteContact bool
 
-	client *sipgo.Client
+	// client is created once in WithTransport and shared by every copy of the
+	// Transport: the dg.transports elements, the copies getTransport and
+	// findTransport hand out, and serve's per-listener copy. Sharing the pointer
+	// lets the listener's ready callback replace the client while requests read
+	// it. Read it through getClient.
+	client *atomic.Pointer[sipgo.Client]
 }
 
 func WithTransport(t Transport) DiagoOption {
@@ -131,7 +137,9 @@ func WithTransport(t Transport) DiagoOption {
 		t.Transport = strings.TrimSuffix(t.Transport, "6") // udp6, tcp6
 
 		// we want to handle SIP networking better per each transport
-		t.client = dg.createClient(t)
+		// No listener is known to hold the port yet, see clientSourcePort.
+		t.client = &atomic.Pointer[sipgo.Client]{}
+		t.client.Store(dg.createClient(t, false))
 		dg.transports = append(dg.transports, t)
 
 		dg.log.Debug("Loaded transport", "t", t)
@@ -584,9 +592,13 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 				if tran.BindPort == 0 {
 					tran.BindPort = port
 					tran.ExternalPort = port
-					tran.client = dg.createClient(tran)
 					dg.transports[i] = tran
 				}
+				// This callback is itself the proof that the listener holds
+				// tran.BindPort. sipgo invokes it before ServeUDP records the
+				// port, so ListenPorts cannot vouch for it yet: tell createClient
+				// directly, and swap the client before anyone is told we are ready.
+				tran.client.Store(dg.createClient(tran, true))
 				readyCh()
 
 				dg.log.Info("Listening on transport", "addr", addr, "protocol", tran.network)
@@ -813,7 +825,7 @@ func (dg *Diago) getClient(tran *Transport) *sipgo.Client {
 		return dg.client
 	}
 
-	return tran.client
+	return tran.client.Load()
 }
 
 func (dg *Diago) getTransport(transport string) (*Transport, bool) {
@@ -932,8 +944,9 @@ func (dg *Diago) RegisterTransaction(ctx context.Context, recipient sip.Uri, opt
 	return newRegisterTransaction(client, recipient, contactHDR, dg.log, opts), nil
 }
 
-// clientSourcePort reports the local UDP port a client may source requests from,
-// which is want only while the transport layer already listens on it.
+// clientSourcePort reports the local UDP port a client built without proof of a
+// listener may source requests from: want only while the transport layer already
+// listens on it. That client is the one built when the transport loads.
 //
 // Sourcing from a listened port reuses that connection. Sourcing from any other
 // port is a fresh bind, which the OS refuses as soon as another process owns the
@@ -941,6 +954,10 @@ func (dg *Diago) RegisterTransaction(ctx context.Context, recipient sip.Uri, opt
 // that moment no listener holds the configured port, so pinning it there turns
 // an unrelated process on the same port into a failed REGISTER rather than the
 // intended reuse. Returning 0 asks for an ephemeral port, which always binds.
+//
+// The serve path does not ask it. sipgo reports a listener ready before it
+// records the port, so the answer there would be 0 even though the port is held;
+// the ready callback tells createClient instead.
 func clientSourcePort(ua *sipgo.UserAgent, want int) int {
 	if want == 0 {
 		return 0
@@ -955,7 +972,11 @@ func clientSourcePort(ua *sipgo.UserAgent, want int) int {
 	return 0
 }
 
-func (dg *Diago) createClient(tran Transport) (client *sipgo.Client) {
+// createClient builds the client a transport sends requests with. listening
+// reports that a listener is known to hold tran.BindPort, which only the
+// listener's ready callback can prove; without that proof clientSourcePort
+// decides whether the port may be pinned.
+func (dg *Diago) createClient(tran Transport, listening bool) (client *sipgo.Client) {
 	ua := dg.ua
 	// When transport is not binding to specific IP
 
@@ -977,8 +998,11 @@ func (dg *Diago) createClient(tran Transport) (client *sipgo.Client) {
 			}
 		}
 
-		// 3. Only source from a port we already listen on, see clientSourcePort.
-		bindPort = clientSourcePort(ua, bindPort)
+		// 3. Only source from a port we already listen on. The ready callback
+		// knows the port is held; a client built at load asks clientSourcePort.
+		if !listening {
+			bindPort = clientSourcePort(ua, bindPort)
+		}
 
 		hostname := ""
 		if resolvedIP != nil && !resolvedIP.IsUnspecified() {
