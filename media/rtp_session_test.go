@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -189,6 +190,85 @@ func TestRTPSessionWriting(t *testing.T) {
 	// assert.Equal(t, int(float32(lostPackets)/float32(expectedPkts)*256), int(recReport.FractionLost))
 }
 
+func TestRTPSessionRTCPCallbacksConcurrentUpdate(t *testing.T) {
+	const iterations = 10_000
+
+	t.Run("read", func(t *testing.T) {
+		rtpSess := fakeSession(9876, 1234, nil, nil, nil, nil)
+		t.Cleanup(rtpSess.rtcpTicker.Stop)
+
+		callback := func(rtcp.Packet, RTPReadStats) {}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				if i%2 == 0 {
+					rtpSess.OnReadRTCP(callback)
+				} else {
+					rtpSess.OnReadRTCP(nil)
+				}
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				rtpSess.readRTCPPacket(&rtcp.ReceiverReport{})
+			}
+		}()
+
+		close(start)
+		wg.Wait()
+	})
+
+	t.Run("write", func(t *testing.T) {
+		rtpSess := fakeSession(9876, 1234, nil, nil, nil, io.Discard)
+		t.Cleanup(rtpSess.rtcpTicker.Stop)
+		rtpSess.writeStats.SSRC = 1
+
+		callback := func(rtcp.Packet, RTPWriteStats) {}
+		start := make(chan struct{})
+		errCh := make(chan error, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				if i%2 == 0 {
+					rtpSess.OnWriteRTCP(callback)
+				} else {
+					rtpSess.OnWriteRTCP(nil)
+				}
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				if err := rtpSess.writeRTCP(time.Now()); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+	})
+}
+
 // func TestRTPSessionMonitoring(t *testing.T) {
 // 	// LSR and DLSR calc
 // 	// SenderReport sent and SenderReport received
@@ -253,14 +333,16 @@ func (c *pipePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *pipePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return len(p), nil
+	return c.Conn.Write(p)
 }
 
 func TestRTPSessionFork(t *testing.T) {
 	rtpConn, rtpPeer := net.Pipe()
 	rtcpConn, rtcpPeer := net.Pipe()
 	t.Cleanup(func() {
+		_ = rtpConn.Close()
 		_ = rtpPeer.Close()
+		_ = rtcpConn.Close()
 		_ = rtcpPeer.Close()
 	})
 
@@ -273,21 +355,35 @@ func TestRTPSessionFork(t *testing.T) {
 		rtpConn:   &pipePacketConn{Conn: rtpConn},
 		rtcpConn:  &pipePacketConn{Conn: rtcpConn},
 	}
+
 	rtpSess := NewRTPSession(sess)
 	rtpSess.readStats.PacketsCount = 7
+	rtpSess.writeStats = RTPWriteStats{
+		SSRC:                1,
+		lastPacketTime:      time.Now(),
+		lastPacketTimestamp: 1,
+		sampleRate:          CodecAudioUlaw.SampleRate,
+	}
 
 	require.NoError(t, rtpSess.MonitorBackground())
 	require.NoError(t, rtpSess.MonitorClose())
 
 	candidate := sess.Fork()
-
 	candidate.SetRemoteAddr(&sess.Raddr)
 	fork := rtpSess.Fork(candidate)
 	// Confirm Forking works
 	assert.Equal(t, uint64(7), fork.ReadStats().PacketsCount)
 
-	// Start monitor
+	// Start the replacement monitor with a short report interval and confirm
+	// its first RTCP write succeeds on the shared deadline-aware connection.
+	fork.rtcpTicker.Stop()
+	fork.rtcpTicker = time.NewTicker(10 * time.Millisecond)
 	require.NoError(t, fork.MonitorBackground())
+	require.NoError(t, rtcpPeer.SetReadDeadline(time.Now().Add(time.Second)))
+	buf := make([]byte, 1500)
+	n, err := rtcpPeer.Read(buf)
+	require.NoError(t, err)
+	require.NotZero(t, n)
 	require.NoError(t, fork.MonitorClose())
 }
 

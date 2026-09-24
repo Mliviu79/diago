@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -17,14 +18,84 @@ var (
 	RecordingFlushSize = 4096
 )
 
-type MonitorPCMReader struct {
-	audioReader io.Reader
-	writer      *bufio.Writer // Lets use Buffered flushing
+type pcmBufioWriter struct {
+	writer   *bufio.Writer // Lets use Buffered flushing
+	mu       sync.Mutex
+	stopped  bool
+	lastTime time.Time
+	codec    media.Codec
+	silence  []byte
+}
 
-	codec        media.Codec
+func (m *pcmBufioWriter) Flush() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Check do we need to inject silence as a tail
+	// Case Reader had no stream running, but time passed
+	if err := m.writeSilenceUnsafe(time.Now()); err != nil {
+		return err
+	}
+
+	if err := m.writer.Flush(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *pcmBufioWriter) writeSilenceUnsafe(now time.Time) error {
+	diff := uint32(now.Sub(m.lastTime).Seconds() * float64(m.codec.SampleRate))
+	srt := m.codec.SampleTimestamp()
+	for i := 2 * srt; i < diff; i += srt {
+		if _, err := m.writer.Write(m.silence); err != nil {
+			return err
+		}
+	}
+	m.lastTime = now
+	return nil
+}
+
+func (m *pcmBufioWriter) writePCM(now time.Time, lpcm []byte) error {
+	// We do not want to write on stopped monitoring
+	// We need this, because user can stop monitoring, but still keep underhood stream active
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return nil
+	}
+
+	// Check do we need to inject first silence
+	if err := m.writeSilenceUnsafe(now); err != nil {
+		return err
+	}
+
+	_, err := m.writer.Write(lpcm)
+	return err
+}
+
+func (m *pcmBufioWriter) Stop() {
+	m.mu.Lock()
+	m.stopped = true
+	m.mu.Unlock()
+}
+
+func (m *pcmBufioWriter) Start() {
+	m.mu.Lock()
+	m.stopped = false
+	m.mu.Unlock()
+}
+
+// Monitoring starts with first packet arrived, but you can shift with start time. Ex stream are not continious
+func (m *pcmBufioWriter) StartTime(t time.Time) {
+	m.mu.Lock()
+	m.lastTime = t
+	m.mu.Unlock()
+}
+
+type MonitorPCMReader struct {
+	pcmBufioWriter
+	audioReader  io.Reader
 	decoder      PCMDecoderBuffer
-	silence      []byte
-	lastTime     time.Time
 	FlushOnError bool
 }
 
@@ -43,16 +114,8 @@ func (m *MonitorPCMReader) Init(w io.Writer, codec media.Codec, audioReader io.R
 	samples16 := codec.Samples16()
 	silence := bytes.Repeat([]byte{0}, samples16) // This alloc could be avoided
 	m.silence = silence
+	m.lastTime = time.Now()
 	return nil
-}
-
-func (m *MonitorPCMReader) Flush() error {
-	return m.writer.Flush()
-}
-
-// Monitoring starts with first packet arrived, but you can shift with start time. Ex stream are not continious
-func (m *MonitorPCMReader) StartTime(t time.Time) {
-	m.lastTime = t
 }
 
 func (m *MonitorPCMReader) Read(b []byte) (int, error) {
@@ -63,18 +126,7 @@ func (m *MonitorPCMReader) Read(b []byte) (int, error) {
 		}
 		return n, err
 	}
-	// Check do we need to inject silence
 	now := time.Now()
-	if !m.lastTime.IsZero() {
-		diff := uint32(now.Sub(m.lastTime).Seconds() * float64(m.codec.SampleRate))
-		srt := m.codec.SampleTimestamp()
-		for i := 2 * srt; i < diff; i += srt {
-			if _, err := m.writer.Write(m.silence); err != nil {
-				return n, err
-			}
-		}
-	}
-	m.lastTime = now
 
 	// Decode stream to PCM unless stream is already decoded?
 	if _, err := m.decoder.Write(b[:n]); err != nil {
@@ -83,18 +135,14 @@ func (m *MonitorPCMReader) Read(b []byte) (int, error) {
 	lpcm := m.decoder.ReadFull()
 
 	// Write to outer stream. Expecting some buffer with flushing will happen
-	_, err = m.writer.Write(lpcm)
+	err = m.writePCM(now, lpcm)
 	return n, err
 }
 
 type MonitorPCMWriter struct {
-	audioWriter io.Writer
-	writer      *bufio.Writer // Lets use Buffered flushing
-
-	codec        media.Codec
+	pcmBufioWriter
+	audioWriter  io.Writer
 	decoder      PCMDecoderBuffer
-	silence      []byte
-	lastTime     time.Time
 	FlushOnError bool
 }
 
@@ -113,27 +161,11 @@ func (m *MonitorPCMWriter) Init(w io.Writer, codec media.Codec, audioWriter io.W
 	samples16 := codec.Samples16()
 	silence := bytes.Repeat([]byte{0}, samples16) // This alloc could be avoided
 	m.silence = silence
+	m.lastTime = time.Now()
 	return nil
 }
 
-func (m *MonitorPCMWriter) Flush() error {
-	return m.writer.Flush()
-}
-
 func (m *MonitorPCMWriter) Write(b []byte) (int, error) {
-	// Check do we need to inject silence
-	now := time.Now()
-	if !m.lastTime.IsZero() {
-		diff := uint32(now.Sub(m.lastTime).Seconds() * float64(m.codec.SampleRate))
-		srt := m.codec.SampleTimestamp()
-		for i := 2 * srt; i < diff; i += srt {
-			if _, err := m.writer.Write(m.silence); err != nil {
-				return 0, err
-			}
-		}
-	}
-	m.lastTime = now
-
 	n, err := m.audioWriter.Write(b)
 	if err != nil {
 		if m.FlushOnError {
@@ -142,6 +174,7 @@ func (m *MonitorPCMWriter) Write(b []byte) (int, error) {
 		return n, err
 	}
 
+	now := time.Now()
 	// Decode stream to PCM unless stream is already decoded?
 	if _, err := m.decoder.Write(b[:n]); err != nil {
 		return 0, err
@@ -149,7 +182,7 @@ func (m *MonitorPCMWriter) Write(b []byte) (int, error) {
 	lpcm := m.decoder.ReadFull()
 
 	// Write to outer stream. Expecting some buffer with flushing will happen
-	_, err = m.writer.Write(lpcm)
+	err = m.writePCM(now, lpcm)
 	return n, err
 }
 
@@ -218,6 +251,10 @@ func (m *MonitorPCMStereo) removeTmpFiles() (err error) {
 }
 
 func (m *MonitorPCMStereo) Close() error {
+	// Stop any current PCM writing
+	m.MonitorPCMReader.Stop()
+	m.MonitorPCMWriter.Stop()
+
 	if err := m.Flush(); err != nil {
 		return err
 	}
@@ -270,6 +307,9 @@ func (m *MonitorPCMStereo) interleave() error {
 			}
 			break
 		}
+		// Shorter file ended, then pad its missing tail with silence
+		clear(readBuf1[n1:n])
+		clear(readBuf2[n2:n])
 
 		// interleave
 		copyN := 0

@@ -246,6 +246,12 @@ func (s *RTPSession) startMonitor(goroutines int) error {
 	if s.closed {
 		return errRTPSessionClosed
 	}
+	// A fork reuses the media session's RTCP connection. MonitorClose expires
+	// both deadlines to stop the previous monitor, so clear both before any
+	// replacement reader or writer starts.
+	if err := s.Sess.rtcpConn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
 	s.monitorRun = true
 	s.monitorWG.Add(goroutines)
 	return nil
@@ -581,10 +587,11 @@ func (s *RTPSession) readRTCPPacket(pkt rtcp.Packet) {
 	now := time.Now()
 
 	// Add interceptor
-	if s.onReadRTCP != nil {
+	onReadRTCP := s.onReadRTCP
+	if onReadRTCP != nil {
 		stats := s.readStats
 		s.rtcpMU.Unlock()
-		s.onReadRTCP(pkt, stats)
+		onReadRTCP(pkt, stats)
 		s.rtcpMU.Lock()
 	}
 
@@ -667,10 +674,11 @@ func (s *RTPSession) writeRTCP(now time.Time) error {
 	s.readStats.IntervalPacketsCount = 0
 
 	// Add interceptor
-	if s.onWriteRTCP != nil {
+	onWriteRTCP := s.onWriteRTCP
+	if onWriteRTCP != nil {
 		stats := s.writeStats
 		s.rtcpMU.Unlock()
-		s.onWriteRTCP(pkt, stats)
+		onWriteRTCP(pkt, stats)
 	} else {
 		s.rtcpMU.Unlock()
 	}

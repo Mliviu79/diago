@@ -47,6 +47,15 @@ var (
 	ErrNoCommonMedia = errors.New("no common media")
 )
 
+// RTPTracer receives decoded RTP packets when RTPDebug is enabled.
+//
+// Traces run synchronously on the media path. Implementations must not block
+// and must clone packets that are retained after the method returns.
+type RTPTracer interface {
+	RTPTraceRead(laddr string, raddr string, packet *rtp.Packet)
+	RTPTraceWrite(laddr string, raddr string, packet *rtp.Packet)
+}
+
 var (
 	// RTPPortStart and RTPPortEnd allows defining rtp port range for media
 	RTPPortStart  = 0
@@ -58,6 +67,7 @@ var (
 
 	RTPDebug  = false
 	RTCPDebug = false
+	rtpTracer RTPTracer
 
 	// RTPProfileSAVPDisable disables offering RTP/SAVP and keeps standard RTP/AVP for backward compatibilit needs
 	//
@@ -74,18 +84,41 @@ var (
 	SDPCodecPreferLocalOrder int = 0
 )
 
-func logRTPRead(m *MediaSession, raddr net.Addr, p *rtp.Packet) {
-	if RTPDebug {
-		s := raddr.String()
+// RTPDebugTracer sets the tracer used when RTPDebug is enabled.
+// Passing nil restores the default RTP debug logging.
+// It must be called before RTP traffic starts.
+func RTPDebugTracer(t RTPTracer) {
+	rtpTracer = t
+}
 
-		DefaultLogger().Debug(fmt.Sprintf("RTP read %s < %s:\n%s", m.Laddr.String(), s, p.String()))
+func logRTPRead(m *MediaSession, raddr net.Addr, p *rtp.Packet) {
+	if !RTPDebug {
+		return
 	}
+
+	laddr := m.Laddr.String()
+	raddrStr := raddr.String()
+	if rtpTracer != nil {
+		rtpTracer.RTPTraceRead(laddr, raddrStr, p)
+		return
+	}
+
+	DefaultLogger().Debug(fmt.Sprintf("RTP read %s < %s:\n%s", laddr, raddrStr, p.String()))
 }
 
 func logRTPWrite(m *MediaSession, p *rtp.Packet) {
-	if RTPDebug {
-		DefaultLogger().Debug(fmt.Sprintf("RTP write %s > %s:\n%s", m.Laddr.String(), m.Raddr.String(), p.String()))
+	if !RTPDebug {
+		return
 	}
+
+	laddr := m.Laddr.String()
+	raddr := m.Raddr.String()
+	if rtpTracer != nil {
+		rtpTracer.RTPTraceWrite(laddr, raddr, p)
+		return
+	}
+
+	DefaultLogger().Debug(fmt.Sprintf("RTP write %s > %s:\n%s", laddr, raddr, p.String()))
 }
 
 func logRTCPRead(m *MediaSession, pkts []rtcp.Packet) {
@@ -504,7 +537,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		// made the 200 OK answering any re-INVITE advertise the internal bind
 		// address, so the peer sent RTP somewhere it could not route and the call
 		// went one way from the first re-INVITE on, with a clean SIP trace.
-		ExternalIP: s.ExternalIP,
+		ExternalIP: slices.Clone(s.ExternalIP),
 		// The role carries over so the caller can set it once on the session it
 		// owns. Fork is called inside the re-negotiation path, where the fork
 		// itself is not reachable to configure.
@@ -709,7 +742,9 @@ func (s *MediaSession) LocalSDP() []byte {
 	}
 
 	if s.sessionID == 0 {
-		s.sessionID = GetCurrentNTPTimestamp()
+		// Use NTP seconds for the SDP o= session id (mainstream practice); the full 64-bit
+		// NTP value exceeds int64 when parsed as signed, breaking strict peers (488).
+		s.sessionID = GetCurrentNTPTimestamp() >> 32
 		s.sessionVersion = s.sessionID
 	} else {
 		s.sessionVersion++
@@ -1638,8 +1673,6 @@ func (m *MediaSession) WriteRTP(p *rtp.Packet) error {
 		return nil
 	}
 
-	logRTPWrite(m, p)
-
 	writeBuf := m.getWriteBuf()
 
 	n, err := p.MarshalTo(writeBuf)
@@ -1664,6 +1697,8 @@ func (m *MediaSession) WriteRTP(p *rtp.Packet) error {
 	if n != len(data) {
 		return io.ErrShortWrite
 	}
+
+	logRTPWrite(m, p)
 	return nil
 }
 

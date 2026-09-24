@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,9 +178,52 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 	username, password := t.opts.Username, t.opts.Password
 	client := t.client
 	req := t.Origin
-	contact := *req.Contact().Clone()
+	contact := req.Contact().Clone()
 
-	res, err := client.Do(ctx, req, sipgo.ClientRequestRegisterBuild)
+	res, err := func() (*sip.Response, error) {
+
+		contact := req.Contact()
+		if contact.Address.Port == 0 && net.ParseIP(contact.Address.Host) != nil {
+
+			sipgo.ClientRequestRegisterBuild(client, req)
+
+			tx, err := client.TransactionLayer().NewClientTransaction(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+
+			host, port, err := sip.ParseAddr(tx.Connection().LocalAddr().String())
+			if err != nil {
+				return nil, err
+			}
+			contact.Address.Host = host
+			contact.Address.Port = port
+
+			err = tx.Init()
+			if err != nil {
+				tx.Terminate()
+				return nil, err
+			}
+
+			for {
+				select {
+				case res := <-tx.Responses():
+					if res.IsProvisional() {
+						continue
+					}
+					return res, nil
+
+				case <-tx.Done():
+					return nil, tx.Err()
+
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		}
+
+		return client.Do(ctx, req, sipgo.ClientRequestRegisterBuild)
+	}()
 	if err != nil {
 		return fmt.Errorf("fail to create transaction req=%q: %w", req.StartLine(), err)
 	}
@@ -201,7 +245,7 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 		}
 
 		// Update contact address of NAT
-		req.ReplaceHeader(&contact)
+		req.ReplaceHeader(contact)
 	}
 
 	if isDigestChallenge(res) {
