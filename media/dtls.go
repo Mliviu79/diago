@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -206,9 +207,20 @@ func (conf *DTLSConfig) clientAuth() dtls.ClientAuthType {
 // DTLS here is only a key exchange: the association carries no application data,
 // and nothing reads or writes it once the keying material is exported. Retiring
 // it is therefore a local act, and detach makes that explicit.
+//
+// It also keeps the last ClientHello the DTLS stack sent while nothing has been
+// heard from the peer, so it can be sent again: see resendHello.
 type dtlsKeyExchangeConn struct {
 	net.PacketConn
 	detached atomic.Bool
+
+	// mu guards hello, helloAddr and heard. hello is the last ClientHello
+	// sent, to helloAddr, and heard is set once a DTLS record has arrived from
+	// the peer, after which the DTLS stack's retransmissions answer for it.
+	mu        sync.Mutex
+	hello     []byte
+	helloAddr net.Addr
+	heard     bool
 }
 
 func newDTLSKeyExchangeConn(conn net.PacketConn) *dtlsKeyExchangeConn {
@@ -229,14 +241,69 @@ func (c *dtlsKeyExchangeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if c.detached.Load() {
 		return 0, nil, io.EOF
 	}
-	return c.PacketConn.ReadFrom(p)
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	// A DTLS record by its first byte (RFC 7983 section 7), as against media
+	// the peer sends on the same socket.
+	if n > 0 && p[0] >= 20 && p[0] <= 63 {
+		c.mu.Lock()
+		c.heard = true
+		c.hello = nil
+		c.mu.Unlock()
+	}
+	return n, addr, err
 }
 
 func (c *dtlsKeyExchangeConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if c.detached.Load() {
 		return len(p), nil
 	}
-	return c.PacketConn.WriteTo(p, addr)
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if err == nil && isClientHelloDatagram(p) {
+		c.mu.Lock()
+		if !c.heard {
+			c.hello = append(c.hello[:0], p...)
+			c.helloAddr = addr
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+// resendHello sends the last ClientHello again, as it was sent, while nothing
+// has been heard from the peer. It is a retransmission of the client's first
+// flight (RFC 6347 section 4.2.4). A peer that received it already takes the
+// copy as one, or discards it as a replayed record (section 3.3).
+func (c *dtlsKeyExchangeConn) resendHello() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.heard || c.hello == nil || c.detached.Load() {
+		return nil
+	}
+	_, err := c.PacketConn.WriteTo(c.hello, c.helloAddr)
+	return err
+}
+
+// isClientHelloDatagram reports whether p is a datagram holding one DTLS
+// record, in epoch 0, that carries a whole ClientHello (RFC 6347 sections 4.1
+// and 4.2.2), which a client may send again as it is.
+func isClientHelloDatagram(p []byte) bool {
+	const recordHeaderLen, handshakeHeaderLen = 13, 12
+	const contentTypeHandshake, handshakeTypeClientHello = 22, 1
+	if len(p) < recordHeaderLen+handshakeHeaderLen || p[0] != contentTypeHandshake || p[3] != 0 || p[4] != 0 {
+		return false
+	}
+	recordLen := int(p[11])<<8 | int(p[12])
+	if recordHeaderLen+recordLen != len(p) {
+		return false
+	}
+	h := p[recordHeaderLen:]
+	if h[0] != handshakeTypeClientHello {
+		return false
+	}
+	msgLen := int(h[1])<<16 | int(h[2])<<8 | int(h[3])
+	fragOffset := int(h[6])<<16 | int(h[7])<<8 | int(h[8])
+	fragLen := int(h[9])<<16 | int(h[10])<<8 | int(h[11])
+	return fragOffset == 0 && fragLen == msgLen && handshakeHeaderLen+msgLen == recordLen
 }
 
 // Close is deliberately a no-op. The socket outlives the DTLS association and

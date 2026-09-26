@@ -271,8 +271,10 @@ type MediaSession struct {
 	// DTLS
 	dtlsConn *dtls.Conn
 	// dtlsTr is the transport dtlsConn was built on. It is held so the handshake
-	// can hand the socket back once the keying material is exported.
-	dtlsTr *dtlsKeyExchangeConn
+	// can hand the socket back once the keying material is exported, and so a
+	// FinalizeContext waiting for a handshake FinalizeWithin left running can
+	// resend its ClientHello. The handshake may build it on its own goroutine.
+	dtlsTr atomic.Pointer[dtlsKeyExchangeConn]
 
 	// ICE
 	iceAgent *ICEAgent
@@ -1384,11 +1386,12 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 	// dialDTLS builds the DTLS conn over the media transport.
 	dialDTLS := func() error {
 		var err error
-		s.dtlsTr = s.dtlsTransport()
+		tr := s.dtlsTransport()
+		s.dtlsTr.Store(tr)
 		if role == "server" {
-			s.dtlsConn, err = dtls.Server(s.dtlsTr, &s.Raddr, dtlsConf)
+			s.dtlsConn, err = dtls.Server(tr, &s.Raddr, dtlsConf)
 		} else {
-			s.dtlsConn, err = dtls.Client(s.dtlsTr, &s.Raddr, dtlsConf)
+			s.dtlsConn, err = dtls.Client(tr, &s.Raddr, dtlsConf)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to setup dlts %s conn: %w", role, err)
@@ -1691,7 +1694,7 @@ func (s *MediaSession) dtlsTransport() *dtlsKeyExchangeConn {
 // read loop and the handshake goroutine, and it cannot reach the socket because
 // detach has already taken it away.
 func (s *MediaSession) retireDTLS() error {
-	s.dtlsTr.detach()
+	s.dtlsTr.Load().detach()
 	if err := s.dtlsConn.Close(); err != nil {
 		return fmt.Errorf("dtls conn close: %w", err)
 	}
@@ -1712,7 +1715,10 @@ func (s *MediaSession) Finalize() error {
 // When FinalizeWithin left the negotiation running, FinalizeContext waits for
 // that one instead, under the same bounds counted from this call: ctx, and
 // DTLSHandshakeTimeout, plus ICEConnectTimeout for an ICE session. When either
-// ends first the negotiation is ended with it.
+// ends first the negotiation is ended with it. The peer is expected to take
+// part from this call on, so a ClientHello it has not answered is sent again
+// at once, rather than when the DTLS stack's retransmission timer, which may
+// have backed off to a minute, next fires.
 func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 	if run := s.loadFinalizeRun(); run != nil {
 		return s.awaitFinalizeRun(ctx, run)
@@ -1737,8 +1743,9 @@ func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 // The negotiation is left running because it cannot be run again in its place.
 // As the DTLS client this session has sent ClientHellos, which wait on the
 // peer's socket until its DTLS stack reads them: it completes this association
-// from them, and fails a new one they are read ahead of. An ICE agent cannot
-// start its connectivity checks twice either.
+// from them, and fails a new one they are read ahead of. A peer that discarded
+// them instead gets the last one again from FinalizeContext. An ICE agent
+// cannot start its connectivity checks twice either.
 //
 // Until FinalizeContext waits for it, the negotiation is bounded by ctx alone,
 // and by Close, which ends it. The session carries no media meanwhile:
@@ -1860,14 +1867,35 @@ func (s *MediaSession) awaitFinalizeRun(ctx context.Context, run *finalizeRun) e
 	timer := time.NewTimer(bound)
 	defer timer.Stop()
 
+	// The peer takes part from now on. A ClientHello it discarded while it did
+	// not goes again at once, and then on the schedule RFC 6347 section
+	// 4.2.4.1 gives a retransmission, starting at a second and doubling, until
+	// the peer answers it. The DTLS stack's own timer has backed off meanwhile.
+	resend := time.NewTimer(0)
+	defer resend.Stop()
+	resendAfter := time.Duration(0)
+
 	var stop error
-	select {
-	case <-run.done:
-		return s.endFinalizeRun(run)
-	case <-ctx.Done():
-		stop = fmt.Errorf("media session: negotiation: %w", ctx.Err())
-	case <-timer.C:
-		stop = fmt.Errorf("media session: negotiation did not complete within %s: %w", bound, context.DeadlineExceeded)
+wait:
+	for {
+		select {
+		case <-run.done:
+			return s.endFinalizeRun(run)
+		case <-ctx.Done():
+			stop = fmt.Errorf("media session: negotiation: %w", ctx.Err())
+			break wait
+		case <-timer.C:
+			stop = fmt.Errorf("media session: negotiation did not complete within %s: %w", bound, context.DeadlineExceeded)
+			break wait
+		case <-resend.C:
+			if tr := s.dtlsTr.Load(); tr != nil {
+				if err := tr.resendHello(); err != nil {
+					DefaultLogger().Debug("Resending the DTLS ClientHello failed", "error", err)
+				}
+			}
+			resendAfter = max(time.Second, 2*resendAfter)
+			resend.Reset(resendAfter)
+		}
 	}
 	run.cancel()
 	<-run.done

@@ -275,9 +275,10 @@ func TestDTLSRetiresItsGoroutinesAndLeavesTheSocket(t *testing.T) {
 
 	s := &MediaSession{}
 	s.rtpConn = sock
-	s.dtlsTr = s.dtlsTransport()
+	tr := s.dtlsTransport()
+	s.dtlsTr.Store(tr)
 
-	s.dtlsConn, err = dtlsServer(s.dtlsTr, peer.LocalAddr(), []tls.Certificate{testdata.ServerCertificate()})
+	s.dtlsConn, err = dtlsServer(tr, peer.LocalAddr(), []tls.Certificate{testdata.ServerCertificate()})
 	require.NoError(t, err)
 
 	client, err := dtlsClient(peer, sock.LocalAddr(), []tls.Certificate{testdata.ClientCertificate()}, "")
@@ -331,9 +332,10 @@ func TestDTLSRetireIsInvisibleOnTheWire(t *testing.T) {
 	s.iceMux = newICEMux(local, remote.LocalAddr())
 	t.Cleanup(func() { _ = s.iceMux.Close() })
 	s.rtpConn = s.iceMux.rtp
-	s.dtlsTr = s.dtlsTransport()
+	tr := s.dtlsTransport()
+	s.dtlsTr.Store(tr)
 
-	s.dtlsConn = dtlsHandshakeOverTransport(t, s.dtlsTr, peer, remote.LocalAddr())
+	s.dtlsConn = dtlsHandshakeOverTransport(t, tr, peer, remote.LocalAddr())
 	require.NoError(t, s.retireDTLS())
 
 	// Nothing may follow the handshake on the wire.
@@ -1035,4 +1037,108 @@ func TestDTLSWriteRTCPsEncrypts(t *testing.T) {
 		_, _, err := offerer.rtcpConn.ReadFrom(make([]byte, RTPBufSize))
 		require.True(t, os.IsTimeout(err), "RTCP went out before the handshake: %v", err)
 	})
+}
+
+// TestDTLSFinalizeWithinResendsClientHelloWhenWaitedFor is a caller that
+// ignores the answer in a 183 (RFC 3960) and discards our ClientHellos, as a
+// NAT not open yet or a stack that drops DTLS before the 200 does, instead of
+// queueing them. The handshake FinalizeWithin left running retransmits its
+// ClientHello on the DTLS stack's timer, 1 s at first and doubling up to 60 s
+// (RFC 6347 section 4.2.4.1): after three, the next is 4 s away, and after a
+// minute of ringing up to a minute away, while FinalizeContext waits for the
+// handshake only DTLSHandshakeTimeout from the answer. Once the call is
+// answered the caller takes part, so FinalizeContext resends the ClientHello
+// at once, and on the RFC's schedule until the caller answers it.
+func TestDTLSFinalizeWithinResendsClientHelloWhenWaitedFor(t *testing.T) {
+	prev := DTLSHandshakeTimeout
+	DTLSHandshakeTimeout = 2 * time.Second
+	t.Cleanup(func() { DTLSHandshakeTimeout = prev })
+
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	answerer.DTLSConf.SDPSetupRole = func(bool) string { return "active" }
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	// The caller discards what reaches it until it answers.
+	hellos := make(chan struct{}, 16)
+	stopDiscard := make(chan struct{})
+	discarded := make(chan struct{})
+	go func() {
+		defer close(discarded)
+		buf := make([]byte, RTPBufSize)
+		for {
+			select {
+			case <-stopDiscard:
+				return
+			default:
+			}
+			_ = offerer.rtpConn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+			if _, _, err := offerer.rtpConn.ReadFrom(buf); err == nil {
+				hellos <- struct{}{}
+			}
+		}
+	}()
+
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 100*time.Millisecond), ErrFinalizeInProgress)
+	// ClientHellos at 0, 1 and 3 s are discarded; the DTLS stack sends the
+	// next at 7 s.
+	for i := 0; i < 3; i++ {
+		select {
+		case <-hellos:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("ClientHello %d was not sent", i+1)
+		}
+	}
+	close(stopDiscard)
+	<-discarded
+	require.NoError(t, offerer.rtpConn.SetReadDeadline(time.Time{}))
+
+	// The call is answered: the caller runs its DTLS server now.
+	answered := time.Now()
+	errCh := make(chan error, 2)
+	go func() { errCh <- offerer.Finalize() }()
+	go func() { errCh <- answerer.FinalizeContext(context.Background()) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "the handshake did not complete within DTLSHandshakeTimeout of the answer")
+		case <-time.After(10 * time.Second):
+			t.Fatal("the handshake did not return")
+		}
+	}
+	require.Less(t, time.Since(answered), time.Second, "the ClientHello waited for the DTLS stack's retransmission timer")
+	requireSRTPBetween(t, answerer, offerer, 10)
+	requireSRTPBetween(t, offerer, answerer, 20)
+}
+
+// TestIsClientHelloDatagram pins what may be resent as a ClientHello: one
+// DTLS handshake record in epoch 0 holding the whole message, and nothing
+// else.
+func TestIsClientHelloDatagram(t *testing.T) {
+	// record builds a datagram of one handshake record of msgType, whose
+	// message is msgLen bytes of which the record carries fragLen from
+	// fragOffset.
+	record := func(epoch uint16, msgType byte, msgLen, fragOffset, fragLen int) []byte {
+		h := []byte{msgType,
+			byte(msgLen >> 16), byte(msgLen >> 8), byte(msgLen),
+			0, 0,
+			byte(fragOffset >> 16), byte(fragOffset >> 8), byte(fragOffset),
+			byte(fragLen >> 16), byte(fragLen >> 8), byte(fragLen),
+		}
+		h = append(h, make([]byte, fragLen)...)
+		p := []byte{22, 0xfe, 0xfd, byte(epoch >> 8), byte(epoch), 0, 0, 0, 0, 0, 1, byte(len(h) >> 8), byte(len(h))}
+		return append(p, h...)
+	}
+
+	require.True(t, isClientHelloDatagram(record(0, 1, 122, 0, 122)))
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 0, 60)), "a fragment")
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 60, 62)), "a fragment")
+	require.False(t, isClientHelloDatagram(record(1, 1, 122, 0, 122)), "epoch 1")
+	require.False(t, isClientHelloDatagram(record(0, 11, 122, 0, 122)), "a Certificate")
+	two := append(record(0, 1, 122, 0, 122), record(0, 1, 122, 0, 122)...)
+	require.False(t, isClientHelloDatagram(two), "two records")
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 0, 122)[:40]), "cut short")
+	rtpLike := record(0, 1, 122, 0, 122)
+	rtpLike[0] = 0x80
+	require.False(t, isClientHelloDatagram(rtpLike), "RTP")
 }
