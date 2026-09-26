@@ -926,6 +926,14 @@ func playTimedJitterStream(t *testing.T, jb *RTPJitterBuffer, reader *chanRTPRea
 	return lastPlayed.Sub(time.Unix(0, lastSent.Load()))
 }
 
+// TestRTPJitterBufferRealtimeSimulation sends packets on a real clock, delayed
+// by up to 400 ms and reordered, and requires every one to be played in order,
+// none lost, late or dropped. The goroutine that sends them stands in for the
+// network, so when it runs late the packet is late for the buffer as it would
+// be from the network. The buffer leaves room for that: a packet is played
+// 600 ms after its place in the stream, 200 ms after the most delayed packets
+// are sent, and its window of 40 packets is 13 wider than playout needs, room
+// for a consumer that reads up to 260 ms late.
 func TestRTPJitterBufferRealtimeSimulation(t *testing.T) {
 	const (
 		ssrc        = 1234
@@ -934,8 +942,8 @@ func TestRTPJitterBufferRealtimeSimulation(t *testing.T) {
 	packetDuration := 20 * time.Millisecond
 	reader := &chanRTPReader{packets: make(chan rtp.Packet, packetCount)}
 	jb := NewRTPJitterBuffer(reader, packetDuration, RTPJitterBufferOptions{
-		DelayPackets: 25,
-		MaxPackets:   32,
+		DelayPackets: 30,
+		MaxPackets:   40,
 	})
 	t.Cleanup(func() {
 		_ = jb.Close()
