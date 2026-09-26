@@ -27,11 +27,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// lentPacketConn hands a socket to a DTLS stack without handing it the socket's
+// lifetime: Close is a no-op, and the socket is closed by whoever bound it. It
+// is deliberately not dtlsKeyExchangeConn, which is what these tests exercise.
+type lentPacketConn struct{ net.PacketConn }
+
+func (lentPacketConn) Close() error { return nil }
+
 // dtlsHandshakeOverTransport runs a real DTLS handshake between transport and a
 // peer socket, and returns the local conn. The teardown paths under test are
 // pion's own, so they have to be reached through a completed handshake rather
 // than a hand built Conn.
-func dtlsHandshakeOverTransport(t *testing.T, transport net.PacketConn, peer *net.UDPConn, peerAddr net.Addr) *dtls.Conn {
+//
+// The peer's DTLS client owns peer: its teardown, which a close_notify from the
+// local side triggers, closes it. A caller that still uses the socket after
+// that passes it as a lentPacketConn.
+func dtlsHandshakeOverTransport(t *testing.T, transport net.PacketConn, peer net.PacketConn, peerAddr net.Addr) *dtls.Conn {
 	t.Helper()
 
 	server, err := dtlsServer(transport, peerAddr, []tls.Certificate{testdata.ServerCertificate()})
@@ -66,7 +77,9 @@ func TestDTLSTeardownLeavesSessionTransportOpen(t *testing.T) {
 	t.Cleanup(func() { _ = s.iceMux.Close() })
 	s.rtpConn = s.iceMux.rtp
 
-	server := dtlsHandshakeOverTransport(t, s.dtlsTransport(), peer, remote.LocalAddr())
+	// The peer's DTLS client answers the close_notify below by closing its conn,
+	// and media is sent from that same socket afterwards, so it is only lent.
+	server := dtlsHandshakeOverTransport(t, s.dtlsTransport(), lentPacketConn{peer}, remote.LocalAddr())
 
 	// close_notify is the gentlest of the teardowns that reach nextConn.Close();
 	// a fatal alert arrives at the same place via close(false).
