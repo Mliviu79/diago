@@ -92,6 +92,9 @@ type RTPJitterBuffer struct {
 	closeOnce sync.Once
 	// startOnce ensures that only one upstream reader goroutine is launched.
 	startOnce sync.Once
+	// readLoopDone is closed when readLoop returns, or by Close when readLoop
+	// never started.
+	readLoopDone chan struct{}
 
 	// slots contains all reusable packet metadata and packet-sized byte regions.
 	slots []rtpJitterSlot
@@ -180,6 +183,7 @@ func NewRTPJitterBuffer(reader RTPReader, packetDuration time.Duration, opts RTP
 		input:          make(chan rtpJitterInput, slotCount),
 		freeSlots:      freeSlots,
 		done:           make(chan struct{}),
+		readLoopDone:   make(chan struct{}),
 		slots:          slots,
 		sequence:       sequence,
 		initialTimer:   initialTimer,
@@ -292,6 +296,7 @@ func (j *RTPJitterBuffer) start() {
 }
 
 func (j *RTPJitterBuffer) readLoop() {
+	defer close(j.readLoopDone)
 	defer close(j.input)
 
 	for {
@@ -300,6 +305,13 @@ func (j *RTPJitterBuffer) readLoop() {
 		case <-j.done:
 			return
 		case slotIndex = <-j.freeSlots:
+		}
+		// A select picks among ready cases at random, so a free slot can win over
+		// Close. Once the loop has seen Close it starts no further upstream read.
+		select {
+		case <-j.done:
+			return
+		default:
 		}
 
 		slot := &j.slots[slotIndex]
@@ -458,13 +470,30 @@ func (j *RTPJitterBuffer) recycleSlot(slotIndex int) {
 	}
 }
 
-// Close stops jitter-buffer delivery. It does not close the injected reader.
+// Close stops jitter-buffer delivery. It does not close the injected reader,
+// and it does not wait for the read loop, which may be blocked in the injected
+// reader's ReadRTP where Close cannot interrupt it. See Done.
 func (j *RTPJitterBuffer) Close() error {
 	j.closeOnce.Do(func() {
 		close(j.done)
 		j.stopTimers()
+		// A read loop that has not started by now never starts.
+		j.startOnce.Do(func() { close(j.readLoopDone) })
 	})
 	return nil
+}
+
+// Done returns a channel that is closed once the buffer has stopped reading the
+// injected reader and will not read it again. That happens when the injected
+// reader returns an error, or after Close once the injected reader's ReadRTP
+// in progress, if any, returns.
+//
+// An owner that needs the injected reader released, to hand it to another
+// consumer or to be sure nothing reads it any more, calls Close, then makes
+// the injected reader's ReadRTP return, for example by closing it, and then
+// waits on Done.
+func (j *RTPJitterBuffer) Done() <-chan struct{} {
+	return j.readLoopDone
 }
 
 // Statistics returns a race-safe snapshot of jitter buffer counters.

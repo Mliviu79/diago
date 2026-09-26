@@ -87,6 +87,25 @@ func (r *countingChanRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) 
 	return n, err
 }
 
+// startSignalRTPReader reports on started each read that begins, before it
+// blocks on packets.
+type startSignalRTPReader struct {
+	*chanRTPReader
+	started chan struct{}
+}
+
+func newStartSignalRTPReader() *startSignalRTPReader {
+	return &startSignalRTPReader{
+		chanRTPReader: newChanRTPReader(),
+		started:       make(chan struct{}, 8),
+	}
+}
+
+func (r *startSignalRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
+	r.started <- struct{}{}
+	return r.chanRTPReader.ReadRTP(buf, p)
+}
+
 func TestRTPJitterBuffer(t *testing.T) {
 	t.Run("packetDurationRequired", func(t *testing.T) {
 		require.PanicsWithValue(t,
@@ -273,13 +292,12 @@ func TestRTPJitterBuffer(t *testing.T) {
 
 	t.Run("closeAfterReadLoopStopped", func(t *testing.T) {
 		jb := NewRTPJitterBuffer(emptyRTPReader{}, time.Millisecond, RTPJitterBufferOptions{})
+		jb.start()
 		require.NoError(t, jb.Close())
 
 		// The read loop closes input when Close stops it, which is also how it
 		// reports the end of the upstream stream. Wait for that before reading.
-		jb.start()
-		_, ok := <-jb.input
-		require.False(t, ok, "the read loop must stop on Close")
+		requireJitterDone(t, jb)
 
 		// ReadRTP sees Close and the closed input at once, and a select picks
 		// among ready cases at random, so a single read proves nothing.
@@ -287,6 +305,76 @@ func TestRTPJitterBuffer(t *testing.T) {
 		for i := 0; i < 64; i++ {
 			_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
 			require.ErrorIs(t, err, io.ErrClosedPipe, "read %d after Close", i+1)
+		}
+	})
+}
+
+func TestRTPJitterBufferDone(t *testing.T) {
+	t.Run("afterUpstreamEnd", func(t *testing.T) {
+		jb := newTestRTPJitterBuffer(t, rtpPackets(1234, 0, 1))
+
+		require.Equal(t, uint16(0), readJitterSeq(t, jb))
+		require.Equal(t, uint16(1), readJitterSeq(t, jb))
+		requireJitterEOF(t, jb)
+		requireJitterDone(t, jb)
+	})
+
+	t.Run("closeBeforeRead", func(t *testing.T) {
+		reader := newStartSignalRTPReader()
+		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{})
+		require.NoError(t, jb.Close())
+		requireJitterDone(t, jb)
+
+		var pkt rtp.Packet
+		_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
+		require.ErrorIs(t, err, io.ErrClosedPipe)
+		require.Empty(t, reader.started, "a buffer closed before its first read never reads upstream")
+	})
+
+	t.Run("closeWaitsForUpstreamRead", func(t *testing.T) {
+		reader := newStartSignalRTPReader()
+		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{})
+		jb.start()
+		requireSignal(t, reader.started, "the read loop never read upstream")
+
+		// The read loop is blocked in the upstream ReadRTP, which Close cannot
+		// interrupt, so it has not stopped yet.
+		require.NoError(t, jb.Close())
+		select {
+		case <-jb.Done():
+			t.Fatal("Done closed while the read loop is blocked upstream")
+		default:
+		}
+
+		// Ending the upstream read is what the owner does to release it.
+		close(reader.packets)
+		requireJitterDone(t, jb)
+	})
+
+	t.Run("noUpstreamReadAfterClose", func(t *testing.T) {
+		// The read loop returns from an upstream read after Close with a packet
+		// and a free slot, and Close and the slot are both ready at once. A select
+		// picks among them at random, so one trial proves nothing.
+		for trial := 0; trial < 32; trial++ {
+			reader := newStartSignalRTPReader()
+			jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{})
+			jb.start()
+			requireSignal(t, reader.started, "the read loop never read upstream")
+
+			require.NoError(t, jb.Close())
+			sendJitterPacket(t, reader.chanRTPReader, rtpPacket(1234, 0))
+
+			select {
+			case <-jb.Done():
+			case <-reader.started:
+				close(reader.packets)
+				t.Fatalf("trial %d: the read loop read upstream again after Close", trial)
+			case <-time.After(5 * time.Second):
+				close(reader.packets)
+				t.Fatalf("trial %d: the read loop did not stop", trial)
+			}
+			require.Empty(t, reader.started, "trial %d", trial)
+			close(reader.packets)
 		}
 	})
 }
@@ -492,6 +580,36 @@ func requireJitterEOF(t *testing.T, jb *RTPJitterBuffer) {
 	var pkt rtp.Packet
 	_, err := jb.ReadRTP(buf, &pkt)
 	require.ErrorIs(t, err, io.EOF)
+}
+
+func requireJitterDone(t *testing.T, jb *RTPJitterBuffer) {
+	t.Helper()
+
+	select {
+	case <-jb.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read loop did not stop")
+	}
+}
+
+func requireSignal(t *testing.T, signal <-chan struct{}, msg string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+func sendJitterPacket(t *testing.T, reader *chanRTPReader, pkt rtp.Packet) {
+	t.Helper()
+
+	select {
+	case reader.packets <- pkt:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the read loop did not take packet %d", pkt.SequenceNumber)
+	}
 }
 
 func rtpPackets(ssrc uint32, seqs ...uint16) []rtp.Packet {
