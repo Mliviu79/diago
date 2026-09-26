@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -120,21 +119,20 @@ func (r *RTPPacketReader) Read(b []byte) (int, error) {
 	// NOTE: Packet Payload can or will reference this buffer as payload. To return only payload copy is required
 	// DO NOT EXPOSE Payload from this point
 	rtpN, err := reader.ReadRTP(buf, pkt)
-	if err != nil {
-		// In case we error while new reader update happen, then retry again
-		// This can be deadline, timeout, or connection closed
+	for err != nil {
+		// A read that failed on a reader replaced meanwhile, typically because
+		// the replaced session was closed under it, continues on the current
+		// reader. Replacements can follow each other while a read is blocked,
+		// so this repeats until a read succeeds or fails on the reader still in
+		// place.
 		r.mu.RLock()
 		newReader := r.reader
 		r.mu.RUnlock()
-		if newReader != reader {
-			// Make sure read is enabled if this is rtp connection
-			// Reason is we SetDeadline on Update but media session may not change connection
-			// TODO we may need to expose this
-			if ms, ok := newReader.(*MediaSession); ok {
-				ms.rtpConn.SetReadDeadline(time.Time{})
-			}
-			rtpN, err = newReader.ReadRTP(buf, pkt)
+		if newReader == reader {
+			break
 		}
+		reader = newReader
+		rtpN, err = reader.ReadRTP(buf, pkt)
 	}
 	if err != nil {
 		// For now underhood IO should only have net closed
@@ -230,14 +228,14 @@ func (r *RTPPacketReader) UpdateRTPSession(rtpSess *RTPSession) {
 	// r.mu.Unlock()
 }
 
+// UpdateReader replaces the reader Read uses. It does not interrupt a Read
+// blocked on the previous reader: that read returns what arrives there, or, if
+// it fails, for example because the caller closed the previous reader's
+// session, Read continues on this reader. A caller moving the media to a new
+// socket closes the old one, as the dialog does for a rebinding re-INVITE.
 func (r *RTPPacketReader) UpdateReader(reader RTPReader) {
 	// codec := CodecFromSession(rtpSess.Sess)
 	r.mu.Lock()
-	// Make sure that current reading is stopped
-	if m, ok := r.reader.(*MediaSession); ok {
-		m.rtpConn.SetReadDeadline(time.Now())
-	}
 	r.reader = reader
-	// TODO we need to make sure that current Audio Reading is really stopped before updating
 	r.mu.Unlock()
 }

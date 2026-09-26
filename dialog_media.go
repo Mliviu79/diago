@@ -643,16 +643,6 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 		jitter := media.NewRTPJitterBuffer(reader, codec.SampleDur, opts)
 		d.RTPPacketReader.UpdateReader(jitter)
 
-		// UpdateReader interrupts a potentially blocked RTPSession read. The new
-		// jitter reader uses that same session, so restore normal network reading.
-		if session, ok := reader.(*media.RTPSession); ok {
-			if err := session.Sess.StartRTP(1); err != nil {
-				d.RTPPacketReader.UpdateReader(reader)
-				_ = jitter.Close()
-				return fmt.Errorf("failed to start jitter buffer RTP reader: %w", err)
-			}
-		}
-
 		d.onCloseUnsafe(jitter.Close)
 		return nil
 	}
