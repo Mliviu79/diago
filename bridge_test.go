@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -350,16 +351,20 @@ func (d *bridgeTestDialog) sendRTP(t *testing.T, seq uint16, ts uint32, payload 
 
 // bridgeTestConn is a dialog's RTP socket. It counts the reads in progress on
 // it. With deadlineErr set, every read deadline it is given is applied and then
-// reported as failed.
+// reported as failed. With beforeRead set, every read calls it first.
 type bridgeTestConn struct {
 	*net.UDPConn
 	deadlineErr error
 	reading     atomic.Int32
+	beforeRead  func()
 }
 
 func (c *bridgeTestConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	c.reading.Add(1)
 	defer c.reading.Add(-1)
+	if c.beforeRead != nil {
+		c.beforeRead()
+	}
 	return c.UDPConn.ReadFrom(b)
 }
 
@@ -575,12 +580,24 @@ func TestBridgeMixRefusesCodecMismatch(t *testing.T) {
 // frame read more than two frame durations late, so the mix must take each
 // frame within a frame duration, however fast its writers return.
 func TestBridgeMixPollDeliversRealtimeAudio(t *testing.T) {
+	testBridgeMixDeliversRealtimeAudio(t, true)
+}
+
+// TestBridgeMixDirectReadDeliversRealtimeAudio checks the same with Poll off,
+// where the mix reads each stream itself with a short deadline, and that the
+// frames it reads are mixed.
+func TestBridgeMixDirectReadDeliversRealtimeAudio(t *testing.T) {
+	testBridgeMixDeliversRealtimeAudio(t, false)
+}
+
+func testBridgeMixDeliversRealtimeAudio(t *testing.T, poll bool) {
 	ulaw10ms := media.CodecAudioUlaw
 	ulaw10ms.SampleDur = 10 * time.Millisecond
 
 	for _, codec := range []media.Codec{media.CodecAudioUlaw, ulaw10ms} {
 		t.Run(codec.SampleDur.String(), func(t *testing.T) {
 			b := NewBridgeMix()
+			b.Poll = poll
 			talker := newBridgeTestDialog(t, "talker", codec)
 			listener := newBridgeTestDialog(t, "listener", codec)
 			talker.media.audioWriter = newBridgeTestWriter()
@@ -720,6 +737,11 @@ func (w bridgeFailingWriter) Write(b []byte) (int, error) {
 // BYE has closed, before its handler leaves the bridge, is dropped from the mix;
 // any other failed write loses that frame for that dialog alone.
 func TestBridgeMixKeepsMixingPastAFailedDialog(t *testing.T) {
+	t.Run("Poll", func(t *testing.T) { testBridgeMixKeepsMixingPastAFailedDialog(t, true) })
+	t.Run("DirectRead", func(t *testing.T) { testBridgeMixKeepsMixingPastAFailedDialog(t, false) })
+}
+
+func testBridgeMixKeepsMixingPastAFailedDialog(t *testing.T, poll bool) {
 	for _, tc := range []struct {
 		name string
 		// joined sets the dialog up to fail once it has joined
@@ -732,6 +754,7 @@ func TestBridgeMixKeepsMixingPastAFailedDialog(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := NewBridgeMix()
+			b.Poll = poll
 			talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
 			failed := newBridgeTestDialog(t, "failed", media.CodecAudioUlaw)
 			listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
@@ -759,6 +782,168 @@ func TestBridgeMixKeepsMixingPastAFailedDialog(t *testing.T) {
 			}
 			assert.Equal(t, 1, b.stateRead(), "the mix must keep running")
 		})
+	}
+}
+
+// TestBridgeMixDirectReadStopsWhileAudioFlows checks that a stop ends a mix
+// that reads its streams directly, with Poll off, while every read finds a frame
+// waiting. Such a mix never has a read time out on its own deadline, so it sees
+// the stop only through the deadline the stop sets, which its own must never
+// replace.
+func TestBridgeMixDirectReadStopsWhileAudioFlows(t *testing.T) {
+	b := NewBridgeMix()
+	b.Poll = false
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+	a.media.audioWriter = newBridgeTestWriter()
+	heard := newBridgeTestWriter()
+	c.media.audioWriter = heard
+	for _, d := range []*bridgeTestDialog{a, c} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+
+	// Both peers send four frames for every frame the mix reads, so a read
+	// always finds one waiting
+	feeding := make(chan struct{})
+	fed := make(chan struct{})
+	go func() {
+		defer close(fed)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; ; i++ {
+			select {
+			case <-feeding:
+				return
+			case <-ticker.C:
+			}
+			for _, d := range []*bridgeTestDialog{a, c} {
+				pkt := rtp.Packet{
+					Header:  rtp.Header{Version: 2, SequenceNumber: uint16(i), Timestamp: uint32(i) * 160, SSRC: 1},
+					Payload: bytes.Repeat([]byte{0x20}, 160),
+				}
+				data, _ := pkt.Marshal()
+				_, _ = d.peer.WriteTo(data, d.conn.LocalAddr())
+			}
+		}
+	}()
+	var feedEnd sync.Once
+	endFeed := func() {
+		feedEnd.Do(func() { close(feeding) })
+		<-fed
+	}
+	t.Cleanup(endFeed)
+
+	select {
+	case <-heard.frames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the mix wrote nothing")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_ = b.mixStopWait()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		// Ending the feed lets the reads drain the frames waiting and then time
+		// out, which ends the mix and the stop
+		endFeed()
+		select {
+		case <-stopped:
+		case <-time.After(10 * time.Second):
+		}
+		t.Fatal("the mix did not stop while audio was flowing")
+	}
+}
+
+// rebind moves the dialog's media to a session on a new socket, as a re-INVITE
+// that rebinds the media does in replaceRTPSessionUnsafe: under the dialog's
+// lock the packet reader moves to the new session and the session is replaced,
+// and the replaced session's socket is then closed.
+func (d *bridgeTestDialog) rebind(t *testing.T) {
+	t.Helper()
+	rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { rtpConn.Close() })
+	conn := &bridgeTestConn{UDPConn: rtpConn}
+
+	d.media.mu.Lock()
+	sess := &media.MediaSession{Codecs: slices.Clone(d.media.mediaSession.Codecs)}
+	sess.InitWithListeners(conn, conn, d.peer.LocalAddr().(*net.UDPAddr))
+	d.media.RTPPacketReader.UpdateReader(sess)
+	d.media.mediaSession = sess
+	d.media.mu.Unlock()
+
+	require.NoError(t, d.conn.Close())
+	d.conn = conn
+}
+
+// TestBridgeMixDirectReadFollowsRebind checks that a mix reading its streams
+// directly, with Poll off, reads a dialog with a deadline on its current media
+// session. Once a re-INVITE has moved a dialog's media to a new socket, a
+// deadline set on the replaced session leaves the read on the new socket without
+// one, and the mix waits there until that dialog sends a frame. That holds for
+// a read started after the move, and for one the move caught waiting, which the
+// packet reader continues on the new socket.
+func TestBridgeMixDirectReadFollowsRebind(t *testing.T) {
+	t.Run("BetweenReads", func(t *testing.T) { testBridgeMixDirectReadFollowsRebind(t, false) })
+	t.Run("DuringRead", func(t *testing.T) { testBridgeMixDirectReadFollowsRebind(t, true) })
+}
+
+func testBridgeMixDirectReadFollowsRebind(t *testing.T, duringRead bool) {
+	b := NewBridgeMix()
+	b.Poll = false
+	talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
+	moved := newBridgeTestDialog(t, "moved", media.CodecAudioUlaw)
+	listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
+	talker.media.audioWriter = newBridgeTestWriter()
+	moved.media.audioWriter = newBridgeTestWriter()
+	heard := newBridgeTestWriter()
+	listener.media.audioWriter = heard
+
+	// The first read of the moved dialog waits until the move has closed the
+	// socket it reads
+	reading := make(chan struct{})
+	moveDone := make(chan struct{})
+	if duringRead {
+		var once sync.Once
+		moved.conn.beforeRead = func() {
+			once.Do(func() {
+				close(reading)
+				select {
+				case <-moveDone:
+				case <-time.After(5 * time.Second):
+				}
+			})
+		}
+	}
+	for _, d := range []*bridgeTestDialog{talker, moved, listener} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	// The moved dialog stays silent
+	if duringRead {
+		select {
+		case <-reading:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the mix did not read the dialog")
+		}
+	}
+	moved.rebind(t)
+	close(moveDone)
+	const frames = 5
+	start := time.Now()
+	for i := range frames {
+		time.Sleep(time.Until(start.Add(time.Duration(i) * 20 * time.Millisecond)))
+		talker.sendRTP(t, uint16(i), uint32(i)*160, bytes.Repeat([]byte{byte(0x20 + i)}, 160))
+	}
+	for i := range frames {
+		waitHeard(t, heard, byte(0x20+i))
 	}
 }
 

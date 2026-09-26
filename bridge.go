@@ -637,10 +637,12 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur ti
 }
 
 type bridgePCMStream struct {
-	id           uint32
-	r            io.Reader
-	w            io.Writer
-	mediaSession *media.MediaSession
+	id uint32
+	r  io.Reader
+	w  io.Writer
+	// media is the dialog's media, whose current session a direct read sets its
+	// deadline on
+	media *DialogMedia
 	// read buf
 	buf []byte
 	n   int
@@ -694,13 +696,13 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, fi
 	}
 
 	*stream = bridgePCMStream{
-		r:            &pcmReader,
-		w:            &pcmWriter,
-		mediaSession: m.mediaSession,
-		id:           m.RTPPacketWriter.SSRC,
-		buf:          make([]byte, media.RTPBufSize),
-		pipeRead:     make(chan int),
-		pipeWrite:    make(chan []byte),
+		r:         &pcmReader,
+		w:         &pcmWriter,
+		media:     m,
+		id:        m.RTPPacketWriter.SSRC,
+		buf:       make([]byte, media.RTPBufSize),
+		pipeRead:  make(chan int),
+		pipeWrite: make(chan []byte),
 	}
 	return nil
 }
@@ -716,13 +718,20 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 	if !poll {
 		// If are not polling data then we need todo direct read
 		err := func() error {
-			for i, r := range rwStreams {
-				r.mediaSession.StopRTP(1, 1*time.Millisecond)
+			handledStreams := len(rwStreams)
+			for _, r := range rwStreams {
+				r.n = 0
+				if r.markGone {
+					handledStreams--
+					continue
+				}
+				if !b.armDirectRead(r) {
+					return fmt.Errorf("reading is stopped")
+				}
 
 				// Mostly PCM sample size should be same or less our sampling
 				// but we should keep same sampling or deal this per writer?
-				n, err := r.r.Read(r.buf)
-				rwStreams[i].n = n
+				n, err := b.readDirect(r)
 				if err != nil {
 					if errors.Is(err, os.ErrDeadlineExceeded) {
 						state := b.stateRead()
@@ -732,9 +741,19 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 						}
 						continue
 					}
-					return err
+					// The stream's reader has ended, as it does once a BYE has
+					// closed the dialog's media. The dialog is dropped from the
+					// mix, and the others keep being mixed.
+					r.markGone = true
+					handledStreams--
+					continue
 				}
-				maxN = max(maxN, n)
+				r.n = n
+				mixN := audio.PCMMix(mixedBuf, mixedBuf, r.buf[:n])
+				maxN = max(maxN, mixN)
+			}
+			if handledStreams == 0 {
+				return fmt.Errorf("all streams are gones")
 			}
 			return nil
 		}()
@@ -787,6 +806,53 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 
 	b.log.Debug("Mixing done", "streams.len", len(rwStreams), "maxN", maxN)
 	return maxN, err
+}
+
+// armDirectRead gives the next direct read of a stream a deadline one
+// millisecond away, on its dialog's current media session. It sets it under the
+// bridge lock and only while the mix runs, so it never replaces the deadline
+// mixStop sets to stop the mix, and returns false once a stop has begun. A
+// deadline that can not be set leaves the read to report what is wrong with the
+// connection.
+func (b *BridgeMix) armDirectRead(s *bridgePCMStream) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.mixState != 1 {
+		return false
+	}
+	_ = s.media.MediaSession().StopRTP(1, time.Millisecond)
+	return true
+}
+
+// readDirect reads the stream once armDirectRead has set its deadline. A
+// re-INVITE that rebinds the dialog's media closes the socket that deadline is
+// on, and the packet reader carries a read waiting there over to the new
+// socket, which has no deadline. A read still waiting once its deadline has
+// passed is therefore armed again, on the dialog's current media session, every
+// two milliseconds until it returns. The arming has stopped when readDirect
+// returns.
+func (b *BridgeMix) readDirect(s *bridgePCMStream) (int, error) {
+	readDone := make(chan struct{})
+	rearmed := make(chan struct{})
+	rearm := time.AfterFunc(2*time.Millisecond, func() {
+		defer close(rearmed)
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			b.armDirectRead(s)
+			select {
+			case <-readDone:
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+	n, err := s.r.Read(s.buf)
+	close(readDone)
+	if !rearm.Stop() {
+		<-rearmed
+	}
+	return n, err
 }
 
 func unmixStream(buf []byte, mixedBuf []byte) []byte {
