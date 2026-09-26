@@ -76,7 +76,9 @@ func TestRTPSessionReading(t *testing.T) {
 	}
 
 	rtpWriter := NewRTPPacketWriterSession(rtpSessWrite)
+	writeDone := make(chan struct{})
 	go func() {
+		defer close(writeDone)
 		// Setup remote session
 		// defer rtpWrite.Sess.Close()
 
@@ -101,6 +103,14 @@ func TestRTPSessionReading(t *testing.T) {
 		if err != nil {
 			break
 		}
+	}
+
+	// The writer still logs the last packet and waits a packet clock tick after
+	// the pipe hands it over, so it outlives the last read.
+	select {
+	case <-writeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RTP writer did not finish")
 	}
 
 	// stream pkts + 3 -1 as increase of seq number
@@ -140,7 +150,9 @@ func TestRTPSessionWriting(t *testing.T) {
 	}
 
 	rtpReader := NewRTPPacketReaderSession(rtpSessRead)
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		readBuf := make([]byte, 1500)
 		for i := 0; i < len(rtpStream); i++ {
 			_, err := rtpReader.Read(readBuf)
@@ -161,6 +173,14 @@ func TestRTPSessionWriting(t *testing.T) {
 
 		_, err := rtpWriter.Write(payload)
 		assert.NoError(t, err)
+	}
+
+	// The reader still logs and counts the last packet after the pipe hands it
+	// over, so it outlives the last write.
+	select {
+	case <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RTP reader did not finish")
 	}
 
 	// stream pkts + 3 -1 as increase of seq number
@@ -439,7 +459,9 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
 	rtpSessRead.sourceLock = true // Enable source locking
 
+	writeDone := make(chan struct{})
 	go func() {
+		defer close(writeDone)
 		var seq uint16 = 1
 		for ; seq < 5; seq++ {
 			pkt := rtp.Packet{
@@ -456,6 +478,14 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	pkt := rtp.Packet{}
 	_, err := rtpSessRead.ReadRTP(make([]byte, 1600), &pkt)
 	require.NoError(t, err)
+
+	// The writer still logs and counts the last packet after the pipe hands it
+	// over, so it outlives the read.
+	select {
+	case <-writeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RTP writer did not finish")
+	}
 
 	assert.Equal(t, uint16(4), pkt.SequenceNumber)
 }
