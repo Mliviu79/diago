@@ -4,6 +4,7 @@
 package media
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"testing"
@@ -168,4 +169,59 @@ func TestICESessionClosesSocket(t *testing.T) {
 
 	// Close is idempotent: MediaSession.Close may be reached twice on error paths.
 	require.NoError(t, s.Close())
+}
+
+// TestICEFinalizeWithinContinuesChecks pins that FinalizeWithin gives up
+// waiting for the connectivity checks, not the checks. The agent cannot start
+// them a second time, so an answer to an early offer that stopped them could
+// never complete once the caller takes part after the 200.
+func TestICEFinalizeWithinContinuesChecks(t *testing.T) {
+	ip := iceTestIP(t)
+
+	newSess := func(role DTLSEndpointRole, cert tls.Certificate) *MediaSession {
+		t.Helper()
+		s := &MediaSession{
+			Codecs:    []Codec{CodecAudioUlaw},
+			Mode:      sdp.ModeSendrecv,
+			SecureRTP: SecureRTPModeDTLS,
+			ICEConf:   &ICEConfig{},
+			DTLSRole:  role,
+			DTLSConf:  DTLSConfig{Certificates: []tls.Certificate{cert}},
+		}
+		s.Laddr = net.UDPAddr{IP: ip, Port: 0}
+		require.NoError(t, s.Init())
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	offerer := newSess(DTLSEndpointRoleOfferer, testdata.ClientCertificate())
+	answerer := newSess(DTLSEndpointRoleAnswerer, testdata.ServerCertificate())
+	require.NoError(t, answerer.RemoteSDP(offerer.LocalSDP()))
+	offerer.RemoteSDPIsAnswer = true
+	require.NoError(t, offerer.RemoteSDP(answerer.LocalSDP()))
+
+	// The offerer, the controlling agent, starts nothing yet.
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 300*time.Millisecond), ErrFinalizeInProgress)
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- offerer.Finalize() }()
+	go func() { errCh <- answerer.FinalizeContext(context.Background()) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "ICE + DTLS negotiation left running did not complete")
+		case <-time.After(40 * time.Second):
+			t.Fatal("ICE + DTLS negotiation left running did not return")
+		}
+	}
+
+	pkt := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: 1, Timestamp: 160, SSRC: 0xdeadbeef},
+		Payload: []byte{0xd5, 0xd5, 0xd5, 0xd5},
+	}
+	require.NoError(t, answerer.WriteRTP(pkt))
+	require.NoError(t, offerer.rtpConn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	got := rtp.Packet{}
+	_, err := offerer.ReadRTP(make([]byte, RTPBufSize), &got)
+	require.NoError(t, err, "media must arrive and decrypt over the ICE pair")
+	assert.Equal(t, pkt.Payload, got.Payload)
 }

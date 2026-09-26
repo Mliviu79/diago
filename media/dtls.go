@@ -30,6 +30,8 @@ var (
 	// wait for the peer. The DTLS stack retransmits its flights for as long as
 	// its context lives, so without a cap a peer that never completes the
 	// handshake would hold it, the caller of Finalize and the socket forever.
+	// A handshake FinalizeWithin left running is capped from the moment
+	// FinalizeContext waits for it.
 	DTLSHandshakeTimeout = 30 * time.Second
 )
 

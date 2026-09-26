@@ -158,7 +158,7 @@ func newProgressMediaDTLSDialog(t *testing.T) (d *DialogServerSession, peer *med
 }
 
 // TestDialogServerProgressMediaDTLS pins that early media over DTLS-SRTP is
-// keyed before ProgressMedia returns. RFC 5763 section 5 has an answerer that
+// keyed before ProgressMedia returns. RFC 5763 section 6.2 has an answerer that
 // wishes to provide early media take setup:active and establish the DTLS
 // association at once, and RFC 3261 section 13.2.1 has the caller treat the
 // answer in the 183 as the answer. Without the handshake the session has no
@@ -213,9 +213,8 @@ func TestDialogServerProgressMediaDTLS(t *testing.T) {
 		assert.Equal(t, payload, got.Payload)
 	})
 
-	// A caller that ignores the answer in the 183 never runs the handshake.
-	// ProgressMedia then waits for it only as long as the dialog lives, and
-	// returns once the caller gives up.
+	// A caller that gives up before it keys the early media ends the wait
+	// with the dialog, ahead of KeyTimeout.
 	t.Run("gives up with the dialog", func(t *testing.T) {
 		d, _, inviteTx := newProgressMediaDTLSDialog(t)
 

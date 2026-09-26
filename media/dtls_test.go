@@ -23,6 +23,7 @@ import (
 	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/diago/testdata"
 	"github.com/pion/dtls/v3"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -718,4 +719,189 @@ func TestDTLSSDPHasNoConnectionAttribute(t *testing.T) {
 			require.Contains(t, string(body), "a=fingerprint:")
 		})
 	}
+}
+
+// dtlsTestPacket is an RTP packet whose payload is easy to find on the wire.
+func dtlsTestPacket(seq uint16) *rtp.Packet {
+	return &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    CodecAudioUlaw.PayloadType,
+			SequenceNumber: seq,
+			Timestamp:      uint32(seq) * 160,
+			SSRC:           0x5eed0000,
+		},
+		Payload: []byte{0xd5, 0x5a, 0xd5, 0x5a, 0xd5, 0x5a, 0xd5, 0x5a},
+	}
+}
+
+// requireSRTPBetween writes one packet from one session and requires the other
+// to read and decrypt it.
+func requireSRTPBetween(t *testing.T, from, to *MediaSession, seq uint16) {
+	t.Helper()
+	pkt := dtlsTestPacket(seq)
+	require.NoError(t, from.WriteRTP(pkt))
+	require.NoError(t, to.StopRTP(1, 5*time.Second))
+	got := rtp.Packet{}
+	_, err := to.ReadRTP(make([]byte, RTPBufSize), &got)
+	require.NoError(t, err, "the media did not arrive and decrypt")
+	require.NoError(t, to.StartRTP(1))
+	require.Equal(t, seq, got.SequenceNumber)
+	require.Equal(t, pkt.Payload, got.Payload)
+}
+
+// TestDTLSFinalizeWithinLeavesHandshakeRunning pins that FinalizeWithin gives
+// up waiting, not the handshake. A caller may ignore the answer in a 183 (RFC
+// 3960), so the answerer of an early offer stops waiting for it, but the
+// handshake has to go on: as the client (RFC 5763 section 6.2) it has already
+// sent ClientHellos, and a peer whose DTLS stack reads them later cannot
+// complete a new association in their place, while it completes this one at
+// once. The handshake also outlives DTLSHandshakeTimeout until it is waited
+// for, since the caller may take longer than that to answer.
+func TestDTLSFinalizeWithinLeavesHandshakeRunning(t *testing.T) {
+	prev := DTLSHandshakeTimeout
+	DTLSHandshakeTimeout = time.Second
+	t.Cleanup(func() { DTLSHandshakeTimeout = prev })
+
+	for _, setup := range []string{"active", "passive"} {
+		t.Run("answerer "+setup, func(t *testing.T) {
+			offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+			answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+			answerer.DTLSConf.SDPSetupRole = func(bool) string { return setup }
+			_, answer := negotiateDTLS(t, offerer, answerer, nil)
+			require.Contains(t, string(answer), "a=setup:"+setup)
+
+			// The offerer ignores the answer for now and runs nothing.
+			err := answerer.FinalizeWithin(context.Background(), 300*time.Millisecond)
+			require.ErrorIs(t, err, ErrFinalizeInProgress)
+			require.True(t, answerer.FinalizePending(), "the handshake must be left to wait for")
+			require.ErrorIs(t, answerer.WriteRTP(dtlsTestPacket(1)), ErrDTLSNotKeyed)
+
+			// Longer than DTLSHandshakeTimeout, which does not run until the
+			// handshake is waited for.
+			time.Sleep(1500 * time.Millisecond)
+
+			errCh := make(chan error, 2)
+			go func() { errCh <- offerer.Finalize() }()
+			go func() { errCh <- answerer.FinalizeContext(context.Background()) }()
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-errCh:
+					require.NoError(t, err, "the handshake left running did not complete")
+				case <-time.After(10 * time.Second):
+					t.Fatal("the handshake left running did not return")
+				}
+			}
+			require.False(t, answerer.FinalizePending())
+			requireSRTPBetween(t, answerer, offerer, 10)
+			requireSRTPBetween(t, offerer, answerer, 20)
+		})
+	}
+}
+
+// TestDTLSFinalizeWithinJoinIsBounded pins that a handshake left running is
+// bounded by DTLSHandshakeTimeout once it is waited for, so a peer that never
+// takes part does not hold the FinalizeContext that waits for it.
+func TestDTLSFinalizeWithinJoinIsBounded(t *testing.T) {
+	prev := DTLSHandshakeTimeout
+	DTLSHandshakeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { DTLSHandshakeTimeout = prev })
+
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 100*time.Millisecond), ErrFinalizeInProgress)
+
+	done := make(chan error, 1)
+	go func() { done <- answerer.FinalizeContext(context.Background()) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(10 * time.Second):
+		t.Fatal("waiting for the handshake outlived DTLSHandshakeTimeout")
+	}
+	require.False(t, answerer.FinalizePending())
+	require.ErrorIs(t, answerer.WriteRTP(dtlsTestPacket(1)), ErrDTLSNotKeyed, "a failed handshake leaves no keys")
+}
+
+// TestDTLSFinalizeWithinEndsWithClose pins that Close ends a handshake left
+// running and waits for it, so it does not outlive the session or run on the
+// sockets Close releases.
+func TestDTLSFinalizeWithinEndsWithClose(t *testing.T) {
+	baseline := dtlsGoroutines()
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 100*time.Millisecond), ErrFinalizeInProgress)
+
+	closed := make(chan error, 1)
+	go func() { closed <- answerer.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not end the handshake left running")
+	}
+	require.Eventually(t, func() bool {
+		return dtlsGoroutines() <= baseline
+	}, 5*time.Second, 10*time.Millisecond, "the handshake left running outlived Close")
+}
+
+// TestDTLSFinalizeWithinEndsWithContext pins that the context FinalizeWithin
+// is given still ends the handshake, as it ends the call.
+func TestDTLSFinalizeWithinEndsWithContext(t *testing.T) {
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.ErrorIs(t, answerer.FinalizeWithin(ctx, 100*time.Millisecond), ErrFinalizeInProgress)
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- answerer.FinalizeContext(context.Background()) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handshake outlived the context it was started with")
+	}
+}
+
+// TestDTLSFinalizeWithinSendsNoMedia pins that a session whose handshake
+// FinalizeWithin left running sends no media. Without keys WriteRTP and
+// WriteRTCP would put it on the wire in plaintext, where the profile has none:
+// SRTP processing does not start before the handshake completes (RFC 5764
+// section 5.1), and media is protected solely with SRTP (section 4.1). Once
+// the handshake has keyed the session, media goes out encrypted.
+func TestDTLSFinalizeWithinSendsNoMedia(t *testing.T) {
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	// As the DTLS server the answerer sends nothing of its own until the
+	// offerer starts the handshake, so any datagram is the media refused below.
+	answerer.DTLSConf.SDPSetupRole = func(bool) string { return "passive" }
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 100*time.Millisecond), ErrFinalizeInProgress)
+	require.ErrorIs(t, answerer.WriteRTP(dtlsTestPacket(1)), ErrDTLSNotKeyed)
+	require.ErrorIs(t, answerer.WriteRTCP(&rtcp.ReceiverReport{SSRC: 1}), ErrDTLSNotKeyed)
+
+	require.NoError(t, offerer.rtpConn.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, _, err := offerer.rtpConn.ReadFrom(make([]byte, RTPBufSize))
+	require.True(t, os.IsTimeout(err), "media went out before the handshake: %v", err)
+	require.NoError(t, offerer.rtpConn.SetReadDeadline(time.Time{}))
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- offerer.Finalize() }()
+	go func() { errCh <- answerer.FinalizeContext(context.Background()) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the handshake left running did not return")
+		}
+	}
+	requireSRTPBetween(t, answerer, offerer, 10)
 }

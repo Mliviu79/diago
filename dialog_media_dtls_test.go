@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -519,4 +521,274 @@ func TestDialogServerReInviteNewAssociationFailureHangsUp(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the peer's handshake did not return")
 	}
+}
+
+// sentPacketConn records every datagram a media session writes through it, so
+// a test sees what went on the wire from that session.
+type sentPacketConn struct {
+	net.PacketConn
+	mu   sync.Mutex
+	sent [][]byte
+}
+
+func (c *sentPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	c.sent = append(c.sent, bytes.Clone(p))
+	c.mu.Unlock()
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+func (c *sentPacketConn) datagrams() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.sent)
+}
+
+// isDTLSRecord reports whether a datagram is a DTLS record rather than RTP or
+// RTCP, by its first byte (RFC 7983 section 7).
+func isDTLSRecord(datagram []byte) bool {
+	return len(datagram) > 0 && datagram[0] >= 20 && datagram[0] <= 63
+}
+
+// newSentDTLSMediaSession builds the DTLS-SRTP media session a callee on the
+// loopback builds, over an RTP socket that records what it sends. A handler
+// installs it with InitMediaSession before it answers.
+func newSentDTLSMediaSession(t *testing.T) (*media.MediaSession, *sentPacketConn) {
+	t.Helper()
+	rtpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	rtcpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	sent := &sentPacketConn{PacketConn: rtpConn}
+	sess := &media.MediaSession{
+		Codecs:    []media.Codec{media.CodecAudioUlaw},
+		SecureRTP: media.SecureRTPModeDTLS,
+		DTLSConf:  media.DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}},
+	}
+	sess.InitWithListeners(sent, rtcpConn, &net.UDPAddr{})
+	// InitWithListeners takes the local address from the RTCP socket, and the
+	// SDP has to name the RTP one.
+	sess.Laddr = *rtpConn.LocalAddr().(*net.UDPAddr)
+	t.Cleanup(func() { _ = sess.Close() })
+	return sess, sent
+}
+
+// TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller is a DTLS-SRTP call
+// without ICE whose caller ignores the answer in the 183, as RFC 3960 lets it,
+// and takes part in the handshake only after the 200: diago's own Invite
+// without EarlyMediaDetect. ProgressMedia gives up on early media after its
+// KeyTimeout and returns ErrEarlyMediaNotKeyed, instead of waiting out
+// DTLSHandshakeTimeout. Media written meanwhile is refused and nothing but DTLS
+// goes on the wire. The call stays answerable: Answer sends the 200 and the
+// handshake ProgressMedia started completes with the caller, so the media is
+// encrypted both ways.
+func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, sent := newSentDTLSMediaSession(t)
+	callee := newDTLSDiago(t, 16457, testdata.ServerCertificate())
+
+	type progressResult struct {
+		err  error
+		took time.Duration
+	}
+	type answerResult struct {
+		d *DialogServerSession
+		// writeErr is a write made after ProgressMedia gave up and before the
+		// answer, and sent is what the session had put on the wire when the
+		// answer returned.
+		writeErr error
+		sent     [][]byte
+		err      error
+	}
+	progressed := make(chan progressResult, 1)
+	answered := make(chan answerResult, 1)
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+		defer close(handlerDone)
+		d.InitMediaSession(sess, nil, nil)
+		start := time.Now()
+		err := d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: time.Second})
+		progressed <- progressResult{err: err, took: time.Since(start)}
+
+		r := answerResult{d: d}
+		r.writeErr = d.MediaSession().WriteRTP(&rtp.Packet{
+			Header:  rtp.Header{Version: 2, PayloadType: media.CodecAudioUlaw.PayloadType, SequenceNumber: 1, Timestamp: 160, SSRC: 0x5eed},
+			Payload: bytes.Repeat([]byte{0x5a}, 160),
+		})
+		r.err = d.Answer()
+		r.sent = sent.datagrams()
+		answered <- r
+		if r.err != nil {
+			return
+		}
+		select {
+		case <-release:
+		case <-d.Context().Done():
+		}
+	}))
+
+	caller := newDTLSDiago(t, 16458, testdata.ClientCertificate())
+	require.NoError(t, caller.ServeBackground(ctx, nil))
+	type inviteResult struct {
+		d   *DialogClientSession
+		err error
+	}
+	invited := make(chan inviteResult, 1)
+	go func() {
+		ictx, icancel := context.WithTimeout(ctx, 30*time.Second)
+		defer icancel()
+		d, err := caller.Invite(ictx, sip.Uri{User: "callee", Host: "127.0.0.1", Port: 16457}, InviteOptions{})
+		invited <- inviteResult{d: d, err: err}
+	}()
+
+	select {
+	case r := <-progressed:
+		require.ErrorIs(t, r.err, ErrEarlyMediaNotKeyed)
+		require.Less(t, r.took, 5*time.Second, "ProgressMedia waited past its KeyTimeout")
+	case <-time.After(10 * time.Second):
+		t.Fatal("ProgressMedia did not give up on early media within its KeyTimeout")
+	}
+
+	var answer answerResult
+	select {
+	case answer = <-answered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the callee did not answer")
+	}
+	require.NoError(t, answer.err, "the call must stay answerable")
+	require.ErrorIs(t, answer.writeErr, media.ErrDTLSNotKeyed)
+	require.NotEmpty(t, answer.sent, "the handshake was never started")
+	for i, datagram := range answer.sent {
+		require.True(t, isDTLSRecord(datagram), "datagram %d sent before the media was keyed is not DTLS: first byte %d", i, datagram[0])
+	}
+
+	var call inviteResult
+	select {
+	case call = <-invited:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the caller's Invite did not return")
+	}
+	require.NoError(t, call.err)
+	t.Cleanup(func() {
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer hcancel()
+		_ = call.d.Hangup(hctx)
+		close(release)
+		select {
+		case <-handlerDone:
+		case <-time.After(10 * time.Second):
+			t.Error("the callee's handler did not return")
+		}
+		_ = call.d.Close()
+	})
+
+	requireEncryptedMedia(t, &call.d.DialogMedia, &answer.d.DialogMedia, 100)
+	requireEncryptedMedia(t, &answer.d.DialogMedia, &call.d.DialogMedia, 110)
+}
+
+// TestIntegrationDialogDTLSEarlyMediaKeyedByCaller is a DTLS-SRTP call without
+// ICE whose caller takes the answer in the 183 and runs the handshake at once,
+// diago's own Invite with EarlyMediaDetect. ProgressMedia returns once the
+// early media is keyed, well within its KeyTimeout, the early media is
+// encrypted both ways, and after Answer the media stays encrypted.
+func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, _ := newSentDTLSMediaSession(t)
+	callee := newDTLSDiago(t, 16459, testdata.ServerCertificate())
+
+	type progressResult struct {
+		d   *DialogServerSession
+		err error
+	}
+	progressed := make(chan progressResult, 1)
+	answerNow := make(chan struct{})
+	answered := make(chan error, 1)
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+		defer close(handlerDone)
+		d.InitMediaSession(sess, nil, nil)
+		err := d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: 5 * time.Second})
+		progressed <- progressResult{d: d, err: err}
+		if err != nil {
+			return
+		}
+		select {
+		case <-answerNow:
+		case <-d.Context().Done():
+			return
+		}
+		err = d.Answer()
+		answered <- err
+		if err != nil {
+			return
+		}
+		select {
+		case <-release:
+		case <-d.Context().Done():
+		}
+	}))
+
+	caller := newDTLSDiago(t, 16460, testdata.ClientCertificate())
+	require.NoError(t, caller.ServeBackground(ctx, nil))
+	dialog, err := caller.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: 16459}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer hcancel()
+		_ = dialog.Hangup(hctx)
+		close(release)
+		select {
+		case <-handlerDone:
+		case <-time.After(10 * time.Second):
+			t.Error("the callee's handler did not return")
+		}
+		_ = dialog.Close()
+	})
+
+	ictx, icancel := context.WithTimeout(ctx, 20*time.Second)
+	defer icancel()
+	err = dialog.Invite(ictx, InviteClientOptions{EarlyMediaDetect: true})
+	require.ErrorIs(t, err, ErrClientEarlyMedia)
+
+	var d *DialogServerSession
+	select {
+	case r := <-progressed:
+		require.NoError(t, r.err, "early media the caller keyed must be reported keyed")
+		d = r.d
+	case <-time.After(10 * time.Second):
+		t.Fatal("ProgressMedia did not return")
+	}
+	requireEncryptedMedia(t, &d.DialogMedia, &dialog.DialogMedia, 100)
+	requireEncryptedMedia(t, &dialog.DialogMedia, &d.DialogMedia, 110)
+
+	close(answerNow)
+	acked := make(chan error, 1)
+	go func() {
+		if err := dialog.WaitAnswer(ictx, sipgo.AnswerOptions{}); err != nil {
+			acked <- err
+			return
+		}
+		acked <- dialog.Ack(ictx)
+	}()
+	select {
+	case err := <-acked:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the caller did not acknowledge the answer")
+	}
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the callee did not answer")
+	}
+	requireEncryptedMedia(t, &dialog.DialogMedia, &d.DialogMedia, 200)
+	requireEncryptedMedia(t, &d.DialogMedia, &dialog.DialogMedia, 210)
 }

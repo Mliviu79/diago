@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,6 +56,18 @@ var (
 	// 488 Not Acceptable Here and keep its current session. Match it with
 	// errors.Is.
 	ErrICERestartUnsupported = errors.New("ice restart unsupported")
+
+	// ErrFinalizeInProgress is returned by FinalizeWithin when the peer has
+	// not completed the negotiation within the wait it was given. The
+	// negotiation is still running, and a later FinalizeContext waits for it.
+	ErrFinalizeInProgress = errors.New("media negotiation still in progress")
+
+	// ErrDTLSNotKeyed is returned by WriteRTP and WriteRTCP while a DTLS
+	// handshake FinalizeWithin left running has not keyed SRTP, and after it
+	// failed. The media is refused rather than sent in plaintext: SRTP
+	// processing does not start before the handshake completes (RFC 5764
+	// section 5.1), and the profile protects media with nothing else.
+	ErrDTLSNotKeyed = errors.New("dtls-srtp not keyed")
 )
 
 // RTPTracer receives decoded RTP packets when RTPDebug is enabled.
@@ -281,7 +294,22 @@ type MediaSession struct {
 	// Like establishedICE it is never written after it is set.
 	dtlsAssoc *dtlsAssociation
 
-	onFinalize func(ctx context.Context) error
+	// onFinalize runs the negotiation RemoteSDP armed: the ICE connectivity
+	// checks and the DTLS handshake. bounded caps each with ICEConnectTimeout
+	// and DTLSHandshakeTimeout; without it only ctx ends them.
+	onFinalize func(ctx context.Context, bounded bool) error
+	// finalizeRun is the negotiation FinalizeWithin left running, until a
+	// FinalizeContext or Close has waited for it. Guarded by finalizeMu, since
+	// Close may run on another goroutine than the one that waits.
+	finalizeMu  sync.Mutex
+	finalizeRun *finalizeRun
+	// dtlsUnkeyed is set when FinalizeWithin leaves a DTLS handshake running,
+	// and cleared by the handshake once it has keyed SRTP; WriteRTP and
+	// WriteRTCP refuse while it is set. It is cleared only after the SRTP
+	// contexts are set, so a writer that finds it clear finds them too,
+	// although another goroutine set them, and a writer that finds it set
+	// reads none of what that goroutine writes.
+	dtlsUnkeyed atomic.Bool
 
 	sessionID      uint64
 	sessionVersion uint64
@@ -624,6 +652,14 @@ func (s *MediaSession) OwnsICEAgent() bool {
 }
 
 func (s *MediaSession) Close() error {
+	// A negotiation left running reads and writes the sockets and the fields
+	// closed below, so it ends first.
+	if run := s.loadFinalizeRun(); run != nil {
+		run.cancel()
+		<-run.done
+		_ = s.endFinalizeRun(run)
+	}
+
 	// panic("calling close")
 	var e1, e2, e3 error
 	if s.rtcpConn != nil {
@@ -1255,9 +1291,9 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 		}
 	}
 
-	s.onFinalize = func(ctx context.Context) error {
+	s.onFinalize = func(ctx context.Context, bounded bool) error {
 		if s.iceEnabled() {
-			if err := s.startICE(ctx); err != nil {
+			if err := s.startICE(ctx, bounded); err != nil {
 				return err
 			}
 			if err := dialDTLS(); err != nil {
@@ -1271,8 +1307,12 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 			"laddr", s.dtlsConn.LocalAddr().String(),
 			"raddr", s.dtlsConn.RemoteAddr().String(),
 		)
-		hctx, cancel := context.WithTimeout(ctx, DTLSHandshakeTimeout)
-		defer cancel()
+		hctx := ctx
+		if bounded {
+			var cancel context.CancelFunc
+			hctx, cancel = context.WithTimeout(ctx, DTLSHandshakeTimeout)
+			defer cancel()
+		}
 		if err := s.dtlsConn.HandshakeContext(hctx); err != nil {
 			return fmt.Errorf("dtls conn handshake: %w", err)
 		}
@@ -1345,6 +1385,9 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 				remotePwd:   s.remoteICEPwd,
 			}
 		}
+
+		// Last, once the contexts above are set: see dtlsUnkeyed.
+		s.dtlsUnkeyed.Store(false)
 
 		DefaultLogger().Debug("DTLS SRTP setuped")
 		return nil
@@ -1470,12 +1513,13 @@ func (s *MediaSession) iceControlling() bool {
 }
 
 // startICE runs connectivity checks and installs the nominated pair as the
-// session transport.
+// session transport. bounded caps the checks with ICEConnectTimeout; without
+// it only ctx ends them.
 //
 // The role is iceControlling's. Once a pair is nominated, rtpConn and rtcpConn
 // become views on the one ICE connection, so the rest of MediaSession reads
 // and writes over ICE without further changes.
-func (s *MediaSession) startICE(ctx context.Context) error {
+func (s *MediaSession) startICE(ctx context.Context, bounded bool) error {
 	// Only the session that created the agent can run checks. A fork reaching
 	// here would be a fault in RemoteSDP, which never arms Finalize for one, so
 	// it is refused rather than dereferenced.
@@ -1483,8 +1527,11 @@ func (s *MediaSession) startICE(ctx context.Context) error {
 		return fmt.Errorf("media session: ICE connectivity checks need an agent, this session has none")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, ICEConnectTimeout)
-	defer cancel()
+	if bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ICEConnectTimeout)
+		defer cancel()
+	}
 
 	conn, raddr, err := s.iceAgent.Connect(ctx, s.iceControlling())
 	if err != nil {
@@ -1544,21 +1591,146 @@ func (s *MediaSession) Finalize() error {
 // the DTLS handshake it runs wait for the peer, and end with an error when ctx
 // is done first, or at the latest after ICEConnectTimeout and
 // DTLSHandshakeTimeout.
+//
+// When FinalizeWithin left the negotiation running, FinalizeContext waits for
+// that one instead, under the same bounds counted from this call: ctx, and
+// DTLSHandshakeTimeout, plus ICEConnectTimeout for an ICE session. When either
+// ends first the negotiation is ended with it.
 func (s *MediaSession) FinalizeContext(ctx context.Context) error {
+	if run := s.loadFinalizeRun(); run != nil {
+		return s.awaitFinalizeRun(ctx, run)
+	}
 	if s.onFinalize != nil {
-		err := s.onFinalize(ctx)
+		err := s.onFinalize(ctx, true)
 		s.onFinalize = nil
 		return err
 	}
 	return nil
 }
 
-// FinalizePending reports whether FinalizeContext has negotiation left to run:
-// the ICE connectivity checks and the DTLS handshake of a new session, or the
-// handshake of a new DTLS association that RemoteSDP found a renegotiation
-// asks for. A fork continuing its association has none, and is keyed already.
+// FinalizeWithin runs the negotiation as FinalizeContext does, but waits for it
+// only as long as wait, for a peer that may not take part yet: a caller given
+// our answer in a 183 is free to ignore it (RFC 3960) and to run the handshake
+// only once the call is answered. It then returns ErrFinalizeInProgress and
+// leaves the negotiation running, for a later FinalizeContext to wait for.
+//
+// The negotiation is left running because it cannot be run again in its place.
+// As the DTLS client this session has sent ClientHellos, which wait on the
+// peer's socket until its DTLS stack reads them: it completes this association
+// from them, and fails a new one they are read ahead of. An ICE agent cannot
+// start its connectivity checks twice either.
+//
+// Until FinalizeContext waits for it, the negotiation is bounded by ctx alone,
+// and by Close, which ends it. The session carries no media meanwhile: WriteRTP
+// and WriteRTCP return ErrDTLSNotKeyed, and nothing may read from the session
+// or change it, since the negotiation does both. A negotiation that ends within
+// wait, successfully or not, is reported as FinalizeContext reports it.
+func (s *MediaSession) FinalizeWithin(ctx context.Context, wait time.Duration) error {
+	run := s.loadFinalizeRun()
+	if run == nil {
+		if s.onFinalize == nil {
+			return nil
+		}
+		run = s.startFinalizeRun(ctx)
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-run.done:
+		return s.endFinalizeRun(run)
+	case <-timer.C:
+		return ErrFinalizeInProgress
+	}
+}
+
+// FinalizePending reports whether FinalizeContext has negotiation left to run
+// or to wait for: the ICE connectivity checks and the DTLS handshake of a new
+// session, the handshake of a new DTLS association that RemoteSDP found a
+// renegotiation asks for, or a negotiation FinalizeWithin left running. A fork
+// continuing its association has none, and is keyed already.
 func (s *MediaSession) FinalizePending() bool {
-	return s.onFinalize != nil
+	return s.onFinalize != nil || s.loadFinalizeRun() != nil
+}
+
+// finalizeRun is a negotiation running on a goroutine of its own. The session
+// that started it owns it: FinalizeContext or Close waits for it to end.
+type finalizeRun struct {
+	cancel context.CancelFunc
+	// done is closed when the negotiation has returned, and err is its result.
+	done chan struct{}
+	err  error
+}
+
+// negotiate runs the negotiation and records its result.
+func (r *finalizeRun) negotiate(ctx context.Context, finalize func(ctx context.Context, bounded bool) error) {
+	defer close(r.done)
+	defer r.cancel()
+	r.err = finalize(ctx, false)
+}
+
+// startFinalizeRun takes the armed negotiation and runs it, unbounded but by
+// ctx, until it is waited for.
+func (s *MediaSession) startFinalizeRun(ctx context.Context) *finalizeRun {
+	finalize := s.onFinalize
+	s.onFinalize = nil
+
+	ctx, cancel := context.WithCancel(ctx)
+	run := &finalizeRun{cancel: cancel, done: make(chan struct{})}
+	s.finalizeMu.Lock()
+	s.finalizeRun = run
+	s.finalizeMu.Unlock()
+	// No media goes out until the handshake has keyed SRTP, and nothing the
+	// negotiation writes is read meanwhile.
+	s.dtlsUnkeyed.Store(true)
+	go run.negotiate(ctx, finalize)
+	return run
+}
+
+func (s *MediaSession) loadFinalizeRun() *finalizeRun {
+	s.finalizeMu.Lock()
+	defer s.finalizeMu.Unlock()
+	return s.finalizeRun
+}
+
+// endFinalizeRun forgets a negotiation that has returned, and reports its
+// result.
+func (s *MediaSession) endFinalizeRun(run *finalizeRun) error {
+	s.finalizeMu.Lock()
+	if s.finalizeRun == run {
+		s.finalizeRun = nil
+	}
+	s.finalizeMu.Unlock()
+	return run.err
+}
+
+// awaitFinalizeRun waits for a negotiation FinalizeWithin left running, under
+// the bounds FinalizeContext gives one it runs itself, and ends it when ctx or
+// the bound ends first. A negotiation that completes while it is being ended
+// is kept.
+func (s *MediaSession) awaitFinalizeRun(ctx context.Context, run *finalizeRun) error {
+	bound := DTLSHandshakeTimeout
+	if s.iceEnabled() {
+		bound += ICEConnectTimeout
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+
+	var stop error
+	select {
+	case <-run.done:
+		return s.endFinalizeRun(run)
+	case <-ctx.Done():
+		stop = fmt.Errorf("media session: negotiation: %w", ctx.Err())
+	case <-timer.C:
+		stop = fmt.Errorf("media session: negotiation did not complete within %s: %w", bound, context.DeadlineExceeded)
+	}
+	run.cancel()
+	<-run.done
+	if err := s.endFinalizeRun(run); err == nil {
+		return nil
+	}
+	return stop
 }
 
 // localDTLSFingerprints returns the a=fingerprint values of our certificates,
@@ -1975,6 +2147,9 @@ func (m *MediaSession) ReadRTCPRawDeadline(buf []byte, t time.Time) (int, error)
 }
 
 func (m *MediaSession) WriteRTP(p *rtp.Packet) error {
+	if m.dtlsUnkeyed.Load() {
+		return ErrDTLSNotKeyed
+	}
 	if m.mode == sdp.ModeRecvonly {
 		// We block here as we would violate our media direction
 		return nil
@@ -2029,6 +2204,9 @@ func (m *MediaSession) WriteRTPRaw(data []byte) (n int, err error) {
 }
 
 func (m *MediaSession) WriteRTCP(p rtcp.Packet) error {
+	if m.dtlsUnkeyed.Load() {
+		return ErrDTLSNotKeyed
+	}
 	logRTCPWrite(m, p)
 
 	// TODO: rtcp library needs to support MarshalTo v2

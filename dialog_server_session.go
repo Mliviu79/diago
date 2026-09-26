@@ -55,6 +55,11 @@ type DialogServerSession struct {
 	// the dialog, for the answer waiting on that ACK to report. Guarded by
 	// d.mu.
 	ackAnswerErr error
+	// earlyAnswerSDP is the answer the 183 carried, set when ProgressMedia
+	// returned ErrEarlyMediaNotKeyed. The 200 repeats it, since the handshake
+	// ProgressMedia left running still uses the media session and LocalSDP
+	// cannot read it meanwhile. Guarded by d.mu.
+	earlyAnswerSDP []byte
 
 	// terminatingBye holds the BYE request that ended this dialog, captured by
 	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
@@ -118,6 +123,10 @@ func (d *DialogServerSession) Progress() error {
 
 // ProgressMedia sends 183 Session Progress and creates early media
 //
+// For DTLS-SRTP it returns once the caller has keyed the early media, or
+// ErrEarlyMediaNotKeyed when the caller has not within
+// ProgressMediaOptions.KeyTimeout.
+//
 // Experimental: Naming of API might change
 func (d *DialogServerSession) ProgressMedia() error {
 	return d.ProgressMediaOptions(ProgressMediaOptions{})
@@ -129,32 +138,91 @@ type ProgressMediaOptions struct {
 
 	// RTPNAT exposes MediaSession property
 	RTPNAT int
+
+	// KeyTimeout bounds how long a DTLS-SRTP ProgressMedia waits for the
+	// caller to key the early media, by completing the ICE connectivity checks
+	// and the DTLS handshake with us, before it returns ErrEarlyMediaNotKeyed.
+	// Zero means five seconds, for the reasons defaultEarlyMediaKeyTimeout
+	// gives. It bounds the wait only: the handshake goes on, for Answer to
+	// complete after the 200.
+	KeyTimeout time.Duration
 }
+
+// defaultEarlyMediaKeyTimeout is how long ProgressMedia waits for a caller to
+// key DTLS-SRTP early media when ProgressMediaOptions leaves it unset.
+//
+// A caller that takes the answer in the 183 keys it within a few round trips:
+// a DTLS 1.2 handshake with a cookie exchange is three, about a second on a 300
+// ms path, and ICE adds its checks ahead of it. Five seconds also covers two
+// lost flights, whose retransmission timers start at one second and double
+// (RFC 6347 section 4.2.4.1). A caller that ignores the 183 (RFC 3960) never
+// keys it, and costs the application this long before it learns early media is
+// not available. Too short a bound costs only the early media, never the call,
+// since the handshake is not abandoned with the wait.
+const defaultEarlyMediaKeyTimeout = 5 * time.Second
+
+// ErrEarlyMediaNotKeyed is returned by ProgressMedia when the caller did not key
+// DTLS-SRTP early media within ProgressMediaOptions.KeyTimeout, most likely
+// because it ignores early media (RFC 3960) and takes part in the DTLS
+// handshake only once the call is answered.
+//
+// The call stays answerable. The dialog has no early media, so no audio reader
+// or writer, and its media session refuses to send with media.ErrDTLSNotKeyed;
+// nothing may use it before Answer. Answer sends the 200 and then completes the
+// handshake ProgressMedia started, bounded by the call and by
+// media.DTLSHandshakeTimeout, before it sets the media up.
+var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has not completed the DTLS handshake")
 
 func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) error {
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
 	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
 		return err
 	}
-	rtpSess := media.NewRTPSession(d.mediaSession)
-	if err := d.setupRTPSession(rtpSess); err != nil {
+	sess := d.mediaSession
+	offer := d.InviteRequest.Body()
+	if offer == nil {
+		return fmt.Errorf("no sdp present in INVITE")
+	}
+	if err := sess.RemoteSDP(offer); err != nil {
 		return err
 	}
 
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
-	body := rtpSess.Sess.LocalSDP()
+	body := sess.LocalSDP()
 	if err := d.DialogServerSession.Respond(183, "Session Progress", body, headers...); err != nil {
 		return err
 	}
 
-	// The 183 carries our answer, and the caller treats it as the answer (RFC
-	// 3261 section 13.2.1), so the negotiation is complete here and the DTLS
-	// handshake, which an answerer providing early media starts at once (RFC
-	// 5763 section 5), runs now. Media sent before it would go out with no SRTP
-	// keys. The wait ends with the dialog, when the caller gives up.
-	if err := rtpSess.Sess.FinalizeContext(d.Context()); err != nil {
+	// The 183 carries our answer. A caller that treats it as the answer (RFC
+	// 3261 section 13.2.1) keys the early media with us: we take setup:active
+	// and start the DTLS handshake at once (RFC 5763 section 6.2), and no media
+	// may go out before it completes (RFC 5764 section 5.1). A caller may also
+	// ignore early media (RFC 3960) and take part only after the 200, so the
+	// wait is bounded by KeyTimeout, and by the dialog when the caller gives
+	// up.
+	//
+	// The handshake is not abandoned with the wait. The ClientHellos already
+	// sent wait on the caller's socket until its DTLS stack reads them after
+	// the 200: it completes this association from them, and fails a new one
+	// they are read ahead of. Answer waits for it instead.
+	keyTimeout := opt.KeyTimeout
+	if keyTimeout <= 0 {
+		keyTimeout = defaultEarlyMediaKeyTimeout
+	}
+	if err := sess.FinalizeWithin(d.Context(), keyTimeout); err != nil {
+		if errors.Is(err, media.ErrFinalizeInProgress) {
+			d.mu.Lock()
+			d.earlyAnswerSDP = body
+			d.mu.Unlock()
+			return ErrEarlyMediaNotKeyed
+		}
 		return err
 	}
+
+	rtpSess := media.NewRTPSession(sess)
+	d.mu.Lock()
+	d.initRTPSessionUnsafe(sess, rtpSess)
+	d.mu.Unlock()
 	return rtpSess.MonitorBackground()
 }
 
@@ -353,11 +421,7 @@ func (d *DialogServerSession) Answer() error {
 
 	// Media Exists as early
 	if d.mediaSession != nil {
-		// This will now block until ACK received with 64*T1 as max.
-		if err := d.RespondSDP(d.mediaSession.LocalSDP()); err != nil {
-			return err
-		}
-		return nil
+		return d.answerEarlyMedia()
 	}
 
 	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
@@ -405,10 +469,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 	// If media exists as early, only respond 200
 	if d.mediaSession != nil {
 		// Check do codecs match
-		if err := d.RespondSDP(d.mediaSession.LocalSDP()); err != nil {
-			return err
-		}
-		return nil
+		return d.answerEarlyMedia()
 	}
 
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
@@ -428,10 +489,54 @@ func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) 
 	conf.rtpNAT = rtpNAT
 }
 
+// answerEarlyMedia answers a call whose media session exists already: set up
+// by ProgressMedia, or installed by the application. It only sends the 200,
+// unless ProgressMedia left the DTLS handshake of the early media running.
+func (d *DialogServerSession) answerEarlyMedia() error {
+	d.mu.Lock()
+	sess := d.mediaSession
+	earlyAnswer := d.earlyAnswerSDP
+	d.mu.Unlock()
+
+	if earlyAnswer == nil {
+		// This will now block until ACK received with 64*T1 as max.
+		return d.RespondSDP(sess.LocalSDP())
+	}
+	return d.answerUnkeyedEarlyMedia(sess, earlyAnswer)
+}
+
+// answerUnkeyedEarlyMedia answers a call whose caller did not key the early
+// media, which ProgressMedia reported with ErrEarlyMediaNotKeyed. The 200
+// repeats the answer in the 183, and once its ACK is read, the handshake
+// ProgressMedia left running is waited for, now bounded by the call and by
+// media.DTLSHandshakeTimeout: a caller that ignored the 183 takes part in it
+// only after the 200. The media is set up once the handshake has keyed it. An
+// in-dialog request waits for all of it, as it does for answerSession.
+func (d *DialogServerSession) answerUnkeyedEarlyMedia(sess *media.MediaSession, earlyAnswer []byte) error {
+	d.mu.Lock()
+	answering := make(chan struct{})
+	d.answering = answering
+	d.mu.Unlock()
+	defer close(answering)
+
+	if err := d.respondSDP(earlyAnswer); err != nil {
+		return err
+	}
+	if err := sess.FinalizeContext(d.Context()); err != nil {
+		return err
+	}
+
+	rtpSess := media.NewRTPSession(sess)
+	d.mu.Lock()
+	d.initRTPSessionUnsafe(sess, rtpSess)
+	d.mu.Unlock()
+	// Must be called after media and reader writer is setup
+	return rtpSess.MonitorBackground()
+}
+
 // answerSession. It allows answering with custom RTP Session.
 // NOTE: Not final API
 func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
-	// TODO: Use setupRTPSession
 	sess := rtpSess.Sess
 	sdp := d.InviteRequest.Body()
 	if sdp == nil {
@@ -467,27 +572,6 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 
 	// Must be called after media and reader writer is setup
 	return rtpSess.MonitorBackground()
-}
-
-func (d *DialogServerSession) setupRTPSession(rtpSess *media.RTPSession) error {
-	sess := rtpSess.Sess
-	sdp := d.InviteRequest.Body()
-	if sdp == nil {
-		return fmt.Errorf("no sdp present in INVITE")
-	}
-
-	if err := sess.RemoteSDP(sdp); err != nil {
-		return err
-	}
-
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	// Close RTP session
-	// d.onCloseUnsafe(func() error {
-	// 	return rtpSess.Close()
-	// })
-	d.mu.Unlock()
-	return nil
 }
 
 // AnswerLate does answer with Late offer.

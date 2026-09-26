@@ -23,7 +23,8 @@ var (
 	ICEGatherTimeout = 5 * time.Second
 
 	// ICEConnectTimeout caps how long connectivity checks may run before the
-	// session gives up on nominating a candidate pair.
+	// session gives up on nominating a candidate pair. Checks FinalizeWithin
+	// left running are capped from the moment FinalizeContext waits for them.
 	ICEConnectTimeout = 30 * time.Second
 )
 
