@@ -636,12 +636,14 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // but for the answer the embedded session leaves to its caller when it refuses
 // a BYE, described below.
 //
-// A BYE that arrives before our answer is complete is read once it is. The ACK
-// the peer sent ahead of it is then not read on a dialog that has already
-// ended, which sipgo would take as confirming it, and an answer that sets up
-// its media after the ACK is not ended under it. A BYE that arrives while a
-// re-INVITE is being handled is read once that re-INVITE is answered, so the
-// peer never gets a 200 to the re-INVITE after the one to its BYE.
+// A BYE that arrives before our answer is complete is read once it is. The
+// wait is for the media: an answer that sets up its media after the ACK,
+// finalizing the session and starting its RTP monitor, would otherwise have
+// that media closed under it by the BYE's handler. It also has the answer see
+// the ACK the peer sent ahead of the BYE, rather than the dialog ending before
+// any ACK, which the answer would report as a missing ACK. A BYE that arrives
+// while a re-INVITE is being handled is read once that re-INVITE is answered,
+// so the peer never gets a 200 to the re-INVITE after the one to its BYE.
 //
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
