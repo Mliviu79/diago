@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,10 +227,15 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		},
 	))
 
-	bridge := NewBridgeMix()
+	// Subtests replace the bridge while the server keeps running. The handler
+	// runs on a server goroutine, so it loads the bridge through an atomic
+	// pointer that a subtest stores only once the bridge is fully configured.
+	var currentBridge atomic.Pointer[BridgeMix]
+	currentBridge.Store(NewBridgeMix())
 	dialogExit := make(chan string, 10)
 	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
 		defer func() { dialogExit <- in.ID }()
+		bridge := currentBridge.Load()
 
 		in.Trying()
 		in.Ringing()
@@ -276,6 +282,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		for range len(dialogs) {
 			<-dialogExit
 		}
+		bridge := currentBridge.Load()
 		assert.Equal(t, 0, len(bridge.dialogs))
 		assert.EqualValues(t, 0, bridge.stateRead())
 	})
@@ -303,8 +310,9 @@ func TestIntegrationBridgingMix(t *testing.T) {
 
 		// Make number of calls that will have audio mixed in bridge
 		// wg := sync.WaitGroup{}
-		bridge = NewBridgeMix()
+		bridge := NewBridgeMix()
 		bridge.WaitDialogsNum = 2 // Do not start mixing until all 3 get joined, otherwise there will be no gurantee when something is mixed
+		currentBridge.Store(bridge)
 
 		dialog1, err := dg.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 5090}, InviteOptions{})
 		require.NoError(t, err)
