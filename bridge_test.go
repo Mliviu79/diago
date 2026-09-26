@@ -1821,6 +1821,95 @@ func TestBridgeMixRefusesDuplicateDialog(t *testing.T) {
 	assert.Equal(t, []DialogSession{c}, b.DialogSessionsList())
 }
 
+// reInviteAlaw has the dialog's peer move it to PCMA with a re-INVITE, which
+// the dialog handles as it handles one.
+func (d *bridgeTestDialog) reInviteAlaw(t *testing.T, peer *net.UDPConn) {
+	t.Helper()
+	offer := sdp.GenerateForAudio(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1),
+		peer.LocalAddr().(*net.UDPAddr).Port, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ALAW})
+	tx := &fakeServerTransaction{}
+	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
+	require.NoError(t, d.media.handleMediaUpdate(context.Background(), newReInvite(t, offer), tx, contact))
+	require.Equal(t, sip.StatusOK, tx.res.StatusCode)
+	p := MediaProps{}
+	d.media.audioWriterProps(&p)
+	require.Equal(t, media.CodecAudioAlaw, p.Codec)
+}
+
+// TestBridgeProxyEndsOnCodecChange checks that a Bridge stops proxying once a
+// re-INVITE moves one of its dialogs from PCMU to PCMA, and that the proxy
+// ends with an error saying the bridge does not transcode. The proxy passes
+// payload on as it is, so it would otherwise hand each side audio in the
+// other's codec. The dialog left in PCMU is then its own again.
+func TestBridgeProxyEndsOnCodecChange(t *testing.T) {
+	t.Run("ProxyMedia", func(t *testing.T) {
+		b := NewBridge()
+		b.WaitDialogsNum = 3 // The proxy is started by hand
+		moved, movedPeer := newAnsweredBridgeTestDialog(t, "moved")
+		other := newBridgeTestDialog(t, "other", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(moved))
+		require.NoError(t, b.AddDialogSession(other))
+		proxied := make(chan error, 1)
+		go func() { proxied <- b.ProxyMedia() }()
+		frame := bytes.Repeat([]byte{0x20}, 160)
+		moved.sendRTPFrom(t, movedPeer, media.CodecAudioUlaw.PayloadType, 1, 0, frame)
+		require.Equal(t, frame, other.recvRTP(t), "the proxy does not run")
+
+		moved.reInviteAlaw(t, movedPeer)
+		select {
+		case err := <-proxied:
+			require.ErrorIs(t, err, errBridgeNoTranscoding)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the proxy went on between PCMA and PCMU")
+		}
+		next := bytes.Repeat([]byte{0x21}, 160)
+		other.sendRTP(t, 2, 160, next)
+		other.readFrame(t, next)
+	})
+
+	t.Run("AddDialogSession", func(t *testing.T) {
+		errorLog := &bridgeErrorLog{}
+		b := Bridge{}
+		b.Init(slog.New(errorLog))
+		moved, movedPeer := newAnsweredBridgeTestDialog(t, "moved")
+		other := newBridgeTestDialog(t, "other", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(moved))
+		require.NoError(t, b.AddDialogSession(other))
+		frame := bytes.Repeat([]byte{0x20}, 160)
+		moved.sendRTPFrom(t, movedPeer, media.CodecAudioUlaw.PayloadType, 1, 0, frame)
+		require.Equal(t, frame, other.recvRTP(t), "the proxy does not run")
+
+		moved.reInviteAlaw(t, movedPeer)
+		require.Eventually(t, func() bool { return other.conn.reading.Load() == 0 }, 2*time.Second, time.Millisecond,
+			"the proxy went on between PCMA and PCMU")
+		require.ErrorIs(t, stopProxyMedia(t, &b), errBridgeNoTranscoding)
+		assert.Equal(t, []string{"Proxy media stopped"}, errorLog.logged())
+		next := bytes.Repeat([]byte{0x21}, 160)
+		other.sendRTP(t, 2, 160, next)
+		other.readFrame(t, next)
+	})
+
+	// A re-INVITE between the join and the start of the proxy is not missed
+	t.Run("BeforeProxyStarts", func(t *testing.T) {
+		b := NewBridge()
+		b.WaitDialogsNum = 3 // The proxy is started by hand
+		moved := newBridgeTestDialog(t, "moved", media.CodecAudioUlaw)
+		other := newBridgeTestDialog(t, "other", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(moved))
+		require.NoError(t, b.AddDialogSession(other))
+		moved.renegotiate(media.CodecAudioAlaw)
+
+		proxied := make(chan error, 1)
+		go func() { proxied <- b.ProxyMedia() }()
+		select {
+		case err := <-proxied:
+			require.ErrorIs(t, err, errBridgeNoTranscoding)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the proxy ran between PCMA and PCMU")
+		}
+	})
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())

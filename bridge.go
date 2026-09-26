@@ -49,6 +49,19 @@ type Bridge struct {
 	WaitDialogsNum int
 }
 
+// errBridgeNoTranscoding is the error of two dialogs a Bridge can not proxy to
+// each other because their codecs differ: it passes payload on as it is.
+var errBridgeNoTranscoding = errors.New("no transcoding supported in bridge")
+
+// bridgeCodecErr returns why a Bridge can not proxy the audio of a dialog in
+// codec c1 to one in codec c2, and back, or nil when it can.
+func bridgeCodecErr(c1, c2 media.Codec) error {
+	if c1 != c2 {
+		return fmt.Errorf("%w codec1=%+v codec2=%+v", errBridgeNoTranscoding, c1, c2)
+	}
+	return nil
+}
+
 var bridgeReadPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, media.RTPBufSize)
@@ -108,13 +121,7 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 		mprops := MediaProps{}
 		_ = m.audioWriterProps(&mprops)
 
-		err := func() error {
-			if origProps.Codec != mprops.Codec {
-				return fmt.Errorf("no transcoding supported in bridge codec1=%+v codec2=%+v", origProps.Codec, mprops.Codec)
-			}
-			return nil
-		}()
-		if err != nil {
+		if err := bridgeCodecErr(origProps.Codec, mprops.Codec); err != nil {
 			return err
 		}
 	}
@@ -154,7 +161,8 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 		proxy.err = b.proxyMedia(dialogs, proxy.stopping)
 		// A hangup closes a dialog's media, which ends the proxy's read of it
 		// and fails a write to it
-		if proxy.err == nil || errors.Is(proxy.err, io.EOF) || errors.Is(proxy.err, net.ErrClosed) {
+		ended := proxy.err == nil || errors.Is(proxy.err, io.EOF) || errors.Is(proxy.err, net.ErrClosed)
+		if ended && !errors.Is(proxy.err, errBridgeNoTranscoding) {
 			b.log.Debug("Proxy media stopped", "error", proxy.err)
 			return
 		}
@@ -204,7 +212,8 @@ func (p *bridgeProxy) stop() error {
 
 // ProxyMedia is explicit starting proxy media.
 // In some cases you want to control and be signaled when bridge terminates
-// It returns once either dialog, or its media, has ended.
+// It returns once either dialog, or its media, has ended, and with an error
+// once a re-INVITE moves either dialog to a codec the other does not have.
 //
 // NOTE: Should be only called if you want to start manually proxying.
 // It is required to set WaitDialogsNum higher than 2
@@ -263,6 +272,30 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession, stopping <-chan struct{}) e
 	m1 := dialogs[0].Media()
 	m2 := dialogs[1].Media()
 
+	// Payload is passed on as it is, so the proxy ends once a re-INVITE moves
+	// either dialog to a codec the other does not have. The codecs are checked
+	// once more after the hooks are in place, for a re-INVITE since the join.
+	mismatch := make(chan error, 1)
+	checkCodecs := func() {
+		p1, p2 := MediaProps{}, MediaProps{}
+		m1.audioWriterProps(&p1)
+		m2.audioWriterProps(&p2)
+		if err := bridgeCodecErr(p1.Codec, p2.Codec); err != nil {
+			select {
+			case mismatch <- err:
+			default:
+			}
+		}
+	}
+	defer m1.addMediaUpdateHook(checkCodecs)()
+	defer m2.addMediaUpdateHook(checkCodecs)()
+	checkCodecs()
+	select {
+	case err := <-mismatch:
+		return err
+	default:
+	}
+
 	// Lets for now simplify proxy and later optimize
 
 	errCh := make(chan error, 2)
@@ -274,7 +307,7 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession, stopping <-chan struct{}) e
 		go func() {
 			errCh <- b.proxyMediaWithDTMF(m2, m1)
 		}()
-		return proxyWait(dialogs, errCh, stopping)
+		return proxyWait(dialogs, errCh, stopping, mismatch)
 	}
 	func() {
 		p1, p2 := MediaProps{}, MediaProps{}
@@ -296,20 +329,22 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession, stopping <-chan struct{}) e
 		go proxyMediaBackground(log, r, w, errCh)
 	}()
 
-	return proxyWait(dialogs, errCh, stopping)
+	return proxyWait(dialogs, errCh, stopping, mismatch)
 }
 
 // proxyWait waits for the two directions of a proxy between dialogs, which
-// send their results to errCh, until either direction ends, either dialog ends
-// or stopping is closed. A direction still reading a dialog would take the
-// next frame from whoever reads that dialog next, so proxyWait then ends both.
-// It returns once both have ended and the dialogs can be read again.
-func proxyWait(dialogs []DialogSession, errCh chan error, stopping <-chan struct{}) error {
+// send their results to errCh, until either direction ends, either dialog
+// ends, stopping is closed or mismatch reports that the dialogs' codecs differ.
+// A direction still reading a dialog would take the next frame from whoever
+// reads that dialog next, so proxyWait then ends both. It returns once both
+// have ended and the dialogs can be read again.
+func proxyWait(dialogs []DialogSession, errCh chan error, stopping <-chan struct{}, mismatch <-chan error) error {
 	var err error
 	running := 2
 	select {
 	case err = <-errCh:
 		running--
+	case err = <-mismatch:
 	case <-dialogs[0].Context().Done():
 	case <-dialogs[1].Context().Done():
 	case <-stopping:
