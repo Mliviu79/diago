@@ -50,6 +50,11 @@ type DialogServerSession struct {
 	// up its media after the ACK, after that too. awaitAnswer waits on it.
 	// Guarded by d.mu.
 	answering chan struct{}
+	// ackAnswerErr is why the answer an ACK carried to the offer in our 2xx
+	// could not be applied or keyed. ReadAck sets it before the ACK confirms
+	// the dialog, for the answer waiting on that ACK to report. Guarded by
+	// d.mu.
+	ackAnswerErr error
 
 	// terminatingBye holds the BYE request that ended this dialog, captured by
 	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
@@ -317,6 +322,15 @@ func (d *DialogServerSession) respondSDP(body []byte) error {
 		return err
 	}
 
+	// The ACK carried the answer to an offer in our 2xx, and it failed. ReadAck
+	// left ending the call to this answer, which reports why.
+	d.mu.Lock()
+	ackErr := d.ackAnswerErr
+	d.mu.Unlock()
+	if ackErr != nil {
+		return errors.Join(ackErr, d.hangupNoMedia())
+	}
+
 	// The 200 OK established the session, so start the refresh loop or arm the
 	// peer-refresh watchdog now, exactly once and on the dialog context so
 	// teardown cancels it.
@@ -504,8 +518,19 @@ func (d *DialogServerSession) AnswerLate() error {
 	return rtpSess.MonitorBackground()
 }
 
+// ReadAck reads the ACK to our 2xx. When the 2xx carried an offer, the ACK
+// carries the answer (RFC 3261 section 13.2.1), which is applied to the media
+// session and finalizes it, running the DTLS handshake of a DTLS-SRTP session.
+//
+// An ACK cannot be refused, so an answer that cannot be applied, or a handshake
+// that fails, ends the call with a BYE once the ACK has confirmed the dialog:
+// RFC 3261 section 13.2.2.4 has a UAC do the same with an offer it cannot
+// accept, and RFC 5763 section 5 has the media session torn down on a
+// fingerprint mismatch. An answer waiting for this ACK sends the BYE and
+// reports the error itself.
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	// Check do we have some session
+	answerWaiting := false
 	err := func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -519,21 +544,37 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		}
 		body := req.Body()
 		if body != nil && contentType.Value() == "application/sdp" {
+			if d.answering != nil {
+				select {
+				case <-d.answering:
+				default:
+					answerWaiting = true
+				}
+			}
+
 			// This is Late offer response
+			sess.RemoteSDPIsAnswer = true
 			if err := sess.RemoteSDP(body); err != nil {
+				d.ackAnswerErr = err
 				return err
 			}
 
 			// Finalize session
 			if err := sess.Finalize(); err != nil {
-				return nil
+				d.ackAnswerErr = err
+				return err
 			}
 		}
 		return nil
 	}()
 	if err != nil {
-		e := d.Hangup(d.Context())
-		return errors.Join(err, e)
+		if ackErr := d.DialogServerSession.ReadAck(req, tx); ackErr != nil {
+			return errors.Join(err, ackErr)
+		}
+		if answerWaiting {
+			return err
+		}
+		return errors.Join(err, d.hangupNoMedia())
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
@@ -917,11 +958,11 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	return nil
 }
 
-// hangupNoMedia ends a call that a failed media update left without media.
-// The offer/answer exchange was complete by then, so the peer has moved to the
-// new session. When that was a new DTLS association whose handshake failed,
-// RFC 5763 section 5 has the media session torn down at once, and with a single
-// audio stream that is the call.
+// hangupNoMedia ends a call left without usable media by an answer that could
+// not be applied or by a failed DTLS handshake. The offer/answer exchange was
+// complete by then, so the peer has moved to the new session. RFC 5763 section
+// 5 has the media session torn down at once on a fingerprint mismatch, and with
+// a single audio stream that is the call.
 func (d *DialogServerSession) hangupNoMedia() error {
 	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
 	defer cancel()
