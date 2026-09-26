@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,12 @@ type Diago struct {
 	client     *sipgo.Client
 	server     *sipgo.Server
 	transports []Transport
+
+	// transportsMu guards the elements of transports. The ready callback of a
+	// listener bound to an ephemeral port records the port there while request
+	// paths read them, so they are read through getTransport and findTransport,
+	// which hand out copies.
+	transportsMu sync.RWMutex
 
 	serveHandler ServeDialogFunc
 
@@ -645,8 +652,12 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 	server := dg.server
 	dg.HandleFunc(f)
 
-	errCh := make(chan error, len(dg.transports))
-	for i, tran := range dg.transports {
+	dg.transportsMu.RLock()
+	transports := slices.Clone(dg.transports)
+	dg.transportsMu.RUnlock()
+
+	errCh := make(chan error, len(transports))
+	for i, tran := range transports {
 		hostport := net.JoinHostPort(tran.BindHost, strconv.Itoa(tran.BindPort))
 
 		go func(i int, tran Transport) {
@@ -663,7 +674,9 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 					if tran.ExternalPort == 0 {
 						tran.ExternalPort = port
 					}
+					dg.transportsMu.Lock()
 					dg.transports[i] = tran
+					dg.transportsMu.Unlock()
 				}
 				// This callback is itself the proof that the listener holds
 				// tran.BindPort. Not every sipgo release has recorded the port in
@@ -904,8 +917,11 @@ func (dg *Diago) getClient(tran *Transport) *sipgo.Client {
 }
 
 func (dg *Diago) getTransport(transport string) (*Transport, bool) {
+	dg.transportsMu.RLock()
+	defer dg.transportsMu.RUnlock()
 	if transport == "" {
-		return &dg.transports[0], true
+		t := dg.transports[0]
+		return &t, true
 	}
 	for _, t := range dg.transports {
 		if sip.NetworkToLower(transport) == t.Transport {
@@ -917,6 +933,8 @@ func (dg *Diago) getTransport(transport string) (*Transport, bool) {
 
 func (dg *Diago) findTransport(transport string, id string) (*Transport, bool) {
 	if id != "" {
+		dg.transportsMu.RLock()
+		defer dg.transportsMu.RUnlock()
 		for _, t := range dg.transports {
 			if id == t.ID {
 				return &t, true

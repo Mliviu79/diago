@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 )
 
 // These tests pin ServeWithReady: it blocks like Serve, and it reports once,
@@ -171,5 +172,120 @@ func TestServeWithReadyReturnsListenErrorWithoutReady(t *testing.T) {
 
 	if n := readyCalls.Load(); n != 0 {
 		t.Fatalf("ready called %d times although the listener never came up", n)
+	}
+}
+
+// TestServeEphemeralPortWhileRequestsReadTransports pins that a listener bound
+// to an ephemeral port records the port on its transport without racing the
+// request paths that read the transports, such as an outbound call made while
+// Serve starts. The race only shows under -race. Once ready has run, a new
+// dialog's Contact carries the port the listener bound.
+func TestServeEphemeralPortWhileRequestsReadTransports(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ua := newTestUA(t)
+	dg := NewDiago(ua, WithTransport(Transport{Transport: "udp", BindHost: "127.0.0.1", BindPort: 0}))
+	// Nobody listens on the discard port; the dialogs are never invited.
+	unreachable := sip.Uri{User: "nobody", Host: "127.0.0.1", Port: 9}
+
+	const readerCount = 4
+	iterations := make([]atomic.Int64, readerCount)
+	stop := make(chan struct{})
+	readerErrs := make(chan error, readerCount)
+	for readerIndex := range readerCount {
+		go func() {
+			readerErrs <- func() error {
+				for {
+					select {
+					case <-stop:
+						return nil
+					default:
+					}
+					d, err := dg.NewDialog(unreachable, NewDialogOptions{})
+					if err != nil {
+						return err
+					}
+					_ = d.Close()
+					iterations[readerIndex].Add(1)
+				}
+			}()
+		}()
+	}
+	// stopReaders stops the readers and waits for them with a bound.
+	stopReaders := func() {
+		close(stop)
+		for range readerCount {
+			select {
+			case err := <-readerErrs:
+				if err != nil {
+					t.Errorf("NewDialog while serving started: %v", err)
+				}
+			case <-time.After(serveReadyBound):
+				t.Fatalf("the readers did not stop within %v", serveReadyBound)
+			}
+		}
+	}
+	// waitForIterations blocks until every reader has read past its floor.
+	waitForIterations := func(floors []int64) bool {
+		deadline := time.Now().Add(serveReadyBound)
+		for readerIndex := range readerCount {
+			for iterations[readerIndex].Load() <= floors[readerIndex] {
+				if time.Now().After(deadline) {
+					return false
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+		return true
+	}
+
+	if !waitForIterations(make([]int64, readerCount)) {
+		stopReaders()
+		t.Fatalf("the readers did not start within %v", serveReadyBound)
+	}
+
+	ready := make(chan struct{})
+	served := make(chan error, 1)
+	go func() {
+		served <- dg.ServeWithReady(ctx, nil, func() { close(ready) })
+	}()
+	select {
+	case <-ready:
+	case err := <-served:
+		stopReaders()
+		t.Fatalf("ServeWithReady returned (%v) and ready not called", err)
+	case <-time.After(serveReadyBound):
+		stopReaders()
+		t.Fatalf("ready not called within %v of serving", serveReadyBound)
+	}
+	readyFloors := make([]int64, readerCount)
+	for readerIndex := range readerCount {
+		readyFloors[readerIndex] = iterations[readerIndex].Load()
+	}
+	readersAdvanced := waitForIterations(readyFloors)
+	stopReaders()
+	if !readersAdvanced {
+		t.Fatalf("the readers did not advance after ready within %v", serveReadyBound)
+	}
+
+	ports := ua.TransportLayer().ListenPorts("udp")
+	if len(ports) != 1 {
+		t.Fatalf("listening on udp ports %v, want one", ports)
+	}
+	d, err := dg.NewDialog(unreachable, NewDialogOptions{})
+	if err != nil {
+		t.Fatalf("NewDialog once serving: %v", err)
+	}
+	defer d.Close()
+	if port := d.UA.ContactHDR.Address.Port; port != ports[0] {
+		t.Fatalf("a new dialog's Contact port = %d, want the listener's %d", port, ports[0])
+	}
+
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(serveReadyBound):
+		t.Fatalf("ServeWithReady did not return within %v of its context ending", serveReadyBound)
 	}
 }
