@@ -45,6 +45,10 @@ type DialogServerSession struct {
 	// watchdog is the armed peer-refresh watchdog, set when the peer is the
 	// refresher and reset on an inbound refresh re-INVITE. Guarded by d.mu.
 	watchdog *peerRefreshWatchdog
+	// answering is set by an answer that sets up its media after the ACK,
+	// before it sends its 2xx, and closed when that answer returns.
+	// awaitAnswer waits on it. Guarded by d.mu.
+	answering chan struct{}
 
 	// terminatingBye holds the BYE request that ended this dialog, captured by
 	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
@@ -404,7 +408,10 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 	// d.onCloseUnsafe(func() error {
 	// 	return rtpSess.Close()
 	// })
+	answering := make(chan struct{})
+	d.answering = answering
 	d.mu.Unlock()
+	defer close(answering)
 
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
@@ -457,7 +464,10 @@ func (d *DialogServerSession) AnswerLate() error {
 	// d.onCloseUnsafe(func() error {
 	// 	return rtpSess.Close()
 	// })
+	answering := make(chan struct{})
+	d.answering = answering
 	d.mu.Unlock()
+	defer close(answering)
 
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
@@ -503,11 +513,62 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 	return d.DialogServerSession.ReadAck(req, tx)
 }
 
+// awaitAnswer waits until our answer is complete before an in-dialog request is
+// handled, and reports whether it is. Complete means the ACK to our 2xx is read
+// and, for an answer that sets up its media after the ACK, that the answer has
+// returned. A peer sends its ACK before any request that follows it, but sipgo
+// hands each request to its handler on its own goroutine, so a later request
+// can be handled before the ACK, or before the answer has finalized and started
+// the media that a re-INVITE would replace. Waiting restores the order the
+// peer sent them in. The wait ends with tx, or after two T1 intervals, which
+// covers an ACK lost in transit and resent when our 2xx is first retransmitted.
+func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
+	timer := time.NewTimer(2 * sip.T1)
+	defer timer.Stop()
+
+	if d.LoadState() == sip.DialogStateEstablished {
+		// The state is loaded again after the read is registered, so an ACK
+		// read in between is not missed.
+		stateCh := d.StateRead()
+		for state := d.LoadState(); state == sip.DialogStateEstablished; {
+			select {
+			case state = <-stateCh:
+			case <-tx.Done():
+				return false
+			case <-timer.C:
+				return false
+			}
+		}
+	}
+
+	// Loaded only now: an answer sets it before its 2xx, so once the 2xx is
+	// acknowledged it is in place.
+	d.mu.Lock()
+	answering := d.answering
+	d.mu.Unlock()
+	if answering == nil {
+		return true
+	}
+	select {
+	case <-answering:
+		return true
+	case <-tx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
 // ReadBye stashes the terminating BYE and then hands it to the embedded session,
 // which owns every part of BYE handling: validation, the 200, and the move to
 // DialogStateEnded. Nothing about that changes here — the request is recorded,
 // never acted upon differently — so BYE semantics are identical for every
 // caller.
+//
+// A BYE that arrives before our answer is complete is read once it is. The ACK
+// the peer sent ahead of it is then not read on a dialog that has already
+// ended, which sipgo would take as confirming it, and an answer that sets up
+// its media after the ACK is not ended under it.
 //
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
@@ -517,6 +578,7 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 // one no observer can be looking at: only a BYE the delegate accepts ends the
 // dialog, and until the dialog ends nothing has cause to read the stash.
 func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	d.awaitAnswer(tx)
 	d.terminatingBye.Store(req)
 	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
 		// Not this dialog's ending: leave no cause planted on it.
@@ -761,10 +823,14 @@ func (d *DialogServerSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 }
 
 func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
-	// Check is current pending dialog
-	if state := d.LoadState(); state == sip.DialogStateEstablished {
-		// RFC 3261 §14.2 — UAS Behavior
-		// If a UAS receives an INVITE request for an existing dialog while another INVITE transaction is in progress, it MUST return a 491 (Request Pending) response to the new INVITE.”
+	// A re-INVITE that arrives after our 2xx but before its ACK is handled once
+	// the answer is complete, as RFC 5407 section 3.1.4 recommends. It cannot be
+	// read ahead of the ACK: ReadRequest below moves the remote CSeq past the
+	// ACK's, and the ACK would then never confirm the dialog. Nor can its media
+	// update run before the answer's media is finalized and started. When the
+	// answer does not complete in time, RFC 5407 permits 491, which asks the
+	// peer to retry.
+	if !d.awaitAnswer(tx) {
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 

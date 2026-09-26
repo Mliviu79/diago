@@ -42,6 +42,13 @@ func (tx *byeServerTx) Err() error            { return nil }
 // the BYE path can be driven without a transport.
 func newByeTestDialog(t *testing.T) (*DialogServerSession, *byeServerTx) {
 	t.Helper()
+	inviteTx := newByeServerTx()
+	return newTestDialogOver(t, inviteTx), inviteTx
+}
+
+// newTestDialogOver builds the dialog newByeTestDialog does over inviteTx.
+func newTestDialogOver(t *testing.T, inviteTx sip.ServerTransaction) *DialogServerSession {
+	t.Helper()
 
 	recipient := sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}
 	caller := sip.Uri{User: "bob", Host: "127.0.0.2", Port: 5060}
@@ -55,12 +62,11 @@ func newByeTestDialog(t *testing.T) (*DialogServerSession, *byeServerTx) {
 	invite.AppendHeader(sip.NewHeader("Call-ID", "bye-stash-test-call-id"))
 	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 100, MethodName: sip.INVITE})
 
-	inviteTx := newByeServerTx()
 	ua := &sipgo.DialogUA{}
 	sess, err := ua.ReadInvite(invite, inviteTx)
 	require.NoError(t, err)
 
-	return &DialogServerSession{DialogServerSession: sess}, inviteTx
+	return &DialogServerSession{DialogServerSession: sess}
 }
 
 // confirm drives the dialog to a confirmed state, where a BYE is meaningful.
