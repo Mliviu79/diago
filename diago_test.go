@@ -972,8 +972,14 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 				BindHost:  "127.0.0.1",
 				BindPort:  16441,
 				MediaSRTP: 2, // USE DTLS
-				// We do not need any Certificate verification
-				MediaDTLSConf: media.DTLSConfig{},
+				// RFC 5763 section 5: the offerer advertises actpass and must be
+				// ready to act as the DTLS server, which needs a certificate. The
+				// a=fingerprint binds the certificate to the signalling, so the
+				// server has to ask for the peer certificate to verify it.
+				MediaDTLSConf: media.DTLSConfig{
+					Certificates:     []tls.Certificate{testdata.ClientCertificate()},
+					ServerClientAuth: media.ServerClientAuthRequireCert,
+				},
 			},
 		),
 		WithMediaConfig(
