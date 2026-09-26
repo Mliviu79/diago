@@ -280,6 +280,8 @@ type BridgeMix struct {
 
 	mixWG    sync.WaitGroup
 	mixState int
+	// mixStopped is closed when the stop that set mixState to 2 has finished
+	mixStopped chan struct{}
 
 	// WaitDialogsNum is just helper flag when to start proxy
 	WaitDialogsNum int
@@ -418,6 +420,15 @@ func (b *BridgeMix) stateRead() int {
 
 func (b *BridgeMix) mixStopWait() error {
 	// DO NOT CALL THIS INSIDE LOOP of b.dialogs. This Unlocks
+	// A stop another caller started is waited for. Until it has finished, the
+	// mix it stops may still be reading the dialogs.
+	for b.mixState == 2 {
+		stopped := b.mixStopped
+		b.mu.Unlock()
+		<-stopped
+		b.mu.Lock()
+	}
+
 	stopInProgress, stopErr := b.mixStop()
 	if stopInProgress {
 		// This caller set the stopping state, so it clears it once the stopped
@@ -426,6 +437,7 @@ func (b *BridgeMix) mixStopWait() error {
 		b.mixWG.Wait()
 		b.mu.Lock()
 		b.stateWriteUnsafe(0)
+		close(b.mixStopped)
 	}
 	// Enable RTP again, on every dialog even when stopping reported an error,
 	// so no dialog is left with its reads stopped.
@@ -443,6 +455,7 @@ func (b *BridgeMix) mixStop() (bool, error) {
 		return false, nil
 	}
 	b.mixState = 2 // Set it stoping in progress
+	b.mixStopped = make(chan struct{})
 	var allErros error
 	for _, d := range b.dialogs {
 		err := d.Media().StopRTP(1, 0) // Stop reading

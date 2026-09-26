@@ -404,6 +404,49 @@ func TestBridgeMixRTPControlErrors(t *testing.T) {
 	})
 }
 
+// TestBridgeMixWaitsForStopInProgress checks that a leave arriving while
+// another caller is stopping the mix waits for that stop to finish. Otherwise
+// it restarts reads on every dialog while the stopped mix is still reading
+// them, and returns before that mix has stopped reading the dialog it removed.
+func TestBridgeMixWaitsForStopInProgress(t *testing.T) {
+	b := NewBridgeMix()
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	// A mix is running. The test stands in for its goroutines, which keep
+	// reading until the test lets them stop.
+	b.mu.Lock()
+	b.dialogs = []DialogSession{a, c}
+	b.mixWG.Add(1)
+	b.stateWriteUnsafe(1)
+	b.mu.Unlock()
+
+	stopped := make(chan error, 1)
+	go func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		stopped <- b.mixStopWait()
+	}()
+	require.Eventually(t, func() bool { return b.stateRead() == 2 }, time.Second, time.Millisecond)
+
+	removed := make(chan error, 1)
+	go func() { removed <- b.RemoveDialogSession(a) }()
+	assert.Never(t, func() bool { return len(removed) > 0 }, 100*time.Millisecond, time.Millisecond,
+		"a leave must not return while the stopped mix is still reading its dialog")
+
+	b.mixWG.Done()
+	for _, done := range []chan error{stopped, removed} {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("stop or leave did not return after the mix stopped")
+		}
+	}
+	assert.Equal(t, []DialogSession{c}, b.DialogSessionsList())
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
