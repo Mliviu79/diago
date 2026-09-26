@@ -40,6 +40,7 @@ type RTPJitterBufferStatistics struct {
 	PacketsDuplicate   uint64
 	PacketsDropped     uint64
 	SSRCResets         uint64
+	Underruns          uint64
 	LastSequenceNumber uint16
 }
 
@@ -51,6 +52,7 @@ type rtpJitterBufferStats struct {
 	packetsDuplicate   atomic.Uint64
 	packetsDropped     atomic.Uint64
 	ssrcResets         atomic.Uint64
+	underruns          atomic.Uint64
 	lastSequenceNumber atomic.Uint32
 }
 
@@ -71,6 +73,16 @@ type rtpJitterInput struct {
 //
 // It sits after RTPSession and before RTPPacketReader, so RTPSession observes
 // true network arrival while downstream readers get reordered packets.
+//
+// Playout releases one packet per packetDuration, and skips a missing packet as
+// lost when later ones are queued. When nothing is queued at all, because the
+// sender paused (hold, silence suppression, DTX) or the network stalled for
+// longer than the playout delay, playout stops, counting an underrun and no
+// packet lost, and buffers again, as at the start of the stream, from the next
+// packet at or after where it stopped. Until it plays again, a packet behind
+// that point is late, except that one MaxPackets or more away in either
+// direction, arriving with nothing queued, starts the stream again, as from a
+// sender that restarted its sequence numbers.
 type RTPJitterBuffer struct {
 	// reader is the upstream network-facing RTP source.
 	reader RTPReader
@@ -120,6 +132,10 @@ type RTPJitterBuffer struct {
 	playout bool
 	// releaseNow reports that the next expected sequence may be processed now.
 	releaseNow bool
+	// resync reports that playout stopped with nothing queued. Until it starts
+	// again, expectedSeq is the first sequence number not yet played, and
+	// packets behind it are late.
+	resync bool
 
 	// inputClosed reports that readLoop has stopped producing packet events.
 	inputClosed bool
@@ -233,10 +249,14 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 				return n, nil
 			}
 
-			j.stats.packetsLost.Add(1)
-			j.expectedSeq++
-			j.releaseNow = false
-			j.resetPlayoutTimer()
+			if j.queued == 0 {
+				j.stopPlayout()
+			} else {
+				j.stats.packetsLost.Add(1)
+				j.expectedSeq++
+				j.releaseNow = false
+				j.resetPlayoutTimer()
+			}
 		}
 
 		if j.inputClosed && j.queued == 0 {
@@ -363,8 +383,16 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 	}
 
 	distance := int16(slot.seq - j.expectedSeq)
+	// Stopped with nothing queued, a packet a whole window or more away from
+	// where playout stopped comes from a sender that restarted its sequence
+	// numbers, so the stream starts again from it as from a new source.
+	if j.resync && j.queued == 0 && (int(distance) >= j.maxPackets || -int(distance) >= j.maxPackets) {
+		j.debugPacketDecision("restart", slot, "outside_window")
+		j.resetStream(slot.ssrc, slot.seq)
+		distance = 0
+	}
 	if distance < 0 {
-		if j.playout {
+		if j.playout || j.resync {
 			j.stats.packetsLate.Add(1)
 			j.debugPacketDecision("late", slot, "behind_playout")
 			j.recycleSlot(slotIndex)
@@ -403,6 +431,10 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 
 	j.sequence[position] = slotIndex
 	j.queued++
+	if j.resync && j.queued == 1 {
+		// The stream resumed, so buffer again as at its start.
+		j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.packetDuration)
+	}
 }
 
 func (j *RTPJitterBuffer) canMoveExpectedBack(seq uint16) bool {
@@ -426,6 +458,7 @@ func (j *RTPJitterBuffer) resetStream(ssrc uint32, seq uint16) {
 	j.expectedSet = true
 	j.playout = false
 	j.releaseNow = false
+	j.resync = false
 	j.stopAndDrainTimer(j.playoutTimer)
 	j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.packetDuration)
 }
@@ -443,8 +476,29 @@ func (j *RTPJitterBuffer) clearSequence() {
 
 func (j *RTPJitterBuffer) startPlayout() {
 	j.stopAndDrainTimer(j.initialTimer)
+	// Starting again after a stop, the first packet queued can be ahead of
+	// expectedSeq. The sequence numbers before it were lost, and playout starts
+	// at that packet instead of spending a tick on each of them.
+	for j.resync && j.queued > 0 && j.sequence[int(j.expectedSeq)%j.maxPackets] < 0 {
+		j.stats.packetsLost.Add(1)
+		j.expectedSeq++
+	}
+	j.resync = false
 	j.playout = true
 	j.releaseNow = true
+}
+
+// stopPlayout stops playout when it finds nothing queued. Counting every tick
+// of a sender's pause as a lost packet would move expectedSeq onto sequence
+// numbers the sender has not used yet, and every packet after the pause would
+// then be late. Playout waits for the stream instead and keeps expectedSeq.
+func (j *RTPJitterBuffer) stopPlayout() {
+	j.stats.underruns.Add(1)
+	j.debugPlayoutStopped()
+	j.playout = false
+	j.releaseNow = false
+	j.resync = true
+	j.stopAndDrainTimer(j.playoutTimer)
 }
 
 func (j *RTPJitterBuffer) resetPlayoutTimer() {
@@ -513,6 +567,7 @@ func (j *RTPJitterBuffer) Statistics() RTPJitterBufferStatistics {
 		PacketsDuplicate:   j.stats.packetsDuplicate.Load(),
 		PacketsDropped:     j.stats.packetsDropped.Load(),
 		SSRCResets:         j.stats.ssrcResets.Load(),
+		Underruns:          j.stats.underruns.Load(),
 		LastSequenceNumber: uint16(j.stats.lastSequenceNumber.Load()),
 	}
 }
@@ -576,6 +631,18 @@ func (j *RTPJitterBuffer) debugPlayoutStarted(reason string) {
 		j.delayPackets,
 		j.maxPackets,
 		reason,
+	)
+}
+
+func (j *RTPJitterBuffer) debugPlayoutStopped() {
+	if !rtpJitterDebug {
+		return
+	}
+
+	jitterDebugf("event=playout_stopped expected_seq=%d delay_packets=%d max_packets=%d reason=nothing_queued",
+		j.expectedSeq,
+		j.delayPackets,
+		j.maxPackets,
 	)
 }
 

@@ -381,6 +381,171 @@ func TestRTPJitterBufferDone(t *testing.T) {
 	})
 }
 
+func TestRTPJitterBufferResumesAfterPause(t *testing.T) {
+	// A sender pauses, on hold or in silence suppression or DTX, and resumes
+	// with its next sequence number, with one further on after packets lost in
+	// the pause, or with its sequence numbers restarted. Every playout tick of
+	// the pause finds nothing to release. Playout must not run ahead of the
+	// resumed stream while it waits, or every packet after the pause is late and
+	// the call stays silent.
+	const (
+		packetDuration = 2 * time.Millisecond
+		delayPackets   = 2
+		maxPackets     = 8
+	)
+	spurt := jitterSeqRange(0, 20)
+	tests := []struct {
+		name string
+		// after holds the packets sent after the spurt, each group after a pause.
+		after [][]uint16
+		// want is what playout releases. Nil means every packet sent.
+		want     []uint16
+		wantLost uint64
+		wantLate uint64
+	}{
+		{
+			name:  "nextSequence",
+			after: [][]uint16{jitterSeqRange(20, 40)},
+		},
+		{
+			name:  "dtx",
+			after: [][]uint16{{20}, {21}, jitterSeqRange(22, 40)},
+		},
+		{
+			name:     "afterLostPackets",
+			after:    [][]uint16{jitterSeqRange(23, 40)},
+			wantLost: 3,
+		},
+		{
+			name:  "restartedAhead",
+			after: [][]uint16{jitterSeqRange(5000, 40)},
+		},
+		{
+			name:  "restartedBehind",
+			after: [][]uint16{jitterSeqRange(60000, 40)},
+		},
+		{
+			// Packets behind the stopped playout within the window are
+			// stragglers of what was already played, not a restart.
+			name:     "restartedWithinWindowBehind",
+			after:    [][]uint16{jitterSeqRange(15, 40)},
+			want:     append(jitterSeqRange(0, 20), jitterSeqRange(20, 35)...),
+			wantLate: 5,
+		},
+		{
+			name:     "stragglerNotReplayed",
+			after:    [][]uint16{append([]uint16{18}, jitterSeqRange(20, 40)...)},
+			want:     jitterSeqRange(0, 60),
+			wantLate: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newChanRTPReader()
+			jb := NewRTPJitterBuffer(reader, packetDuration, RTPJitterBufferOptions{
+				DelayPackets: delayPackets,
+				MaxPackets:   maxPackets,
+			})
+			released := make(chan uint16, 256)
+			consumerDone := make(chan error, 1)
+			go func() {
+				buf := make([]byte, RTPBufSize)
+				var pkt rtp.Packet
+				for {
+					if _, err := jb.ReadRTP(buf, &pkt); err != nil {
+						consumerDone <- err
+						return
+					}
+					released <- pkt.SequenceNumber
+				}
+			}()
+
+			// send runs no further ahead of playout than the delay, so nothing is
+			// dropped for overflowing the window. It returns the underrun count
+			// once the last packet is in the buffer, after which the only
+			// underrun left is the one that follows its release.
+			var sent uint64
+			send := func(seqs []uint16) uint64 {
+				for _, seq := range seqs {
+					sendJitterPacket(t, reader, rtpPacket(1234, seq))
+					sent++
+					require.Eventually(t, func() bool {
+						st := jb.Statistics()
+						return st.PacketsRead == sent && jitterQueued(st) < delayPackets
+					}, 5*time.Second, 100*time.Microsecond, "packet %d was not taken", seq)
+				}
+				return jb.Statistics().Underruns
+			}
+			drained := func() {
+				require.Eventually(t, func() bool {
+					return jitterQueued(jb.Statistics()) == 0
+				}, 5*time.Second, 100*time.Microsecond, "playout stopped with packets queued")
+			}
+
+			underruns := send(spurt)
+			all := append([]uint16(nil), spurt...)
+			for _, group := range tc.after {
+				// The sender stays silent until playout has run out of packets,
+				// so the group reaches a buffer that has stopped, and then for
+				// twenty packets more, the length of a real pause, which playout
+				// must not tick through.
+				require.Eventually(t, func() bool {
+					return jb.Statistics().Underruns > underruns
+				}, 5*time.Second, 100*time.Microsecond, "playout never ran out of packets in the pause")
+				time.Sleep(20 * packetDuration)
+				underruns = send(group)
+				all = append(all, group...)
+			}
+			drained()
+
+			st := jb.Statistics()
+			got := make([]uint16, 0, st.PacketsReleased)
+			for uint64(len(got)) < st.PacketsReleased {
+				select {
+				case seq := <-released:
+					got = append(got, seq)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("released %d of %d packets", len(got), st.PacketsReleased)
+				}
+			}
+
+			require.NoError(t, jb.Close())
+			select {
+			case err := <-consumerDone:
+				require.ErrorIs(t, err, io.ErrClosedPipe)
+			case <-time.After(5 * time.Second):
+				t.Fatal("ReadRTP did not return after Close")
+			}
+			close(reader.packets)
+			requireJitterDone(t, jb)
+
+			want := tc.want
+			if want == nil {
+				want = all
+			}
+			require.Equal(t, want, got, "stats %+v", st)
+			require.Equal(t, tc.wantLost, st.PacketsLost, "lost")
+			require.Equal(t, tc.wantLate, st.PacketsLate, "late")
+			require.Zero(t, st.PacketsDropped, "dropped")
+		})
+	}
+}
+
+// jitterQueued is the number of packets the buffer holds, from its counters.
+func jitterQueued(st RTPJitterBufferStatistics) uint64 {
+	return st.PacketsRead - st.PacketsReleased - st.PacketsLate - st.PacketsDropped - st.PacketsDuplicate
+}
+
+// jitterSeqRange returns n sequence numbers from first, wrapping at 65535.
+func jitterSeqRange(first uint16, n int) []uint16 {
+	seqs := make([]uint16, n)
+	for i := range seqs {
+		seqs[i] = first + uint16(i)
+	}
+	return seqs
+}
+
 func TestRTPJitterBufferEndedUpstreamWaitBlocks(t *testing.T) {
 	// The upstream ends with packets still queued and the next release is an
 	// hour away. ReadRTP has to wait for it blocked. The read loop has closed
