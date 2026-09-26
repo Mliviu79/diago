@@ -4,7 +4,13 @@
 package media
 
 import (
+	"context"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
+	"fmt"
+	"hash"
 	"log/slog"
 	"net"
 	"os"
@@ -310,4 +316,120 @@ func TestDTLSFingerprint(t *testing.T) {
 	fingerprint, err = dtlsSHA256Fingerprint(testdata.ServerCertificate())
 	require.NoError(t, err)
 	t.Log(fingerprint)
+}
+
+// testCertificateFingerprint formats the digest of der the way a=fingerprint
+// carries it, upper case hex separated by colons.
+func testCertificateFingerprint(h hash.Hash, der []byte) string {
+	h.Write(der)
+	sum := h.Sum(nil)
+	octets := make([]string, len(sum))
+	for i, b := range sum {
+		octets[i] = fmt.Sprintf("%02X", b)
+	}
+	return strings.Join(octets, ":")
+}
+
+// TestDTLSVerifyConnectionFingerprint asserts the peer is accepted only when its
+// certificate matches an a=fingerprint from its SDP (RFC 5763 section 5).
+// Certificates here are self signed and nothing else authenticates them, so a
+// certificate matching none of the fingerprints would let anyone on the media
+// path take the DTLS association. Hash names are case insensitive (RFC 8122
+// section 5) and browsers write them in lower case. Lower case hex is accepted
+// too.
+func TestDTLSVerifyConnectionFingerprint(t *testing.T) {
+	peer := testdata.ClientCertificate()
+	leaf := peer.Certificate[0]
+	state := &dtls.State{PeerCertificates: peer.Certificate}
+
+	matching := testCertificateFingerprint(sha256.New(), leaf)
+	other := testCertificateFingerprint(sha256.New(), testdata.ServerCertificate().Certificate[0])
+
+	tests := []struct {
+		name         string
+		fingerprints []sdpFingerprints
+		wantErr      bool
+	}{
+		{name: "matching", fingerprints: []sdpFingerprints{{alg: "SHA-256", fingerprint: matching}}},
+		{name: "browser hash name", fingerprints: []sdpFingerprints{{alg: "sha-256", fingerprint: matching}}},
+		{name: "lower case hex", fingerprints: []sdpFingerprints{{alg: "SHA-256", fingerprint: strings.ToLower(matching)}}},
+		{name: "sha-1", fingerprints: []sdpFingerprints{{alg: "sha-1", fingerprint: testCertificateFingerprint(sha1.New(), leaf)}}},
+		{name: "sha-224", fingerprints: []sdpFingerprints{{alg: "sha-224", fingerprint: testCertificateFingerprint(sha256.New224(), leaf)}}},
+		{name: "sha-384", fingerprints: []sdpFingerprints{{alg: "sha-384", fingerprint: testCertificateFingerprint(sha512.New384(), leaf)}}},
+		{name: "sha-512", fingerprints: []sdpFingerprints{{alg: "sha-512", fingerprint: testCertificateFingerprint(sha512.New(), leaf)}}},
+		{name: "one of several", fingerprints: []sdpFingerprints{{alg: "sha-256", fingerprint: other}, {alg: "sha-256", fingerprint: matching}}},
+		{name: "another certificate", fingerprints: []sdpFingerprints{{alg: "sha-256", fingerprint: other}}, wantErr: true},
+		{name: "malformed", fingerprints: []sdpFingerprints{{alg: "sha-256", fingerprint: "00:11"}}, wantErr: true},
+		{name: "right digest under another hash name", fingerprints: []sdpFingerprints{{alg: "sha-1", fingerprint: matching}}, wantErr: true},
+		{name: "unsupported hash only", fingerprints: []sdpFingerprints{{alg: "md5", fingerprint: matching}}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := dtlsVerifyConnection(state, tc.fingerprints)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+
+	t.Run("no peer certificate", func(t *testing.T) {
+		err := dtlsVerifyConnection(&dtls.State{}, []sdpFingerprints{{alg: "sha-256", fingerprint: matching}})
+		assert.Error(t, err)
+	})
+}
+
+// TestDTLSHandshakeChecksPeerFingerprint asserts a real handshake enforces the
+// SDP fingerprint: it completes against the certificate the SDP names and fails
+// against any other.
+func TestDTLSHandshakeChecksPeerFingerprint(t *testing.T) {
+	serverFP, err := dtlsSHA256Fingerprint(testdata.ServerCertificate())
+	require.NoError(t, err)
+	otherFP, err := dtlsSHA256Fingerprint(testdata.ClientCertificate())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		fingerprint string
+		wantErr     bool
+	}{
+		{name: "named certificate", fingerprint: serverFP},
+		{name: "another certificate", fingerprint: otherFP, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serverSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			require.NoError(t, err)
+			clientSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = serverSock.Close()
+				_ = clientSock.Close()
+			})
+
+			server, err := dtlsServer(serverSock, clientSock.LocalAddr(), []tls.Certificate{testdata.ServerCertificate()})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = server.Close() })
+
+			conf := DTLSConfig{Certificates: []tls.Certificate{testdata.ClientCertificate()}}
+			client, err := dtls.Client(clientSock, serverSock.LocalAddr(), conf.ToLibConf([]sdpFingerprints{{alg: "sha-256", fingerprint: tc.fingerprint}}))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.Close() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			serverErr := make(chan error, 1)
+			go func() { serverErr <- server.HandshakeContext(ctx) }()
+
+			err = client.HandshakeContext(ctx)
+			if tc.wantErr {
+				assert.ErrorContains(t, err, "does not match any SDP fingerprint")
+				assert.Error(t, <-serverErr, "the server must see the handshake fail too")
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, <-serverErr)
+		})
+	}
 }

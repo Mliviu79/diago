@@ -4,11 +4,14 @@
 package media
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"strings"
@@ -206,6 +209,24 @@ func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certific
 	return dtls.Client(conn, raddr, conf.ToLibConf([]sdpFingerprints{}))
 }
 
+// dtlsFingerprintHashes maps the a=fingerprint hash function names of RFC 8122
+// section 5 to their hash, leaving out MD2 and MD5. The names are case
+// insensitive and browsers write them in lower case, so they are looked up in
+// lower case.
+var dtlsFingerprintHashes = map[string]func() hash.Hash{
+	"sha-1":   sha1.New,
+	"sha-224": sha256.New224,
+	"sha-256": sha256.New,
+	"sha-384": sha512.New384,
+	"sha-512": sha512.New,
+}
+
+// dtlsVerifyConnection accepts the peer only when its certificate matches one
+// of the a=fingerprint values from its SDP (RFC 5763 section 5). The
+// certificates are self signed, so that match is the only thing binding the
+// DTLS peer to the signalling, and a certificate matching none of them is
+// rejected. The grammar asks for upper case hex; lower case is accepted as
+// well. A fingerprint whose hash function is not supported is skipped.
 func dtlsVerifyConnection(state *dtls.State, fingerprints []sdpFingerprints) error {
 	if len(state.PeerCertificates) == 0 {
 		return fmt.Errorf("no certificate found in dtls")
@@ -213,35 +234,37 @@ func dtlsVerifyConnection(state *dtls.State, fingerprints []sdpFingerprints) err
 
 	remoteCert := state.PeerCertificates[0]
 	for _, fp := range fingerprints {
-		var remoteFP string
-		if fp.alg == "SHA-256" {
-			var err error
-			remoteFP, err = dtlsSHA256CertificateFingerprint(remoteCert)
-			if err != nil {
-				return err
-			}
-		} else {
+		newHash, ok := dtlsFingerprintHashes[strings.ToLower(fp.alg)]
+		if !ok {
 			DefaultLogger().Debug("Skiping fingerprint due to unsuported alg", "alg", fp.alg)
 			continue
 		}
 
+		remoteFP, err := dtlsCertificateFingerprint(remoteCert, newHash)
+		if err != nil {
+			return err
+		}
+
 		DefaultLogger().Debug("Comparing fingerprint", "alg", fp.alg, "fp", fp.fingerprint, "rfp", remoteFP)
-		if fp.fingerprint == remoteFP {
+		if strings.EqualFold(fp.fingerprint, remoteFP) {
 			return nil
 		}
 	}
 
-	return nil
+	return fmt.Errorf("dtls certificate does not match any SDP fingerprint")
 }
 
 func dtlsSHA256Fingerprint(cert tls.Certificate) (string, error) {
 	if len(cert.Certificate) == 0 {
 		return "", fmt.Errorf("no certificate data found")
 	}
-	return dtlsSHA256CertificateFingerprint(cert.Certificate[0])
+	return dtlsCertificateFingerprint(cert.Certificate[0], sha256.New)
 }
 
-func dtlsSHA256CertificateFingerprint(cert []byte) (string, error) {
+// dtlsCertificateFingerprint returns the fingerprint of a DER certificate under
+// the given hash, formatted as a=fingerprint carries it: upper case hex octets
+// separated by colons.
+func dtlsCertificateFingerprint(cert []byte, newHash func() hash.Hash) (string, error) {
 
 	// Parse the leaf certificate
 	leaf, err := x509.ParseCertificate(cert)
@@ -249,11 +272,12 @@ func dtlsSHA256CertificateFingerprint(cert []byte) (string, error) {
 		return "", fmt.Errorf("failed to parse certificate: %v", err)
 	}
 
-	// Calculate SHA-256 fingerprint
-	hash := sha256.Sum256(leaf.Raw)
+	h := newHash()
+	h.Write(leaf.Raw)
+	sum := h.Sum(nil)
 
 	// Format as colon-separated hex string
-	hexStr := strings.ToUpper(hex.EncodeToString(hash[:]))
+	hexStr := strings.ToUpper(hex.EncodeToString(sum))
 	var fingerprint strings.Builder
 	for i := 0; i < len(hexStr); i += 2 {
 		if i > 0 {
