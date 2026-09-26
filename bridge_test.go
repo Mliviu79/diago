@@ -368,7 +368,7 @@ func TestIntegrationBridging(t *testing.T) {
 	))
 
 	log := asyncLog(t)
-	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
+	err := serveBackground(t, tu, ctx, func(in *DialogServerSession) {
 		in.Trying()
 		in.Ringing()
 		in.Answer()
@@ -423,7 +423,7 @@ func TestIntegrationBridging(t *testing.T) {
 			},
 		))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			ctx := d.Context()
 			if err := d.Answer(); err != nil {
 				echoed <- fmt.Errorf("answer: %w", err)
@@ -1336,7 +1336,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		}
 	}
 	log := asyncLog(t)
-	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
+	err := serveBackground(t, tu, ctx, func(in *DialogServerSession) {
 		var exitErr error
 		defer func() { dialogExit <- exitErr }()
 		bridge := currentBridge.Load()

@@ -1175,7 +1175,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			d.AnswerOptions(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
@@ -1205,7 +1205,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			switch d.ToUser() {
 			case "busy":
 				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
@@ -1236,7 +1236,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			d.AnswerOptions(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					<-stuckRefer
@@ -1258,7 +1258,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			BindPort:  15080,
 		},
 	))
-	require.NoError(t, dg.ServeBackground(ctx, nil))
+	require.NoError(t, serveBackground(t, dg, ctx, nil))
 
 	t.Run("Successful", func(t *testing.T) {
 		d, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15081}, InviteOptions{})
@@ -1473,7 +1473,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 				BindPort:  15090,
 			},
 		))
-		require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			if d.ToUser() == "busy" {
 				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
 				return
@@ -1497,7 +1497,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 					ID:        "udp",
 				},
 			))
-			require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 				d.AnswerOptions(AnswerOptions{OnRefer: transferee.onRefer})
 				<-d.Context().Done()
 			}))
@@ -1513,7 +1513,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 				BindPort:  15092,
 			},
 		))
-		require.NoError(t, referrer.ServeBackground(ctx, nil))
+		require.NoError(t, serveBackground(t, referrer, ctx, nil))
 		t.Cleanup(func() { transferee.awaitHandlers(t) })
 
 		dial := func(t *testing.T) observedReferCall {
@@ -1547,7 +1547,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 					ID:        "udp",
 				},
 			))
-			require.NoError(t, dialer.ServeBackground(ctx, nil))
+			require.NoError(t, serveBackground(t, dialer, ctx, nil))
 		}
 
 		ua, _ := sipgo.NewUA()
@@ -1561,7 +1561,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 			},
 		))
 		received := make(chan *DialogServerSession)
-		require.NoError(t, referrer.ServeBackground(ctx, func(d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, referrer, ctx, func(d *DialogServerSession) {
 			select {
 			case received <- d:
 			case <-ctx.Done():

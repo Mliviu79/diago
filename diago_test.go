@@ -46,6 +46,41 @@ func testDiagoClient(t *testing.T, onRequest func(req *sip.Request) *sip.Respons
 	return NewDiago(ua, opts...)
 }
 
+// serveBackground serves dg as ServeBackground does, on a context that ends
+// with ctx or when the test ends, and has the test wait, bounded, until serving
+// has returned. sipgo closes a listener from a goroutine of its own once the
+// context is done, so a test that returned without waiting could leave its
+// port bound, and the next test binding the same fixed port failed with
+// "address already in use". Serving returns only once its listener is closed.
+// dg serves a single transport, since serving returns with its first
+// listener.
+func serveBackground(t *testing.T, dg *Diago, ctx context.Context, f ServeDialogFunc) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	var serveErr error
+	go func() {
+		defer close(done)
+		serveErr = dg.ServeWithReady(ctx, f, func() { close(ready) })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("serving did not end with the test")
+		}
+	})
+
+	select {
+	case <-ready:
+		return nil
+	case <-done:
+		return serveErr
+	}
+}
+
 // asyncLog returns a function that logs through t from a goroutine that may
 // outlive t, such as a ServeBackground handler or a call it makes. Logging
 // through t panics once t and every test above it have completed, as they have
@@ -151,7 +186,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 		if tc.serve {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {}))
+			require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {}))
 			if tc.expectedContactHost != "" {
 				listenPort := dg.transports[0].BindPort
 				require.NotZero(t, listenPort)
@@ -1119,7 +1154,7 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 
 	dg := NewDiago(ua, WithTransport(tran))
 
-	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	newTran, _ := dg.getTransport("udp")
@@ -1162,7 +1197,7 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 				},
 			))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			d.Trying()
 			err := d.Answer()
 			answered <- err
@@ -1241,7 +1276,7 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 				},
 			))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			d.Trying()
 			err := d.Answer()
 			answered <- err
@@ -1337,7 +1372,7 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 				},
 			))
 
-		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
 			d.Trying()
 			err := d.Answer()
 			answered <- err

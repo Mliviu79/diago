@@ -70,7 +70,7 @@ func newDTLSCall(t *testing.T, calleePort int, callerPort int) dtlsCall {
 	calleeUpdated := make(chan struct{}, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
 		defer close(handlerDone)
 		if err := d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(*DialogMedia) {
 			select {
@@ -90,7 +90,7 @@ func newDTLSCall(t *testing.T, calleePort int, callerPort int) dtlsCall {
 
 	caller := newDTLSDiago(t, callerPort, testdata.ClientCertificate())
 	// It serves only the requests inside its call, such as a re-INVITE.
-	require.NoError(t, caller.ServeBackground(ctx, nil))
+	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	d, err := caller.Invite(ctx, sip.Uri{User: "callee", Host: "127.0.0.1", Port: calleePort}, InviteOptions{})
 	require.NoError(t, err)
 
@@ -235,7 +235,7 @@ func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
 	answerErr := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
 		defer close(handlerDone)
 		if err := d.ProgressMedia(); err != nil {
 			answerErr <- err
@@ -253,7 +253,7 @@ func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
 	}))
 
 	caller := newDTLSDiago(t, 16456, testdata.ClientCertificate())
-	require.NoError(t, caller.ServeBackground(ctx, nil))
+	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	dialog, err := caller.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: 16455}, NewDialogOptions{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -1018,7 +1018,7 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 	answered := make(chan answerResult, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
 		defer close(handlerDone)
 		d.InitMediaSession(sess, nil, nil)
 		start := time.Now()
@@ -1043,7 +1043,7 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 	}))
 
 	caller := newDTLSDiago(t, 16458, testdata.ClientCertificate())
-	require.NoError(t, caller.ServeBackground(ctx, nil))
+	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	type inviteResult struct {
 		d   *DialogClientSession
 		err error
@@ -1122,7 +1122,7 @@ func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
 	answered := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, callee.ServeBackground(ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
 		defer close(handlerDone)
 		d.InitMediaSession(sess, nil, nil)
 		err := d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: 5 * time.Second})
@@ -1147,7 +1147,7 @@ func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
 	}))
 
 	caller := newDTLSDiago(t, 16460, testdata.ClientCertificate())
-	require.NoError(t, caller.ServeBackground(ctx, nil))
+	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	dialog, err := caller.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: 16459}, NewDialogOptions{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
