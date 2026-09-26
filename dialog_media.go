@@ -580,15 +580,28 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	d.RTPPacketReader.UpdateRTPSession(rtpSess)
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
 
+	old := d.mediaSession
 	// Every path forks from the session installed at setup, so exactly one
 	// session ever owns an ICE agent, and it is the one replaced first. It is
 	// kept for Close rather than closed here, because the fork's media still
 	// runs on the pair that agent holds open.
-	if old := d.mediaSession; old != nil && old != msess && old.OwnsICEAgent() && d.iceAgentOwner == nil {
+	if old != nil && old != msess && old.OwnsICEAgent() && d.iceAgentOwner == nil {
 		d.iceAgentOwner = old
 	}
 	d.mediaSession = msess
 	d.rtpSession = rtpSess
+
+	// A fork rebound to a new local address runs on sockets of its own, and the
+	// reader and writer were moved off the replaced session above, so its
+	// sockets carry nothing any more. Closing them releases the ports and fails
+	// a read still blocked on the old RTP socket, which the packet reader then
+	// retries on the new session. Without it that read never returns, because
+	// the peer now sends to the new address.
+	if old != nil && old != d.iceAgentOwner && (!old.Laddr.IP.Equal(msess.Laddr.IP) || old.Laddr.Port != msess.Laddr.Port) {
+		if err := old.Close(); err != nil {
+			return fmt.Errorf("closing replaced media session: %w", err)
+		}
+	}
 	return nil
 }
 

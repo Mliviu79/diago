@@ -469,7 +469,12 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 
 	err = dialog.Hangup(ctx)
 	require.NoError(t, err)
-	remoteAudio := <-audioReceived
+	var remoteAudio []byte
+	select {
+	case remoteAudio = <-audioReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never finished reading the call audio")
+	}
 
 	// 1 packet will not be consumed due to update of RTP packets
 	assert.GreaterOrEqual(t, len(remoteAudio)/160, numPkts-1)
