@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,15 +138,39 @@ func TestOptionsProbe(t *testing.T) {
 	})
 
 	t.Run("TransportErrorIsFailure", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
 		rtx := testRegisterTransaction(t, func(req *sip.Request) *sip.Response {
 			return sip.NewResponseFromRequest(req, 200, "OK", nil)
 		})
+		rtx.client.TxRequester = failingTxRequester{}
 
-		assert.Error(t, rtx.optionsProbe(ctx))
+		assert.ErrorIs(t, rtx.optionsProbe(context.Background()), errProbeTransport)
 	})
+
+	t.Run("CancelledContextSendsNothing", func(t *testing.T) {
+		// A probe for a loop that has been cancelled proves nothing about the
+		// peer, even when an answer would come back at once, and sends
+		// nothing.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		var sent atomic.Int32
+		rtx := testRegisterTransaction(t, func(req *sip.Request) *sip.Response {
+			sent.Add(1)
+			return sip.NewResponseFromRequest(req, 200, "OK", nil)
+		})
+
+		assert.ErrorIs(t, rtx.optionsProbe(ctx), context.Canceled)
+		assert.Zero(t, sent.Load(), "a probe on a cancelled context sent its OPTIONS")
+	})
+}
+
+var errProbeTransport = errors.New("transport write failed")
+
+// failingTxRequester fails every request as a transport that cannot send does.
+type failingTxRequester struct{}
+
+func (failingTxRequester) Request(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	return nil, errProbeTransport
 }
 
 // TestOptionsProbeConcurrentWithRegister runs a probe next to the register loop,

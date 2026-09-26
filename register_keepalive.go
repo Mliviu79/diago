@@ -77,13 +77,22 @@ func (t *RegisterTransaction) optionsKeepaliveLoop(ctx context.Context, interval
 // optionsProbe sends one out-of-dialog OPTIONS and reports whether the peer is
 // alive. Any final response means alive and returns nil, including a 401 or a
 // 405: the point is that the far end answered, so no digest auth is attempted.
-// Only a transport error or a transaction timeout returns an error.
+// Only a transport error or a transaction timeout returns an error, and
+// ctx.Err() once ctx is done.
+//
+// A probe on a context already done sends nothing. The client would send the
+// OPTIONS all the same and then take either the context's end or an answer
+// that came back at once, so the probe could report a peer alive for a loop
+// that had stopped.
 //
 // The request is built from the recipient captured on construction rather than
 // from Origin, which the register loop rewrites in place. ClientRequestBuild
 // gives every probe a fresh Call-ID, From tag and CSeq, keeping probes
 // independent of each other and of the registration.
 func (t *RegisterTransaction) optionsProbe(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	req := sip.NewRequest(sip.OPTIONS, t.recipient)
 	if t.opts.ProxyHost != "" {
 		req.SetDestination(t.opts.ProxyHost)
