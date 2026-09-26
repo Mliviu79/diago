@@ -626,3 +626,109 @@ func TestDialogMediaRTPControlReadsMediaUnderLock(t *testing.T) {
 		})
 	})
 }
+
+// TestDialogMediaAudioBeforeSetup pins that asking a dialog for its audio
+// before its media is set up is an error rather than a reader or writer that
+// panics when used. The media is set up by the answer, or by ProgressMedia
+// once early media is keyed, so it is missing before either and after
+// ErrEarlyMediaNotKeyed, which leaves the dialog with a media session and no
+// RTP session. Before, AudioReader and AudioWriter returned the missing packet
+// reader or writer as a non-nil interface holding a nil pointer, and the
+// helpers built on them panicked.
+func TestDialogMediaAudioBeforeSetup(t *testing.T) {
+	// call runs f, turning a panic into a test failure so every row reports.
+	call := func(t *testing.T, name string, f func() error) {
+		t.Helper()
+		var err error
+		panicked := func() (p any) {
+			defer func() { p = recover() }()
+			err = f()
+			return nil
+		}()
+		if panicked != nil {
+			t.Errorf("%s panicked: %v", name, panicked)
+			return
+		}
+		if !errors.Is(err, ErrNoMediaSetup) {
+			t.Errorf("%s: want ErrNoMediaSetup, got %v", name, err)
+		}
+	}
+
+	dialogs := map[string]func(t *testing.T) *DialogMedia{
+		"no media session": func(t *testing.T) *DialogMedia { return &DialogMedia{} },
+		"media session without RTP session": func(t *testing.T) *DialogMedia {
+			return &DialogMedia{mediaSession: newMediaSessionForTest(t)}
+		},
+	}
+	for name, newDialog := range dialogs {
+		t.Run(name, func(t *testing.T) {
+			d := newDialog(t)
+			call(t, "AudioReader", func() error {
+				r, err := d.AudioReader()
+				require.Nil(t, r)
+				return err
+			})
+			call(t, "AudioReader with media props", func() error {
+				_, err := d.AudioReader(WithAudioReaderMediaProps(&MediaProps{}))
+				return err
+			})
+			call(t, "AudioReader with DTMF", func() error {
+				_, err := d.AudioReader(WithAudioReaderDTMF(&DTMFReader{}))
+				return err
+			})
+			call(t, "AudioWriter", func() error {
+				w, err := d.AudioWriter()
+				require.Nil(t, w)
+				return err
+			})
+			call(t, "AudioWriter with media props", func() error {
+				_, err := d.AudioWriter(WithAudioWriterMediaProps(&MediaProps{}))
+				return err
+			})
+			call(t, "AudioWriter with DTMF", func() error {
+				_, err := d.AudioWriter(WithAudioWriterDTMF(&DTMFWriter{}))
+				return err
+			})
+			call(t, "AudioReaderDTMF", func() error {
+				_, err := d.AudioReaderDTMF()
+				return err
+			})
+			call(t, "AudioWriterDTMF", func() error {
+				_, err := d.AudioWriterDTMF()
+				return err
+			})
+			call(t, "PlaybackCreate", func() error {
+				_, err := d.PlaybackCreate()
+				return err
+			})
+			call(t, "PlaybackControlCreate", func() error {
+				_, err := d.PlaybackControlCreate()
+				return err
+			})
+			call(t, "PlaybackRingtoneCreate", func() error {
+				_, err := d.PlaybackRingtoneCreate()
+				return err
+			})
+			call(t, "AudioStereoRecordingCreate", func() error {
+				f, err := os.CreateTemp(t.TempDir(), "rec-*.wav")
+				require.NoError(t, err)
+				defer f.Close()
+				_, err = d.AudioStereoRecordingCreate(f)
+				return err
+			})
+			call(t, "Echo", d.Echo)
+			call(t, "Listen", d.Listen)
+			call(t, "ListenContext", func() error { return d.ListenContext(context.Background()) })
+			call(t, "ListenUntil", func() error { return d.ListenUntil(time.Millisecond) })
+			call(t, "ListenBackground", func() error {
+				_, err := d.ListenBackground()
+				return err
+			})
+			if d.mediaSession == nil {
+				// With a media session its sockets take a deadline.
+				call(t, "StopRTP", func() error { return d.StopRTP(1, 0) })
+				call(t, "StartRTP", func() error { return d.StartRTP(1, 0) })
+			}
+		})
+	}
+}

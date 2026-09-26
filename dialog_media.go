@@ -32,6 +32,11 @@ var (
 
 	errNoRTPSession = errors.New("no rtp session")
 
+	// ErrNoMediaSetup is returned when the dialog's audio is asked for before
+	// its media is set up: before the answer, or before ProgressMedia keys early
+	// media, and so after ErrEarlyMediaNotKeyed.
+	ErrNoMediaSetup = errors.New("no media setup")
+
 	// errMediaUpdateAfterAnswer marks a media update that failed after its
 	// answer was sent. The peer has moved to the new session by then, so the
 	// call has no media left.
@@ -1302,30 +1307,49 @@ func WithAudioReaderPCMMonitor(mon *audio.MonitorPCMReader, w io.Writer) AudioRe
 // NOTE: AudioReader must be called after negotiation is finished, like Answer()
 // Reading buffer should be equal or bigger of media.RTPBufSize
 // Use AuidioListen for optimized reading.
+//
+// Before the media is set up it returns ErrNoMediaSetup.
 func (d *DialogMedia) AudioReader(opts ...AudioReaderOption) (io.Reader, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// The options read the media session and the packet reader.
+	if len(opts) > 0 && (d.mediaSession == nil || d.RTPPacketReader == nil) {
+		return nil, ErrNoMediaSetup
+	}
 	for _, o := range opts {
 		if err := o(d); err != nil {
 			return nil, err
 		}
 	}
-	return d.getAudioReader(), nil
+	r := d.getAudioReader()
+	if r == nil {
+		return nil, ErrNoMediaSetup
+	}
+	return r, nil
 }
 
+// getAudioReader returns the audio reader, or nil when there is none.
 func (d *DialogMedia) getAudioReader() io.Reader {
 	if d.audioReader != nil {
 		return d.audioReader
 	}
+	if d.RTPPacketReader == nil {
+		return nil
+	}
 	return d.RTPPacketReader
 }
 
-// audioReaderProps
+// audioReaderProps fills p from the media session and returns the audio
+// reader. It returns nil when there is no reader, and without a media session,
+// which describes the audio.
 func (d *DialogMedia) audioReaderProps(p *MediaProps) io.Reader {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.mediaSession == nil {
+		return nil
+	}
 	WithAudioReaderMediaProps(p)(d)
 	return d.getAudioReader()
 }
@@ -1388,30 +1412,50 @@ func WithAudioWriterMonitor(mon *audio.MonitorPCMWriter, w io.Writer) AudioWrite
 // AudioWriter returns io.Writer on which you can write your ENCODED audio.
 // By default it is RTPPacketWriter unless overwritten with SetAudioWriter().
 // NOTE: RTPPacketWriter has running sample clock, but it expects samples sent, match sample duration of codec.
+//
+// Before the media is set up it returns ErrNoMediaSetup.
 func (d *DialogMedia) AudioWriter(opts ...AudioWriterOption) (io.Writer, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// The options read the media session and the packet writer.
+	if len(opts) > 0 && (d.mediaSession == nil || d.RTPPacketWriter == nil) {
+		return nil, ErrNoMediaSetup
+	}
 	for _, o := range opts {
 		if err := o(d); err != nil {
 			return nil, err
 		}
 	}
 
-	return d.getAudioWriter(), nil
+	w := d.getAudioWriter()
+	if w == nil {
+		return nil, ErrNoMediaSetup
+	}
+	return w, nil
 }
 
+// getAudioWriter returns the audio writer, or nil when there is none.
 func (d *DialogMedia) getAudioWriter() io.Writer {
 	if d.audioWriter != nil {
 		return d.audioWriter
 	}
+	if d.RTPPacketWriter == nil {
+		return nil
+	}
 	return d.RTPPacketWriter
 }
 
+// audioWriterProps fills p from the media session and returns the audio
+// writer. It returns nil when there is no writer, and without a media session,
+// which describes the audio.
 func (d *DialogMedia) audioWriterProps(p *MediaProps) io.Writer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.mediaSession == nil {
+		return nil
+	}
 	WithAudioWriterMediaProps(p)(d)
 	return d.getAudioWriter()
 }
@@ -1448,11 +1492,16 @@ func (d *DialogMedia) PlaybackCreate() (AudioPlayback, error) {
 	mprops := MediaProps{}
 	w := d.audioWriterProps(&mprops)
 	if w == nil {
-		return AudioPlayback{}, fmt.Errorf("no media setup")
+		return AudioPlayback{}, ErrNoMediaSetup
 	}
 	p := NewAudioPlayback(w, mprops.Codec)
 	// On each play it needs reset RTP timestamp
-	p.onPlay = d.RTPPacketWriter.ResetTimestamp
+	d.mu.Lock()
+	packetWriter := d.RTPPacketWriter
+	d.mu.Unlock()
+	if packetWriter != nil {
+		p.onPlay = packetWriter.ResetTimestamp
+	}
 	return p, nil
 }
 
@@ -1463,7 +1512,7 @@ func (d *DialogMedia) PlaybackControlCreate() (AudioPlaybackControl, error) {
 	w := d.audioWriterProps(&mprops)
 
 	if w == nil {
-		return AudioPlaybackControl{}, fmt.Errorf("no media setup")
+		return AudioPlaybackControl{}, ErrNoMediaSetup
 	}
 	// Audio is controled via audio reader/writer
 	control := &audioControl{
@@ -1484,7 +1533,7 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 	mprops := MediaProps{}
 	w := d.audioWriterProps(&mprops)
 	if w == nil {
-		return AudioRingtone{}, fmt.Errorf("no media setup")
+		return AudioRingtone{}, ErrNoMediaSetup
 	}
 
 	ringtone, err := audio.RingtoneLoadPCM(mprops.Codec)
@@ -1517,13 +1566,13 @@ func (d *DialogMedia) AudioStereoRecordingCreate(wavFile *os.File) (AudioStereoR
 	mpropsW := MediaProps{}
 	aw := d.audioWriterProps(&mpropsW)
 	if aw == nil {
-		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
+		return AudioStereoRecordingWav{}, ErrNoMediaSetup
 	}
 
 	mpropsR := MediaProps{}
 	ar := d.audioReaderProps(&mpropsR)
 	if ar == nil {
-		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
+		return AudioStereoRecordingWav{}, ErrNoMediaSetup
 	}
 
 	return newDialogRecordingWav(wavFile, ar, mpropsR, aw, mpropsW)
@@ -1613,11 +1662,11 @@ func (d *DialogMedia) ListenContext(pctx context.Context) error {
 func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 	buf := make([]byte, media.RTPBufSize)
 
-	d.StopRTP(1, dur)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
+	d.StopRTP(1, dur)
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -1628,15 +1677,24 @@ func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 
 // StopRTP sets a read or write deadline, as MediaSession.StopRTP does, on the
 // dialog's current media session, which it takes under the dialog's lock since
-// a re-INVITE replaces the session under it.
+// a re-INVITE replaces the session under it. Without a media session it
+// returns ErrNoMediaSetup.
 func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) error {
-	return d.MediaSession().StopRTP(rw, dur)
+	sess := d.MediaSession()
+	if sess == nil {
+		return ErrNoMediaSetup
+	}
+	return sess.StopRTP(rw, dur)
 }
 
 // StartRTP clears the deadline StopRTP sets, on the dialog's current media
 // session.
 func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) error {
-	return d.MediaSession().StartRTP(rw)
+	sess := d.MediaSession()
+	if sess == nil {
+		return ErrNoMediaSetup
+	}
+	return sess.StartRTP(rw)
 }
 
 // dtmfCodec returns the telephone-event codec DTMF is carried on for this
