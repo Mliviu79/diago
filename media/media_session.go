@@ -62,10 +62,10 @@ var (
 	// negotiation is still running, and a later FinalizeContext waits for it.
 	ErrFinalizeInProgress = errors.New("media negotiation still in progress")
 
-	// ErrDTLSNotKeyed is returned by WriteRTP and WriteRTCP while a DTLS
-	// handshake FinalizeWithin left running has not keyed SRTP, and after it
-	// failed. The media is refused rather than sent in plaintext: SRTP
-	// processing does not start before the handshake completes (RFC 5764
+	// ErrDTLSNotKeyed is returned by WriteRTP, WriteRTCP and WriteRTCPs while
+	// a DTLS handshake FinalizeWithin left running has not keyed SRTP, and
+	// after it failed. The media is refused rather than sent in plaintext:
+	// SRTP processing does not start before the handshake completes (RFC 5764
 	// section 5.1), and the profile protects media with nothing else.
 	ErrDTLSNotKeyed = errors.New("dtls-srtp not keyed")
 )
@@ -308,8 +308,8 @@ type MediaSession struct {
 	// since the session was never keyed. Guarded by finalizeMu.
 	finalizeErr error
 	// dtlsUnkeyed is set when FinalizeWithin leaves a DTLS handshake running,
-	// and cleared by the handshake once it has keyed SRTP; WriteRTP and
-	// WriteRTCP refuse while it is set. It is cleared only after the SRTP
+	// and cleared by the handshake once it has keyed SRTP; WriteRTP, WriteRTCP
+	// and WriteRTCPs refuse while it is set. It is cleared only after the SRTP
 	// contexts are set, so a writer that finds it clear finds them too,
 	// although another goroutine set them, and a writer that finds it set
 	// reads none of what that goroutine writes.
@@ -1646,13 +1646,13 @@ func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 // start its connectivity checks twice either.
 //
 // Until FinalizeContext waits for it, the negotiation is bounded by ctx alone,
-// and by Close, which ends it. The session carries no media meanwhile: WriteRTP
-// and WriteRTCP return ErrDTLSNotKeyed, and nothing may read from the session
-// or change it, since the negotiation does both. A negotiation that ends within
-// wait, successfully or not, is reported as FinalizeContext reports it, and so
-// is one that failed before. A wait of zero or less does not wait: it reports a
-// negotiation left running that has ended, and ErrFinalizeInProgress for one
-// that has not.
+// and by Close, which ends it. The session carries no media meanwhile:
+// WriteRTP, WriteRTCP and WriteRTCPs return ErrDTLSNotKeyed, and nothing may
+// read from the session or change it, since the negotiation does both. A
+// negotiation that ends within wait, successfully or not, is reported as
+// FinalizeContext reports it, and so is one that failed before. A wait of zero
+// or less does not wait: it reports a negotiation left running that has ended,
+// and ErrFinalizeInProgress for one that has not.
 func (s *MediaSession) FinalizeWithin(ctx context.Context, wait time.Duration) error {
 	run := s.loadFinalizeRun()
 	if run == nil {
@@ -2300,7 +2300,12 @@ func (m *MediaSession) WriteRTCP(p rtcp.Packet) error {
 	if err != nil {
 		return err
 	}
+	return m.writeRTCPData(data)
+}
 
+// writeRTCPData writes marshaled RTCP, protected as SRTCP when the session has
+// SRTP keys.
+func (m *MediaSession) writeRTCPData(data []byte) error {
 	if m.localCtxSRTP != nil {
 		// sync pool may not be best option and needs benchmarks.
 		// but as RTCP is not realtime this can reduce allocations
@@ -2309,6 +2314,7 @@ func (m *MediaSession) WriteRTCP(p rtcp.Packet) error {
 		defer rtpBufPool.Put(wbuf)
 		writeBuf := wbuf.([]byte)
 
+		var err error
 		data, err = m.localCtxSRTP.EncryptRTCP(writeBuf, data, nil)
 		if err != nil {
 			return err
@@ -2332,21 +2338,21 @@ func (m *MediaSession) WriteRTCPDeadline(p rtcp.Packet, deadline time.Time) erro
 }
 
 // Use this to write Multi RTCP packets if they can fit in MTU=1500
+//
+// The packets go out as one compound packet, protected like WriteRTCP's.
 func (m *MediaSession) WriteRTCPs(pkts []rtcp.Packet) error {
+	if m.dtlsUnkeyed.Load() {
+		return ErrDTLSNotKeyed
+	}
+	for _, p := range pkts {
+		logRTCPWrite(m, p)
+	}
+
 	data, err := rtcpMarshal(pkts)
 	if err != nil {
 		return err
 	}
-
-	n, err := m.WriteRTCPRaw(data)
-	if err != nil {
-		return err
-	}
-
-	if n != len(data) {
-		return io.ErrShortWrite
-	}
-	return nil
+	return m.writeRTCPData(data)
 }
 
 func (m *MediaSession) WriteRTCPRaw(data []byte) (int, error) {
