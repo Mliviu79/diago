@@ -18,6 +18,12 @@ import (
 const (
 	defaultRTPJitterBufferDelayPackets = 20
 	defaultRTPJitterBufferMaxPackets   = 40
+
+	// maxLearnedRTPPacketDuration is the longest packet duration the buffer
+	// learns from RTP timestamps. An audio packet carries at most 120 ms, and a
+	// longer step between consecutive packets is a pause in the stream, as a
+	// sender in DTX makes between its frames, not the duration of a packet.
+	maxLearnedRTPPacketDuration = 200 * time.Millisecond
 )
 
 var rtpJitterDebug = envBool("JITTER_DEBUG")
@@ -29,6 +35,12 @@ type RTPJitterBufferOptions struct {
 	// MaxPackets caps buffered packets and the forward reordering window. If unset, 40 is used.
 	// A value below DelayPackets is raised to DelayPackets.
 	MaxPackets int
+	// ClockRate is the RTP clock rate of the stream in Hz. When set, the buffer
+	// learns the duration of the sender's packets from their RTP timestamps and
+	// paces playout by it, so a sender whose packets are shorter or longer than
+	// the packet duration the buffer was given is played at its own pace. If
+	// unset, playout paces by the packet duration the buffer was given.
+	ClockRate uint32
 }
 
 // RTPJitterBufferStatistics contains simple counters for buffer decisions.
@@ -42,6 +54,9 @@ type RTPJitterBufferStatistics struct {
 	SSRCResets         uint64
 	Underruns          uint64
 	LastSequenceNumber uint16
+	// PacketDuration is what playout paces by: the packet duration the buffer
+	// was given, or the one it learned from the sender's RTP timestamps.
+	PacketDuration time.Duration
 }
 
 type rtpJitterBufferStats struct {
@@ -64,55 +79,52 @@ type rtpJitterSlot struct {
 	seq    uint16
 }
 
-type rtpJitterInput struct {
-	slot int
-	err  error
-}
-
 // RTPJitterBuffer is a fixed-delay, single-consumer RTPReader wrapper.
 //
 // It sits after RTPSession and before RTPPacketReader, so RTPSession observes
-// true network arrival while downstream readers get reordered packets.
+// true network arrival while downstream readers get reordered packets. Its read
+// loop takes each packet from upstream as it arrives, whether or not the
+// consumer is reading.
 //
-// Playout releases one packet per packetDuration, and skips a missing packet as
-// lost when later ones are queued. When nothing is queued at all, because the
-// sender paused (hold, silence suppression, DTX) or the network stalled for
-// longer than the playout delay, playout stops, counting an underrun and no
-// packet lost, and buffers again, as at the start of the stream, from the next
-// packet at or after where it stopped. Until it plays again, a packet behind
-// that point is late, except that one MaxPackets or more away in either
-// direction, arriving with nothing queued, starts the stream again, as from a
-// sender that restarted its sequence numbers.
+// Playout releases one packet per packet duration on a clock that keeps its
+// pace however late a release is made, so a consumer that reads late gets the
+// packets due meanwhile at once. The packet duration is the one the buffer was
+// given or, with RTPJitterBufferOptions.ClockRate, the one the sender's RTP
+// timestamps show. A missing packet is skipped as lost when later ones are
+// queued. When nothing is queued at all, because the sender paused (hold,
+// silence suppression, DTX) or the network stalled for longer than the playout
+// delay, playout stops, counting an underrun and no packet lost, and buffers
+// again, as at the start of the stream, from the next packet at or after where
+// it stopped. Until it plays again, a packet behind that point is late, except
+// that one MaxPackets or more away in either direction, arriving with nothing
+// queued, starts the stream again, as from a sender that restarted its sequence
+// numbers.
+//
+// A packet MaxPackets or more ahead of the next one to play does not fit the
+// window, as happens when the consumer stops reading while the sender goes on.
+// It is the newest audio, so the window moves on to end at it with DelayPackets
+// sequence numbers, and the older packets queued are dropped as stale.
 type RTPJitterBuffer struct {
-	// mu guards reader and packetDuration, which UpdateRTPSession changes while
-	// the read loop and ReadRTP use them.
+	// mu guards every field below up to arrived. The read loop files each packet
+	// under it as the packet arrives, and ReadRTP plays them out under it.
 	mu sync.Mutex
 	// reader is the upstream network-facing RTP source.
 	reader RTPReader
-	// packetDuration controls the interval between playout decisions.
+	// packetDuration is the interval between playout decisions.
 	packetDuration time.Duration
+	// clockRate is the RTP clock rate packet durations are learned in, or 0 when
+	// they are not learned.
+	clockRate uint32
 
 	// delayPackets is the number of queued packets required to start playout early.
 	delayPackets int
 	// maxPackets is both the queue capacity and accepted forward sequence window.
 	maxPackets int
 
-	// input transfers ownership of filled slot indexes from readLoop to ReadRTP.
-	input chan rtpJitterInput
-	// freeSlots transfers ownership of reusable slot indexes back to readLoop.
-	freeSlots chan int
-	// done is closed by Close to stop internal channel operations and delivery.
-	done chan struct{}
-	// closeOnce makes Close idempotent.
-	closeOnce sync.Once
-	// startOnce ensures that only one upstream reader goroutine is launched.
-	startOnce sync.Once
-	// readLoopDone is closed when readLoop returns, or by Close when readLoop
-	// never started.
-	readLoopDone chan struct{}
-
 	// slots contains all reusable packet metadata and packet-sized byte regions.
 	slots []rtpJitterSlot
+	// freeSlots holds the indexes of the slots neither queued nor being read into.
+	freeSlots []int
 	// sequence maps sequenceNumber % maxPackets to an occupied slot index, or -1.
 	sequence []int
 	// queued is the number of occupied entries in sequence.
@@ -127,32 +139,55 @@ type RTPJitterBuffer struct {
 	// expectedSet reports whether expectedSeq has been initialized.
 	expectedSet bool
 
-	// initialTimer limits how long startup waits to collect delayPackets.
-	initialTimer *time.Timer
-	// playoutTimer schedules the next packet release or loss decision.
-	playoutTimer *time.Timer
+	// startAt is when buffering ends at the latest and playout starts with what
+	// is queued. It is zero while nothing is buffering.
+	startAt time.Time
+	// releaseAt is when playout makes its next decision. Each decision moves it
+	// on by packetDuration from where it was, not from when the decision ran.
+	releaseAt time.Time
 	// playout reports whether the initial buffering phase has completed.
 	playout bool
-	// releaseNow reports that the next expected sequence may be processed now.
-	releaseNow bool
-	// startNow reports that the initial timer expired, so playout starts at the
-	// next decision.
-	startNow bool
 	// resync reports that playout stopped with nothing queued. Until it starts
 	// again, expectedSeq is the first sequence number not yet played, and
 	// packets behind it are late.
 	resync bool
 
-	// inputClosed reports that readLoop has stopped producing packet events.
-	inputClosed bool
+	// upstreamEnded reports that the read loop stopped on an upstream error.
+	upstreamEnded bool
 	// readErr stores the terminal upstream error returned after queued packets drain.
 	readErr error
+
+	// stepSeq, stepTimestamp and stepPayloadType describe the newest packet
+	// that arrived, which the next one is compared with to learn the packet
+	// duration. stepSet reports whether they are set.
+	stepSeq         uint16
+	stepTimestamp   uint32
+	stepPayloadType uint8
+	stepSet         bool
+	// pendingStep is the timestamp step between the last two consecutive
+	// packets. A step becomes the packet duration when the next pair repeats it.
+	pendingStep uint32
+
 	// lastArrivalTime is used only for JITTER_DEBUG receive-side diagnostics.
 	lastArrivalTime time.Time
 	// lastArrivalSeq is the previous RTP sequence observed by readLoop.
 	lastArrivalSeq uint16
 	// lastArrivalSet reports whether receive-side debug arrival state is initialized.
 	lastArrivalSet bool
+
+	// arrived wakes ReadRTP once the read loop has filed a packet or ended.
+	arrived chan struct{}
+	// timer wakes ReadRTP for its next playout decision. Only ReadRTP arms it.
+	timer *time.Timer
+	// done is closed by Close to stop the read loop and delivery.
+	done chan struct{}
+	// closeOnce makes Close idempotent.
+	closeOnce sync.Once
+	// startOnce ensures that only one upstream reader goroutine is launched.
+	startOnce sync.Once
+	// readLoopDone is closed when readLoop returns, or by Close when readLoop
+	// never started.
+	readLoopDone chan struct{}
 	// stats uses atomics so Statistics may run concurrently with ReadRTP.
 	stats rtpJitterBufferStats
 }
@@ -176,15 +211,16 @@ func NewRTPJitterBuffer(reader RTPReader, packetDuration time.Duration, opts RTP
 		opts.DelayPackets = opts.MaxPackets
 	}
 
-	// One extra slot lets the network reader finish one read while the configured
-	// jitter window is full. All packet storage is allocated once here.
+	// The window holds at most MaxPackets, so one extra slot is always free for
+	// the read loop to read the next packet into. All packet storage is
+	// allocated once here.
 	slotCount := opts.MaxPackets + 1
 	data := make([]byte, slotCount*RTPBufSize)
 	slots := make([]rtpJitterSlot, slotCount)
-	freeSlots := make(chan int, slotCount)
+	freeSlots := make([]int, slotCount)
 	for i := range slots {
 		slots[i].raw = data[i*RTPBufSize : (i+1)*RTPBufSize]
-		freeSlots <- i
+		freeSlots[i] = i
 	}
 
 	sequence := make([]int, opts.MaxPackets)
@@ -192,24 +228,22 @@ func NewRTPJitterBuffer(reader RTPReader, packetDuration time.Duration, opts RTP
 		sequence[i] = -1
 	}
 
-	initialTimer := time.NewTimer(time.Hour)
-	initialTimer.Stop()
-	playoutTimer := time.NewTimer(time.Hour)
-	playoutTimer.Stop()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
 
 	return &RTPJitterBuffer{
 		reader:         reader,
 		packetDuration: packetDuration,
+		clockRate:      opts.ClockRate,
 		delayPackets:   opts.DelayPackets,
 		maxPackets:     opts.MaxPackets,
-		input:          make(chan rtpJitterInput, slotCount),
+		slots:          slots,
 		freeSlots:      freeSlots,
+		sequence:       sequence,
+		arrived:        make(chan struct{}, 1),
+		timer:          timer,
 		done:           make(chan struct{}),
 		readLoopDone:   make(chan struct{}),
-		slots:          slots,
-		sequence:       sequence,
-		initialTimer:   initialTimer,
-		playoutTimer:   playoutTimer,
 	}
 }
 
@@ -218,52 +252,50 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 	j.start()
 
 	for {
-		// Close wins over anything queued or in flight. The read loop closes input
-		// when Close stops it, which is also how it reports the end of the
-		// upstream stream, so input alone cannot tell the two apart.
+		// Close wins over anything queued.
 		select {
 		case <-j.done:
-			j.stopTimers()
+			j.timer.Stop()
 			return 0, io.ErrClosedPipe
 		default:
 		}
 
-		// A due timer and arrived input are ready together, and a select picks
-		// among them at random. Taking what has arrived first means no playout
-		// decision misses a packet still waiting in input.
-		j.drainInput()
-
-		if !j.playout && (j.startNow || j.queued >= j.delayPackets) {
-			if j.startNow {
-				j.debugPlayoutStarted("initial_timer")
-			} else {
-				j.debugPlayoutStarted("delay_packets")
+		// Every packet that has arrived is filed by now, so each decision sees
+		// all of them.
+		j.mu.Lock()
+		now := time.Now()
+		if !j.playout {
+			if startDue := !j.startAt.IsZero() && !now.Before(j.startAt); startDue || j.queued >= j.delayPackets {
+				if startDue {
+					j.debugPlayoutStarted("initial_timer")
+				} else {
+					j.debugPlayoutStarted("delay_packets")
+				}
+				j.startPlayout(now)
 			}
-			j.startPlayout()
 		}
 
-		if j.playout && j.releaseNow {
+		if j.playout && !now.Before(j.releaseAt) {
 			position := int(j.expectedSeq) % j.maxPackets
 			slotIndex := j.sequence[position]
 			if slotIndex >= 0 && j.slots[slotIndex].seq == j.expectedSeq {
 				slot := &j.slots[slotIndex]
 				if len(buf) < slot.n {
+					j.mu.Unlock()
 					return 0, io.ErrShortBuffer
 				}
 
 				j.sequence[position] = -1
 				j.queued--
 				j.expectedSeq++
-				j.releaseNow = false
-				j.resetPlayoutTimer()
-
+				j.releaseAt = j.releaseAt.Add(j.packetDuration)
 				n := copy(buf, slot.raw[:slot.n])
-				err := RTPUnmarshal(buf[:n], p)
-				j.recycleSlot(slotIndex)
-				if err != nil {
+				j.freeSlot(slotIndex)
+				j.mu.Unlock()
+
+				if err := RTPUnmarshal(buf[:n], p); err != nil {
 					return 0, err
 				}
-
 				j.stats.packetsReleased.Add(1)
 				j.stats.lastSequenceNumber.Store(uint32(p.SequenceNumber))
 				return n, nil
@@ -274,78 +306,46 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 			} else {
 				j.stats.packetsLost.Add(1)
 				j.expectedSeq++
-				j.releaseNow = false
-				j.resetPlayoutTimer()
+				j.releaseAt = j.releaseAt.Add(j.packetDuration)
+				j.mu.Unlock()
+				continue
 			}
 		}
 
-		if j.inputClosed && j.queued == 0 {
-			j.stopTimers()
-			if j.readErr != nil {
-				return 0, j.readErr
+		if j.upstreamEnded && j.queued == 0 {
+			err := j.readErr
+			j.mu.Unlock()
+			j.timer.Stop()
+			if err != nil {
+				return 0, err
 			}
 			return 0, io.EOF
 		}
 
-		// Once the read loop has ended, input is closed and always ready, so it
-		// is left out and only the timers wake the remaining playout.
-		var inputC <-chan rtpJitterInput
-		if !j.inputClosed {
-			inputC = j.input
+		// Nothing is due yet. Wait for the next decision, the next packet or
+		// Close. Stopped with nothing queued, only a packet starts anything.
+		var wait time.Duration
+		switch {
+		case j.playout:
+			wait = j.releaseAt.Sub(now)
+		case !j.startAt.IsZero():
+			wait = j.startAt.Sub(now)
 		}
+		j.mu.Unlock()
 
-		var initialC <-chan time.Time
-		if !j.playout && j.expectedSet {
-			initialC = j.initialTimer.C
+		var timerC <-chan time.Time
+		if wait > 0 {
+			j.timer.Reset(wait)
+			timerC = j.timer.C
 		}
-
-		var playoutC <-chan time.Time
-		if j.playout && !j.releaseNow {
-			playoutC = j.playoutTimer.C
-		}
-
 		select {
 		case <-j.done:
-			j.stopTimers()
+			j.timer.Stop()
 			return 0, io.ErrClosedPipe
-
-		case input, ok := <-inputC:
-			j.handleInput(input, ok)
-
-		case <-initialC:
-			j.startNow = true
-
-		case <-playoutC:
-			j.releaseNow = true
+		case <-j.arrived:
+		case <-timerC:
 		}
 	}
-}
-
-// drainInput takes the input that has already arrived. It takes at most as
-// many as input holds, so a source whose packets are all dropped cannot keep
-// ReadRTP from its playout decisions.
-func (j *RTPJitterBuffer) drainInput() {
-	for i := 0; i < cap(j.input) && !j.inputClosed; i++ {
-		select {
-		case input, ok := <-j.input:
-			j.handleInput(input, ok)
-		default:
-			return
-		}
-	}
-}
-
-func (j *RTPJitterBuffer) handleInput(input rtpJitterInput, ok bool) {
-	if !ok {
-		j.inputClosed = true
-		return
-	}
-	if input.err != nil {
-		j.readErr = input.err
-		j.inputClosed = true
-		return
-	}
-	j.handleSlot(input.slot)
 }
 
 func (j *RTPJitterBuffer) start() {
@@ -356,40 +356,46 @@ func (j *RTPJitterBuffer) start() {
 
 func (j *RTPJitterBuffer) readLoop() {
 	defer close(j.readLoopDone)
-	defer close(j.input)
 
 	for {
-		var slotIndex int
-		select {
-		case <-j.done:
-			return
-		case slotIndex = <-j.freeSlots:
-		}
-		// A select picks among ready cases at random, so a free slot can win over
-		// Close. Once the loop has seen Close it starts no further upstream read.
+		// Once the loop has seen Close it starts no further upstream read.
 		select {
 		case <-j.done:
 			return
 		default:
 		}
 
+		j.mu.Lock()
+		slotIndex := j.freeSlots[len(j.freeSlots)-1]
+		j.freeSlots = j.freeSlots[:len(j.freeSlots)-1]
+		j.mu.Unlock()
+
 		slot := &j.slots[slotIndex]
 		n, err := j.readUpstream(slot)
-		if err != nil {
-			j.sendInput(rtpJitterInput{err: err})
-			return
-		}
-		if n == 0 {
-			j.recycleSlot(slotIndex)
-			continue
-		}
 
-		slot.n = n
-		slot.ssrc = slot.packet.SSRC
-		slot.seq = slot.packet.SequenceNumber
-		j.debugArrival(slot)
-		if !j.sendInput(rtpJitterInput{slot: slotIndex}) {
+		j.mu.Lock()
+		switch {
+		case err != nil:
+			j.freeSlot(slotIndex)
+			j.readErr = err
+			j.upstreamEnded = true
+		case n == 0:
+			j.freeSlot(slotIndex)
+		default:
+			slot.n = n
+			slot.ssrc = slot.packet.SSRC
+			slot.seq = slot.packet.SequenceNumber
+			j.debugArrival(slot)
+			j.handleSlot(slotIndex)
+		}
+		j.mu.Unlock()
+
+		if err != nil {
+			j.notify()
 			return
+		}
+		if n > 0 {
+			j.notify()
 		}
 	}
 }
@@ -426,37 +432,38 @@ func (j *RTPJitterBuffer) upstream() RTPReader {
 	return j.reader
 }
 
-func (j *RTPJitterBuffer) duration() time.Duration {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.packetDuration
-}
-
 // UpdateRTPSession moves the buffer onto rtpSess, the session a media update
-// installed in place of the one it reads, and paces playout by the packet
-// duration of its negotiated audio codec. What is queued and the playout state
-// carry over. A read the read loop has in progress on the previous reader
-// finishes there, or, if it fails, for example because the previous session
-// was closed, continues on rtpSess.
+// installed in place of the one it reads. Playout paces by the packet duration
+// of its negotiated audio codec, and a buffer that learns packet durations
+// learns them again from the packets that follow, in the clock rate of that
+// codec. What is queued and the playout state carry over. A read the read loop
+// has in progress on the previous reader finishes there, or, if it fails, for
+// example because the previous session was closed, continues on rtpSess.
 func (j *RTPJitterBuffer) UpdateRTPSession(rtpSess *RTPSession) {
-	packetDuration := CodecAudioFromSession(rtpSess.Sess).SampleDur
+	codec := CodecAudioFromSession(rtpSess.Sess)
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.reader = rtpSess
-	if packetDuration > 0 {
-		j.packetDuration = packetDuration
+	if codec.SampleDur > 0 {
+		j.packetDuration = codec.SampleDur
 	}
+	if j.clockRate != 0 && codec.SampleRate != 0 {
+		j.clockRate = codec.SampleRate
+	}
+	j.stepSet = false
+	j.pendingStep = 0
 }
 
-func (j *RTPJitterBuffer) sendInput(input rtpJitterInput) bool {
+// notify wakes ReadRTP. One pending wake covers any number of packets, since
+// ReadRTP decides on everything filed when it wakes.
+func (j *RTPJitterBuffer) notify() {
 	select {
-	case <-j.done:
-		return false
-	case j.input <- input:
-		return true
+	case j.arrived <- struct{}{}:
+	default:
 	}
 }
 
+// handleSlot files the packet read into slotIndex. Called with mu held.
 func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 	slot := &j.slots[slotIndex]
 	j.stats.packetsRead.Add(1)
@@ -477,17 +484,18 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 		j.resetStream(slot.ssrc, slot.seq)
 		distance = 0
 	}
+	j.learnPacketDuration(slot)
 	if distance < 0 {
 		if j.playout || j.resync {
 			j.stats.packetsLate.Add(1)
 			j.debugPacketDecision("late", slot, "behind_playout")
-			j.recycleSlot(slotIndex)
+			j.freeSlot(slotIndex)
 			return
 		}
 		if !j.canMoveExpectedBack(slot.seq) {
 			j.stats.packetsDropped.Add(1)
 			j.debugPacketDecision("dropped", slot, "before_window")
-			j.recycleSlot(slotIndex)
+			j.freeSlot(slotIndex)
 			return
 		}
 		j.expectedSeq = slot.seq
@@ -495,10 +503,11 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 	}
 
 	if int(distance) >= j.maxPackets {
-		j.stats.packetsDropped.Add(1)
-		j.debugPacketDecision("dropped", slot, "beyond_window")
-		j.recycleSlot(slotIndex)
-		return
+		// The packet is the newest audio and does not fit the window. The
+		// window moves on to end at it with the playout delay, and what it
+		// leaves behind is stale.
+		j.dropBefore(slot.seq - uint16(j.delayPackets-1))
+		distance = int16(slot.seq - j.expectedSeq)
 	}
 
 	position := int(slot.seq) % j.maxPackets
@@ -511,7 +520,7 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 			j.stats.packetsDropped.Add(1)
 			j.debugPacketDecision("dropped", slot, "slot_collision")
 		}
-		j.recycleSlot(slotIndex)
+		j.freeSlot(slotIndex)
 		return
 	}
 
@@ -519,7 +528,34 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 	j.queued++
 	if j.resync && j.queued == 1 {
 		// The stream resumed, so buffer again as at its start.
-		j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.duration())
+		j.startAt = time.Now().Add(time.Duration(j.delayPackets) * j.packetDuration)
+	}
+}
+
+// learnPacketDuration compares the packet in slot with the one that arrived
+// before it. Two consecutive packets of the same payload type, the second not
+// starting a talkspurt, step their RTP timestamps by the duration of a packet.
+// A step becomes the packet duration once the next pair repeats it, so a
+// single step spanning a pause does not. Called with mu held.
+func (j *RTPJitterBuffer) learnPacketDuration(slot *rtpJitterSlot) {
+	if j.clockRate == 0 {
+		return
+	}
+	pkt := &slot.packet
+	if j.stepSet && slot.seq == j.stepSeq+1 && pkt.PayloadType == j.stepPayloadType && !pkt.Marker {
+		step := pkt.Timestamp - j.stepTimestamp
+		if step > 0 && step == j.pendingStep {
+			if d := time.Duration(step) * time.Second / time.Duration(j.clockRate); d <= maxLearnedRTPPacketDuration {
+				j.packetDuration = d
+			}
+		}
+		j.pendingStep = step
+	}
+	if !j.stepSet || int16(slot.seq-j.stepSeq) > 0 {
+		j.stepSeq = slot.seq
+		j.stepTimestamp = pkt.Timestamp
+		j.stepPayloadType = pkt.PayloadType
+		j.stepSet = true
 	}
 }
 
@@ -536,6 +572,28 @@ func (j *RTPJitterBuffer) canMoveExpectedBack(seq uint16) bool {
 	return true
 }
 
+// dropBefore moves the window on so that next is the first sequence number to
+// play, dropping the packets queued before it as stale. Sequence numbers it
+// passes that were never queued are not counted as lost, as the window moved
+// past them rather than playout.
+func (j *RTPJitterBuffer) dropBefore(next uint16) {
+	passed := int(int16(next - j.expectedSeq))
+	for i := 0; i < passed && i < j.maxPackets; i++ {
+		seq := j.expectedSeq + uint16(i)
+		position := int(seq) % j.maxPackets
+		slotIndex := j.sequence[position]
+		if slotIndex < 0 || j.slots[slotIndex].seq != seq {
+			continue
+		}
+		j.stats.packetsDropped.Add(1)
+		j.debugPacketDecision("dropped", &j.slots[slotIndex], "stale")
+		j.sequence[position] = -1
+		j.queued--
+		j.freeSlot(slotIndex)
+	}
+	j.expectedSeq = next
+}
+
 func (j *RTPJitterBuffer) resetStream(ssrc uint32, seq uint16) {
 	j.clearSequence()
 	j.ssrc = ssrc
@@ -543,11 +601,10 @@ func (j *RTPJitterBuffer) resetStream(ssrc uint32, seq uint16) {
 	j.expectedSeq = seq
 	j.expectedSet = true
 	j.playout = false
-	j.releaseNow = false
-	j.startNow = false
 	j.resync = false
-	j.stopAndDrainTimer(j.playoutTimer)
-	j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.duration())
+	j.stepSet = false
+	j.pendingStep = 0
+	j.startAt = time.Now().Add(time.Duration(j.delayPackets) * j.packetDuration)
 }
 
 func (j *RTPJitterBuffer) clearSequence() {
@@ -556,13 +613,14 @@ func (j *RTPJitterBuffer) clearSequence() {
 			continue
 		}
 		j.sequence[i] = -1
-		j.recycleSlot(slotIndex)
+		j.freeSlot(slotIndex)
 	}
 	j.queued = 0
 }
 
-func (j *RTPJitterBuffer) startPlayout() {
-	j.stopAndDrainTimer(j.initialTimer)
+// startPlayout starts playout with a release due at now.
+func (j *RTPJitterBuffer) startPlayout(now time.Time) {
+	j.startAt = time.Time{}
 	// Starting again after a stop, the first packet queued can be ahead of
 	// expectedSeq. The sequence numbers before it were lost, and playout starts
 	// at that packet instead of spending a tick on each of them.
@@ -571,9 +629,8 @@ func (j *RTPJitterBuffer) startPlayout() {
 		j.expectedSeq++
 	}
 	j.resync = false
-	j.startNow = false
 	j.playout = true
-	j.releaseNow = true
+	j.releaseAt = now
 }
 
 // stopPlayout stops playout when it finds nothing queued. Counting every tick
@@ -584,39 +641,12 @@ func (j *RTPJitterBuffer) stopPlayout() {
 	j.stats.underruns.Add(1)
 	j.debugPlayoutStopped()
 	j.playout = false
-	j.releaseNow = false
 	j.resync = true
-	j.stopAndDrainTimer(j.playoutTimer)
 }
 
-func (j *RTPJitterBuffer) resetPlayoutTimer() {
-	j.resetTimer(j.playoutTimer, j.duration())
-}
-
-func (j *RTPJitterBuffer) resetTimer(timer *time.Timer, duration time.Duration) {
-	j.stopAndDrainTimer(timer)
-	timer.Reset(duration)
-}
-
-func (j *RTPJitterBuffer) stopAndDrainTimer(timer *time.Timer) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-}
-
-func (j *RTPJitterBuffer) stopTimers() {
-	j.stopAndDrainTimer(j.initialTimer)
-	j.stopAndDrainTimer(j.playoutTimer)
-}
-
-func (j *RTPJitterBuffer) recycleSlot(slotIndex int) {
-	select {
-	case j.freeSlots <- slotIndex:
-	case <-j.done:
-	}
+// freeSlot returns a slot no longer queued. Called with mu held.
+func (j *RTPJitterBuffer) freeSlot(slotIndex int) {
+	j.freeSlots = append(j.freeSlots, slotIndex)
 }
 
 // Close stops jitter-buffer delivery. It does not close the injected reader,
@@ -625,7 +655,7 @@ func (j *RTPJitterBuffer) recycleSlot(slotIndex int) {
 func (j *RTPJitterBuffer) Close() error {
 	j.closeOnce.Do(func() {
 		close(j.done)
-		j.stopTimers()
+		j.timer.Stop()
 		// A read loop that has not started by now never starts.
 		j.startOnce.Do(func() { close(j.readLoopDone) })
 	})
@@ -647,6 +677,9 @@ func (j *RTPJitterBuffer) Done() <-chan struct{} {
 
 // Statistics returns a race-safe snapshot of jitter buffer counters.
 func (j *RTPJitterBuffer) Statistics() RTPJitterBufferStatistics {
+	j.mu.Lock()
+	packetDuration := j.packetDuration
+	j.mu.Unlock()
 	return RTPJitterBufferStatistics{
 		PacketsRead:        j.stats.packetsRead.Load(),
 		PacketsReleased:    j.stats.packetsReleased.Load(),
@@ -657,6 +690,7 @@ func (j *RTPJitterBuffer) Statistics() RTPJitterBufferStatistics {
 		SSRCResets:         j.stats.ssrcResets.Load(),
 		Underruns:          j.stats.underruns.Load(),
 		LastSequenceNumber: uint16(j.stats.lastSequenceNumber.Load()),
+		PacketDuration:     packetDuration,
 	}
 }
 
@@ -666,15 +700,14 @@ func (j *RTPJitterBuffer) debugArrival(slot *rtpJitterSlot) {
 	}
 
 	now := time.Now()
-	packetDuration := j.duration()
 	if j.lastArrivalSet {
 		arrivalDelta := now.Sub(j.lastArrivalTime)
-		if arrivalDelta > packetDuration+packetDuration/2 {
+		if arrivalDelta > j.packetDuration+j.packetDuration/2 {
 			jitterDebugf("event=delayed_arrival seq=%d prev_seq=%d arrival_delta=%s packet_duration=%s",
 				slot.seq,
 				j.lastArrivalSeq,
 				arrivalDelta,
-				packetDuration,
+				j.packetDuration,
 			)
 		}
 

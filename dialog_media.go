@@ -658,7 +658,9 @@ func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 }
 
 // WithAudioReaderJitterBuffer inserts an RTP jitter buffer before the payload reader.
-// Packet duration is derived from the negotiated audio codec.
+// Playout starts at the packet duration of the negotiated audio codec and then
+// follows the duration of the peer's packets, learned from their RTP timestamps
+// in the codec's clock rate, or in opts.ClockRate when it is set.
 // The buffer stays in place across media updates, reading each new RTP session.
 // A dialog has at most one; asking for a second is an error.
 func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderOption {
@@ -680,6 +682,9 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 			return fmt.Errorf("no RTP reader setup")
 		}
 
+		if opts.ClockRate == 0 {
+			opts.ClockRate = codec.SampleRate
+		}
 		jitter := media.NewRTPJitterBuffer(reader, codec.SampleDur, opts)
 		d.RTPPacketReader.UpdateReader(jitter)
 		d.jitterBuffer = jitter

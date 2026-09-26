@@ -6,6 +6,7 @@ package media
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -225,16 +226,21 @@ func TestRTPJitterBuffer(t *testing.T) {
 		require.Equal(t, uint16(3), readJitterSeq(t, jb))
 	})
 
-	t.Run("forwardWindowDrop", func(t *testing.T) {
+	t.Run("forwardWindowMoves", func(t *testing.T) {
+		// 4 does not fit a window of four that starts at 0. It is the newest
+		// packet, so the window moves on to end at it and 0 is dropped as stale.
+		// 1 still fits the window and is played. Keeping 0 and dropping 4 would
+		// leave a buffer whose consumer fell behind dropping every new packet.
 		jb := newDeliveredRTPJitterBuffer(t, rtpPackets(1234, 0, 4, 1), RTPJitterBufferOptions{
 			DelayPackets: 2,
 			MaxPackets:   4,
 		})
 
-		require.Equal(t, uint16(0), readJitterSeq(t, jb))
 		require.Equal(t, uint16(1), readJitterSeq(t, jb))
+		require.Equal(t, uint16(4), readJitterSeq(t, jb))
 		requireJitterEOF(t, jb)
 		require.Equal(t, uint64(1), jb.Statistics().PacketsDropped)
+		require.Equal(t, uint64(2), jb.Statistics().PacketsLost)
 	})
 
 	t.Run("shortBufferRetry", func(t *testing.T) {
@@ -286,12 +292,9 @@ func TestRTPJitterBuffer(t *testing.T) {
 		jb.start()
 		require.NoError(t, jb.Close())
 
-		// The read loop closes input when Close stops it, which is also how it
-		// reports the end of the upstream stream. Wait for that before reading.
 		requireJitterDone(t, jb)
 
-		// ReadRTP sees Close and the closed input at once, and a select picks
-		// among ready cases at random, so a single read proves nothing.
+		// Every read after Close reports it, however often it is asked.
 		var pkt rtp.Packet
 		for i := 0; i < 64; i++ {
 			_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
@@ -485,11 +488,9 @@ func TestRTPJitterBufferResumesAfterPause(t *testing.T) {
 			}()
 
 			// send runs no further ahead of playout than the delay, so nothing is
-			// dropped for overflowing the window. It returns the underrun count
-			// once the last packet is in the buffer, after which the only
-			// underrun left is the one that follows its release.
+			// dropped for overflowing the window.
 			var sent uint64
-			send := func(seqs []uint16) uint64 {
+			send := func(seqs []uint16) {
 				for _, seq := range seqs {
 					sendJitterPacket(t, reader, rtpPacket(1234, seq))
 					sent++
@@ -498,7 +499,16 @@ func TestRTPJitterBufferResumesAfterPause(t *testing.T) {
 						return st.PacketsRead == sent && jitterQueued(st) < delayPackets
 					}, 5*time.Second, 100*time.Microsecond, "packet %d was not taken", seq)
 				}
-				return jb.Statistics().Underruns
+			}
+			// stopped reports that playout ran out of packets and stopped. Once
+			// every packet sent is filed, that happens only after the last one
+			// was played. Playout behind its clock plays that packet and stops at
+			// once, so the underrun count read after send can already include
+			// the stop.
+			stopped := func() bool {
+				jb.mu.Lock()
+				defer jb.mu.Unlock()
+				return jb.resync && jb.queued == 0
 			}
 			drained := func() {
 				require.Eventually(t, func() bool {
@@ -506,18 +516,17 @@ func TestRTPJitterBufferResumesAfterPause(t *testing.T) {
 				}, 5*time.Second, 100*time.Microsecond, "playout stopped with packets queued")
 			}
 
-			underruns := send(spurt)
+			send(spurt)
 			all := append([]uint16(nil), spurt...)
 			for _, group := range tc.after {
 				// The sender stays silent until playout has run out of packets,
 				// so the group reaches a buffer that has stopped, and then for
 				// twenty packets more, the length of a real pause, which playout
 				// must not tick through.
-				require.Eventually(t, func() bool {
-					return jb.Statistics().Underruns > underruns
-				}, 5*time.Second, 100*time.Microsecond, "playout never ran out of packets in the pause")
+				require.Eventually(t, stopped, 5*time.Second, 100*time.Microsecond,
+					"playout never ran out of packets in the pause")
 				time.Sleep(20 * packetDuration)
-				underruns = send(group)
+				send(group)
 				all = append(all, group...)
 			}
 			drained()
@@ -571,9 +580,9 @@ func jitterSeqRange(first uint16, n int) []uint16 {
 
 func TestRTPJitterBufferDecidesOnArrivedPackets(t *testing.T) {
 	// The consumer calls ReadRTP late: the playout tick is due, and packet 1
-	// arrived after packet 2 and both wait in input, unread. The tick and input
-	// are ready together and a select picks among them at random, so one trial
-	// proves nothing. Playout must decide on every packet that has arrived.
+	// arrived after packet 2. Playout must decide on every packet that has
+	// arrived, so it plays 1 rather than skipping it as lost. How the goroutines
+	// are scheduled varies between trials, so one trial proves little.
 	for trial := 0; trial < 32; trial++ {
 		reader := newChanRTPReader()
 		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{
@@ -584,8 +593,8 @@ func TestRTPJitterBufferDecidesOnArrivedPackets(t *testing.T) {
 		sendJitterPacket(t, reader, rtpPacket(1234, 0))
 		require.Equal(t, uint16(0), readJitterSeq(t, jb), "trial %d", trial)
 
-		// The read loop takes each packet only after handing the one before to
-		// input, so once 3 is taken, 2 and 1 are waiting there.
+		// The read loop takes each packet only after filing the one before, so
+		// once 3 is taken, 2 and 1 are filed.
 		sendJitterPacket(t, reader, rtpPacket(1234, 2))
 		sendJitterPacket(t, reader, rtpPacket(1234, 1))
 		sendJitterPacket(t, reader, rtpPacket(1234, 3))
@@ -603,9 +612,8 @@ func TestRTPJitterBufferDecidesOnArrivedPackets(t *testing.T) {
 
 func TestRTPJitterBufferEndedUpstreamWaitBlocks(t *testing.T) {
 	// The upstream ends with packets still queued and the next release is an
-	// hour away. ReadRTP has to wait for it blocked. The read loop has closed
-	// input, and a select on a closed channel is always ready, so a ReadRTP that
-	// still selects on it spins instead and never parks.
+	// hour away. ReadRTP has to wait for it blocked, not poll the ended
+	// upstream.
 	jb := NewRTPJitterBuffer(&sliceRTPReader{packets: rtpPackets(1234, 0, 1, 2)}, time.Hour, RTPJitterBufferOptions{
 		DelayPackets: 2,
 		MaxPackets:   8,
@@ -666,71 +674,256 @@ func goroutineStatus(fn string) string {
 }
 
 func TestRTPJitterBufferOverflow(t *testing.T) {
-	t.Skip("Jitter Buffer Overflow needs WORK")
-	t.Run("continuesReading", func(t *testing.T) {
+	// The consumer plays the first packet and stops reading while the sender
+	// goes on to 20. A window of MaxPackets cannot hold what arrives meanwhile.
+	const maxPackets = 5
+	stalled := func(t *testing.T) (*RTPJitterBuffer, *countingChanRTPReader) {
+		t.Helper()
 		reader := &countingChanRTPReader{
 			chanRTPReader: &chanRTPReader{packets: make(chan rtp.Packet, 32)},
 		}
 		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{
 			DelayPackets: 3,
-			MaxPackets:   5,
+			MaxPackets:   maxPackets,
 		})
 		t.Cleanup(func() {
 			_ = jb.Close()
 			close(reader.packets)
+			requireJitterDone(t, jb)
 		})
 
-		first := make(chan uint16, 1)
-		go func() {
-			first <- readJitterSeq(t, jb)
-		}()
+		read := readJitterAsync(jb, make([]byte, RTPBufSize))
 		for seq := uint16(0); seq < 3; seq++ {
-			reader.packets <- rtpPacket(1234, seq)
+			sendJitterPacket(t, reader.chanRTPReader, rtpPacket(1234, seq))
 		}
-		require.Equal(t, uint16(0), <-first)
+		require.Equal(t, uint16(0), awaitJitterSeq(t, jb, read))
 
 		for seq := uint16(3); seq <= 20; seq++ {
-			reader.packets <- rtpPacket(1234, seq)
+			sendJitterPacket(t, reader.chanRTPReader, rtpPacket(1234, seq))
 		}
+		return jb, reader
+	}
+
+	t.Run("continuesReading", func(t *testing.T) {
+		jb, reader := stalled(t)
 		require.Eventually(t, func() bool {
-			return reader.reads.Load() == 21
-		}, 100*time.Millisecond, time.Millisecond,
+			return reader.reads.Load() == 21 && jb.Statistics().PacketsRead == 21
+		}, 5*time.Second, time.Millisecond,
 			"upstream reading must continue when all playout slots are occupied")
+
+		st := jb.Statistics()
+		require.LessOrEqual(t, jitterQueued(st), uint64(maxPackets), "stats %+v", st)
+		require.Equal(t, uint64(21), st.PacketsReleased+jitterQueued(st)+st.PacketsDropped, "stats %+v", st)
 	})
 
 	t.Run("discardsStalePackets", func(t *testing.T) {
-		reader := &countingChanRTPReader{
-			chanRTPReader: &chanRTPReader{packets: make(chan rtp.Packet, 32)},
-		}
-		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{
-			DelayPackets: 3,
-			MaxPackets:   5,
-		})
-		t.Cleanup(func() {
-			_ = jb.Close()
-			close(reader.packets)
-		})
-
-		first := make(chan uint16, 1)
-		go func() {
-			first <- readJitterSeq(t, jb)
-		}()
-		for seq := uint16(0); seq < 3; seq++ {
-			reader.packets <- rtpPacket(1234, seq)
-		}
-		require.Equal(t, uint16(0), <-first)
-
-		for seq := uint16(3); seq <= 20; seq++ {
-			reader.packets <- rtpPacket(1234, seq)
-		}
+		jb, _ := stalled(t)
 		require.Eventually(t, func() bool {
-			return reader.reads.Load() >= 6
-		}, 100*time.Millisecond, time.Millisecond)
+			return jb.Statistics().PacketsRead == 21
+		}, 5*time.Second, time.Millisecond)
 
-		seq := readJitterSeq(t, jb)
-		require.GreaterOrEqual(t, seq, uint16(18),
+		// The window moved on with each packet that did not fit, so the
+		// consumer comes back to the newest audio, in order through the last
+		// packet sent, and what fell behind the window was dropped. The window
+		// holds up to MaxPackets, and a consumer that reads late loses nothing
+		// still in it, so playout resumes within MaxPackets of the newest
+		// packet, not DelayPackets.
+		first := readJitterSeq(t, jb)
+		require.GreaterOrEqual(t, first, uint16(20-maxPackets+1),
 			"playout should resume near the newest packet instead of returning stale audio")
+		for seq := first + 1; seq <= 20; seq++ {
+			require.Equal(t, seq, readJitterSeq(t, jb))
+		}
+
+		st := jb.Statistics()
+		require.Equal(t, uint64(first-1), st.PacketsDropped, "stats %+v", st)
+		require.Zero(t, st.PacketsLost, "stats %+v", st)
 	})
+}
+
+func TestRTPJitterBufferLearnsPacketDuration(t *testing.T) {
+	// The buffer is given 20 ms, 160 timestamp units at 8000 Hz.
+	type packet struct {
+		seq       uint16
+		timestamp uint32
+		pt        uint8
+		marker    bool
+	}
+	// steps returns packets from seq 0 and timestamp from, each step on from the
+	// one before.
+	steps := func(from uint32, steps ...uint32) []packet {
+		packets := []packet{{timestamp: from}}
+		for _, step := range steps {
+			last := packets[len(packets)-1]
+			packets = append(packets, packet{seq: last.seq + 1, timestamp: last.timestamp + step})
+		}
+		return packets
+	}
+	tests := []struct {
+		name      string
+		clockRate uint32
+		packets   []packet
+		want      time.Duration
+	}{
+		{name: "shorterPackets", clockRate: 8000, packets: steps(0, 80, 80, 80), want: 10 * time.Millisecond},
+		{name: "longerPackets", clockRate: 8000, packets: steps(0, 240, 240, 240), want: 30 * time.Millisecond},
+		{name: "timestampWraps", clockRate: 8000, packets: steps(1<<32-100, 80, 80, 80), want: 10 * time.Millisecond},
+		// One step could span a pause, so it takes a second to confirm it.
+		{name: "oneStep", clockRate: 8000, packets: steps(0, 80), want: 20 * time.Millisecond},
+		// A 60 ms pause without a marker makes one step of 70 ms, which no step
+		// after it repeats.
+		{name: "pause", clockRate: 8000, packets: steps(0, 80, 80, 560), want: 10 * time.Millisecond},
+		// DTX frames 400 ms apart repeat their step, but no packet is that long.
+		{name: "dtxFrames", clockRate: 8000, packets: steps(0, 3200, 3200, 3200), want: 20 * time.Millisecond},
+		// Packets of one telephone-event share its timestamp.
+		{name: "sameTimestamp", clockRate: 8000, packets: steps(0, 0, 0, 0), want: 20 * time.Millisecond},
+		{
+			// The step into a packet with the marker spans the silence before
+			// its talkspurt, so it is not compared.
+			name:      "talkspurtStart",
+			clockRate: 8000,
+			packets: []packet{
+				{seq: 0, timestamp: 0},
+				{seq: 1, timestamp: 80},
+				{seq: 2, timestamp: 160},
+				{seq: 3, timestamp: 400, marker: true},
+				{seq: 4, timestamp: 640},
+			},
+			want: 10 * time.Millisecond,
+		},
+		{
+			// A step into another payload type is not a packet duration.
+			name:      "payloadTypeChange",
+			clockRate: 8000,
+			packets: []packet{
+				{seq: 0, timestamp: 0},
+				{seq: 1, timestamp: 240, pt: 101},
+				{seq: 2, timestamp: 480},
+			},
+			want: 20 * time.Millisecond,
+		},
+		{name: "noClockRate", packets: steps(0, 80, 80, 80), want: 20 * time.Millisecond},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			packets := make([]rtp.Packet, 0, len(tc.packets))
+			for _, p := range tc.packets {
+				pkt := rtpPacket(1234, p.seq)
+				pkt.Timestamp = p.timestamp
+				pkt.Marker = p.marker
+				if p.pt != 0 {
+					pkt.PayloadType = p.pt
+				}
+				packets = append(packets, pkt)
+			}
+			jb := NewRTPJitterBuffer(&sliceRTPReader{packets: packets}, 20*time.Millisecond, RTPJitterBufferOptions{
+				ClockRate: tc.clockRate,
+			})
+			t.Cleanup(func() { _ = jb.Close() })
+			jb.start()
+			requireJitterDone(t, jb)
+			require.Equal(t, tc.want, jb.Statistics().PacketDuration)
+		})
+	}
+}
+
+func TestRTPJitterBufferKeepsSenderPace(t *testing.T) {
+	// The sender runs on an exact schedule and the consumer reads all the
+	// time. Playout has to keep the sender's pace, or the queue grows by what
+	// playout falls behind, and a full window drops audio.
+	t.Run("lateReleases", func(t *testing.T) {
+		// Each release happens a little after its tick. A playout clock that
+		// counts the next tick from the release falls behind by that much on
+		// every packet: about 0.4 ms each at a 1 ms tick, and still 0.6 ms at
+		// 20 ms.
+		const n = 1000
+		reader := &chanRTPReader{packets: make(chan rtp.Packet)}
+		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{
+			DelayPackets: 4,
+			MaxPackets:   n,
+		})
+		lag := playTimedJitterStream(t, jb, reader, n, time.Millisecond, 8)
+
+		st := jb.Statistics()
+		require.Equal(t, uint64(n), st.PacketsReleased, "stats %+v", st)
+		require.Less(t, lag, 50*time.Millisecond, "playout fell behind the sender")
+	})
+
+	t.Run("shorterPackets", func(t *testing.T) {
+		// The sender sends 2 ms packets where 4 ms was negotiated. Paced by
+		// 4 ms, playout falls behind by a packet every 4 ms and the window
+		// overflows within a quarter of a second.
+		const n = 500
+		reader := &chanRTPReader{packets: make(chan rtp.Packet)}
+		jb := NewRTPJitterBuffer(reader, 4*time.Millisecond, RTPJitterBufferOptions{
+			DelayPackets: 4,
+			MaxPackets:   64,
+			ClockRate:    8000,
+		})
+		playTimedJitterStream(t, jb, reader, n, 2*time.Millisecond, 16)
+
+		st := jb.Statistics()
+		require.Equal(t, uint64(n), st.PacketsReleased, "stats %+v", st)
+		require.Zero(t, st.PacketsDropped, "stats %+v", st)
+		require.Equal(t, 2*time.Millisecond, st.PacketDuration)
+	})
+}
+
+// playTimedJitterStream sends n packets, one every interval from an exact
+// schedule with timestamps step apart, and reads until the upstream ends. It
+// checks the packets are played in order and returns how long after the last
+// packet was sent it was played.
+func playTimedJitterStream(t *testing.T, jb *RTPJitterBuffer, reader *chanRTPReader, n int, interval time.Duration, step uint32) time.Duration {
+	t.Helper()
+
+	stop := make(chan struct{})
+	senderDone := make(chan struct{})
+	var lastSent atomic.Int64
+	go func() {
+		defer close(senderDone)
+		defer close(reader.packets)
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			time.Sleep(time.Until(start.Add(time.Duration(i) * interval)))
+			pkt := rtpPacket(1234, uint16(i))
+			pkt.Timestamp = uint32(i) * step
+			if i == n-1 {
+				lastSent.Store(time.Now().UnixNano())
+			}
+			select {
+			case reader.packets <- pkt:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		_ = jb.Close()
+		select {
+		case <-senderDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the sender did not stop")
+		}
+		requireJitterDone(t, jb)
+	})
+
+	var lastPlayed time.Time
+	next := uint16(0)
+	for {
+		r := awaitJitterRead(t, jb, readJitterAsync(jb, make([]byte, RTPBufSize)))
+		if errors.Is(r.err, io.EOF) {
+			break
+		}
+		require.NoError(t, r.err)
+		require.GreaterOrEqual(t, r.seq, next, "played out of order")
+		next = r.seq + 1
+		if int(r.seq) == n-1 {
+			lastPlayed = time.Now()
+		}
+	}
+	require.False(t, lastPlayed.IsZero(), "the last packet was never played")
+	return lastPlayed.Sub(time.Unix(0, lastSent.Load()))
 }
 
 func TestRTPJitterBufferRealtimeSimulation(t *testing.T) {

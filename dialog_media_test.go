@@ -323,16 +323,22 @@ func newJitterDialog(t *testing.T) *jitterDialog {
 	return jd
 }
 
-// sendAndRead sends the packet seq to addr and waits for the consumer to read
-// it, so each packet reaches a buffer that has played the one before.
+// sendAndRead sends the packet seq, 20 ms of PCMU, to addr and waits for the
+// consumer to read it, so each packet reaches a buffer that has played the one
+// before.
 func (jd *jitterDialog) sendAndRead(t *testing.T, addr net.UDPAddr, seq uint16) {
+	t.Helper()
+	jd.sendAndReadTimestamp(t, addr, seq, uint32(seq)*160)
+}
+
+func (jd *jitterDialog) sendAndReadTimestamp(t *testing.T, addr net.UDPAddr, seq uint16, timestamp uint32) {
 	t.Helper()
 	raw, err := (&rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    0,
 			SequenceNumber: seq,
-			Timestamp:      uint32(seq) * 160,
+			Timestamp:      timestamp,
 			SSRC:           1234,
 		},
 		Payload: make([]byte, 160),
@@ -405,6 +411,20 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 			jd.sendAndRead(t, ms.Laddr, seq)
 		}
 	})
+}
+
+// TestDialogMediaJitterBufferLearnsPeerPacketDuration pins that the jitter
+// buffer on the audio reader plays the peer's packets at their own duration,
+// which it learns from their RTP timestamps in the clock rate of the negotiated
+// codec. The call negotiated PCMU at 20 ms, and the peer sends 10 ms packets.
+func TestDialogMediaJitterBufferLearnsPeerPacketDuration(t *testing.T) {
+	jd := newJitterDialog(t)
+	require.Equal(t, 20*time.Millisecond, jd.jitter.Statistics().PacketDuration)
+	addr := jd.d.MediaSession().Laddr
+	for seq := uint16(0); seq < 4; seq++ {
+		jd.sendAndReadTimestamp(t, addr, seq, uint32(seq)*80)
+	}
+	require.Equal(t, 10*time.Millisecond, jd.jitter.Statistics().PacketDuration)
 }
 
 // TestDialogMediaJitterBufferSetUpOnce pins that a second jitter buffer is
