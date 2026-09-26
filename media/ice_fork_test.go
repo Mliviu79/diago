@@ -267,3 +267,30 @@ func TestICEForkWithoutEstablishedPairFails(t *testing.T) {
 	require.False(t, errors.Is(err, ErrICERestartUnsupported), "a pair-less fork is not a restart: %v", err)
 	finalizeWithin(t, fork, 5*time.Second)
 }
+
+// TestICEForkNewAssociationNeedsRestart is a re-offer on an established ICE
+// pair, with the credentials unchanged, that asks for a new DTLS association.
+// A new association has to run over candidates the current one did not use
+// (RFC 8842 section 6), which is an ICE restart this session cannot perform, so
+// the offer is refused with ErrICERestartUnsupported. Continuing the old
+// association instead would leave the peer waiting for a handshake, with a
+// certificate that no longer matches its fingerprint.
+func TestICEForkNewAssociationNeedsRestart(t *testing.T) {
+	_, answerer, offer, _ := newEstablishedICEPair(t, nil)
+
+	fp, err := dtlsSHA256Fingerprint(testdata.ServerCertificate())
+	require.NoError(t, err)
+	cases := map[string]string{
+		"PeerFingerprint": strings.Replace(string(offer), sdpLine(t, offer, "a=fingerprint:"), "a=fingerprint:SHA-256 "+fp, 1),
+		"Roles":           strings.Replace(string(offer), "a=setup:actpass", "a=setup:active", 1),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			fork := answerer.Fork()
+			err := remoteSDPNoPanic(fork, []byte(body))
+			requireNoPanic(t, err)
+			require.True(t, errors.Is(err, ErrICERestartUnsupported), "want ErrICERestartUnsupported, got %v", err)
+			finalizeWithin(t, fork, 5*time.Second)
+		})
+	}
+}

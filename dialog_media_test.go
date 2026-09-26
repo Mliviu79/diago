@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -192,7 +193,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{mediaSession: newMediaSessionForTest(t)}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(newReInvite(t, nil), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, nil), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		requireLocalSDP(t, d, tx.res)
 	})
@@ -204,7 +205,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{mediaSession: newMediaSessionForTest(t)}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(newReInvite(t, []byte{}), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, []byte{}), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		requireLocalSDP(t, d, tx.res)
 	})
@@ -216,7 +217,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(newReInvite(t, nil), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, nil), tx, contactHDR))
 		require.Equal(t, sip.StatusRequestTerminated, tx.res.StatusCode)
 	})
 
@@ -226,7 +227,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(newReInvite(t, []byte("v=0\r\n")), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, []byte("v=0\r\n")), tx, contactHDR))
 		require.Equal(t, sip.StatusRequestTerminated, tx.res.StatusCode)
 		require.Contains(t, tx.res.Reason, "no media session present")
 	})
@@ -371,7 +372,7 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 
 		tx := &fakeServerTransaction{}
 		contactHDR := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
-		require.NoError(t, jd.d.handleMediaUpdate(newReInvite(t, jd.offerer.LocalSDP()), tx, contactHDR))
+		require.NoError(t, jd.d.handleMediaUpdate(context.Background(), newReInvite(t, jd.offerer.LocalSDP()), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")
 

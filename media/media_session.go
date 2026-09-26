@@ -263,14 +263,20 @@ type MediaSession struct {
 	rtcpMux        bool
 	remoteICEUfrag string
 	remoteICEPwd   string
-	// establishedICE describes the pair the agent nominated and the DTLS
-	// association built over it. Finalize sets it once SRTP is keyed and Fork
-	// shares it, because a fork has no agent: without this record a
-	// renegotiating fork has nothing to compare the peer's credentials against
-	// and nothing to put in its own SDP. It is never written after it is set,
-	// which is what makes sharing one pointer between a session and its forks
-	// safe.
+	// establishedICE describes the pair the agent nominated. Finalize sets it
+	// once SRTP is keyed over the pair and Fork shares it, because a fork has
+	// no agent: without this record a renegotiating fork has nothing to
+	// compare the peer's credentials against and nothing to put in its own
+	// SDP. It is never written after it is set, which is what makes sharing
+	// one pointer between a session and its forks safe.
 	establishedICE *establishedICE
+	// dtlsAssoc describes the DTLS association the handshake completed: the
+	// role, fingerprints, tls-id and transport it was built with. Finalize sets
+	// it once SRTP is keyed, and Fork shares it together with the SRTP
+	// contexts, so that a renegotiating fork can tell whether the peer
+	// continues the association or asks for a new one (RFC 8842 section 3.1).
+	// Like establishedICE it is never written after it is set.
+	dtlsAssoc *dtlsAssociation
 
 	onFinalize func(ctx context.Context) error
 
@@ -532,13 +538,17 @@ func (s *MediaSession) StartRTP(rw int8) error {
 // Fork is special call to be used in case when there is session update
 // It preserves pointer to same conneciton but rest is removed
 //
+// A fork of a keyed DTLS session carries a read-only record of its DTLS
+// association and the SRTP contexts in use, so it renegotiates over that
+// association instead of running a handshake. RemoteSDP only arms a new
+// handshake when the peer asks for a new association (RFC 8842 section 3.1).
+//
 // An ICE session is forked onto the same transport: the fork shares the ICE
 // mux, and so the nominated pair, but never the agent. Once the pair is
-// established the fork also carries a read-only record of it and the SRTP
-// contexts in use, so it renegotiates over that pair and its DTLS association
-// instead of running checks or a handshake: RemoteSDP accepts the same remote
-// credentials and returns ErrICERestartUnsupported for different ones, and
-// LocalSDP keeps describing the pair.
+// established the fork also carries a read-only record of it, so it
+// renegotiates over that pair instead of running checks: RemoteSDP accepts the
+// same remote credentials and returns ErrICERestartUnsupported for different
+// ones, and LocalSDP keeps describing the pair.
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
 		Laddr:          s.Laddr, // TODO clone it although it is read only
@@ -583,18 +593,20 @@ func (s *MediaSession) Fork() *MediaSession {
 		SRTPAlg:   s.SRTPAlg,
 	}
 
-	// A fork of an established ICE pair continues its DTLS association, so it
-	// keeps the SRTP contexts as well. They are handed over rather than
-	// derived again from the same keying material, because a context is more
-	// than its keys: it holds the rollover counter and highest sequence number
-	// of every stream already in flight (RFC 3711 section 3.3.1). The peer
-	// continues its own contexts, so a fresh one here would put a stream that
-	// had already wrapped its sequence number back at a rollover counter of
-	// zero while the peer's stayed where it was, and that stream would stop
-	// authenticating. The old session stops using them when the dialog swaps
-	// the fork in.
-	if s.establishedICE != nil {
-		cp.establishedICE = s.establishedICE
+	cp.establishedICE = s.establishedICE
+
+	// A fork of a keyed DTLS session continues its DTLS association unless
+	// RemoteSDP finds a new one asked for, so it keeps the SRTP contexts as
+	// well. They are handed over rather than derived again from the same
+	// keying material, because a context is more than its keys: it holds the
+	// rollover counter and highest sequence number of every stream already in
+	// flight (RFC 3711 section 3.3.1). The peer continues its own contexts, so
+	// a fresh one here would put a stream that had already wrapped its
+	// sequence number back at a rollover counter of zero while the peer's
+	// stayed where it was, and that stream would stop authenticating. The old
+	// session stops using them when the dialog swaps the fork in.
+	if s.dtlsAssoc != nil {
+		cp.dtlsAssoc = s.dtlsAssoc
 		cp.localCtxSRTP = s.localCtxSRTP
 		cp.remoteCtxSRTP = s.remoteCtxSRTP
 	}
@@ -739,29 +751,8 @@ func (s *MediaSession) LocalSDP() []byte {
 		// SDPSetupRole override and DTLSRole, both of which it reads.
 		dtlsSet = &dtlsSetup{
 			setup:        s.localDTLSSetup(),
-			fingerprints: make([]sdpFingerprints, len(s.DTLSConf.Certificates)),
+			fingerprints: s.localDTLSFingerprints(),
 		}
-		// DTLS
-		// This is only needed for self signed certificates?
-		// https://datatracker.ietf.org/doc/html/rfc5763#section-2
-		// 	 If Alice uses only self- signed certificates for the communication with Bob, a fingerprint is
-		//    included in the SDP offer/answer exchange.
-		// 		The fingerprint alone protects against active attacks on the media
-		//    but not active attacks on the signaling.  In order to prevent active
-		//    attacks on the signaling, "Enhancements for Authenticated Identity
-		//    Management in the Session Initiation Protocol (SIP)" [RFC4474]
-		for i, cert := range s.DTLSConf.Certificates {
-			fingerprint, err := dtlsSHA256Fingerprint(cert)
-			if err != nil {
-				DefaultLogger().Error("Failed to generate dtls certificate fingerprint", "error", err)
-				continue
-			}
-			dtlsSet.fingerprints[i] = sdpFingerprints{
-				fingerprint: fingerprint,
-				alg:         "SHA-256",
-			}
-		}
-
 	}
 
 	// RFC 3264 section 6: "the answer MUST contain the same [...] transport
@@ -796,9 +787,10 @@ func (s *MediaSession) LocalSDP() []byte {
 	// role afresh from the offer gets this wrong exactly when we were passive,
 	// because the actpass a subsequent offer carries (section 5.5) derives
 	// active. A re-offer of our own keeps actpass from localDTLSSetup, which is
-	// what section 5.5 asks of the offerer.
-	if dtlsSet != nil && s.establishedICE != nil && s.answeringOffer() {
-		dtlsSet.setup = s.establishedICE.dtlsSetup
+	// what section 5.5 asks of the offerer. A session starting a new
+	// association has no record, and takes its role from the offer.
+	if dtlsSet != nil && s.dtlsAssoc != nil && s.answeringOffer() {
+		dtlsSet.setup = s.dtlsAssoc.setup
 	}
 
 	if s.sessionID == 0 {
@@ -1066,10 +1058,18 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	// Check for DTLS
 	if len(s.DTLSConf.Certificates) > 0 || s.SecureRTP == 2 {
 		setup := ""
+		tlsID := ""
 		fingerprints := make([]sdpFingerprints, 0, 1) // at least must be 1
 		for _, v := range attrs {
 			if strings.HasPrefix(v, "setup:") {
 				setup = strings.TrimSpace(v[len("setup:"):])
+				continue
+			}
+
+			// RFC 8842 section 4: the peer changes it to ask for a new DTLS
+			// association.
+			if strings.HasPrefix(v, "tls-id:") {
+				tlsID = strings.TrimSpace(v[len("tls-id:"):])
 				continue
 			}
 
@@ -1115,19 +1115,8 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		// this switch made us the client, so both endpoints sent a ClientHello.
 		s.dtlsRemoteSetup = setup
 
-		// RFC 8842 section 3.1 needs a new DTLS association only when the
-		// roles change, a fingerprint changes, or tls-id asks for one. A
-		// session continuing an established pair is renegotiating codecs or
-		// direction over the association it already has, so it keeps it and
-		// the SRTP keys Fork handed over, and arms no handshake. Arming one
-		// would not even run: the server re-INVITE path never calls Finalize
-		// on the fork, so the media after the re-INVITE would go out and come
-		// in unkeyed with nothing reporting it. The attributes above are still
-		// parsed and validated, and the peer's a=setup is still recorded.
-		if s.establishedICE == nil {
-			if err := s.armDTLSHandshake(setup, fingerprints); err != nil {
-				return err
-			}
+		if err := s.negotiateDTLSAssociation(setup, fingerprints, tlsID); err != nil {
+			return err
 		}
 	}
 
@@ -1144,15 +1133,101 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	return nil
 }
 
+// negotiateDTLSAssociation decides, once RemoteSDP has read the peer's DTLS
+// attributes, whether this session continues the DTLS association it has or
+// needs a new one, and arms the handshake of a new one. setup, fingerprints and
+// tlsID are the peer's a=setup, a=fingerprint and a=tls-id values.
+//
+// A session continuing an association is renegotiating codecs or direction
+// over it: it keeps the association and the SRTP contexts Fork handed over, and
+// arms no handshake. The attributes are still validated by the caller, and the
+// peer's a=setup is still recorded.
+//
+// A new association has to be told apart from the current one, whose media
+// keeps arriving until the peer switches over, and over UDP only the transport
+// can do that (RFC 8842 section 5.1). Under ICE that takes candidates not used
+// by the current association, which is an ICE restart (section 6), so it is
+// refused with ErrICERestartUnsupported. Without ICE a session answering an
+// offer moves to sockets of its own, as section 5.1 has the answerer do,
+// before it arms the handshake. A session applying an answer to its own offer
+// can no longer move, since the peer is already sending to the transport in
+// that offer; it arms the handshake only if the offer was made from sockets of
+// its own, and otherwise refuses the answer.
+func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []sdpFingerprints, tlsID string) error {
+	assoc := s.dtlsAssoc
+	if assoc == nil {
+		return s.armDTLSHandshake(setup, fingerprints, tlsID)
+	}
+
+	reason := assoc.changedBy(s, setup, fingerprints, tlsID)
+	if reason == "" {
+		return nil
+	}
+
+	if s.iceEnabled() {
+		return fmt.Errorf("sdp: %s asks for a new DTLS association, which needs an ICE restart: %w", reason, ErrICERestartUnsupported)
+	}
+
+	rebound := false
+	if sameUDPAddr(s.Laddr, assoc.laddr) {
+		// Still on the sockets of the session this one was forked from, whose
+		// media runs on them and whose reader would take the handshake's
+		// packets.
+		if s.RemoteSDPIsAnswer {
+			return fmt.Errorf("sdp: %s asks for a new DTLS association over the transport of the current one", reason)
+		}
+		// Dropped first, so that a failed bind cannot leave this session
+		// holding sockets it does not own.
+		s.rtpConn, s.rtcpConn = nil, nil
+		laddr := net.UDPAddr{IP: s.Laddr.IP, Zone: s.Laddr.Zone}
+		if err := s.createListeners(&laddr); err != nil {
+			return fmt.Errorf("media session: new DTLS association: %w", err)
+		}
+		rebound = true
+	}
+
+	DefaultLogger().Debug("Starting a new DTLS association", "reason", reason, "laddr", s.Laddr.String())
+	// The keys of the current association are not the new one's. The fork
+	// runs on neither until its handshake has keyed it.
+	s.dtlsAssoc = nil
+	s.localCtxSRTP = nil
+	s.remoteCtxSRTP = nil
+	if err := s.armDTLSHandshake(setup, fingerprints, tlsID); err != nil {
+		if rebound {
+			// Nothing but this session refers to the sockets just bound, and
+			// a session RemoteSDP refused is not installed.
+			_ = s.Close()
+		}
+		return err
+	}
+	return nil
+}
+
 // armDTLSHandshake prepares the DTLS association RemoteSDP negotiated and arms
 // Finalize to run the handshake and key SRTP from it. setup is the peer's
-// a=setup value and fingerprints are the certificate fingerprints it sent.
-func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerprints) error {
+// a=setup value, and fingerprints and tlsID are the certificate fingerprints
+// and the tls-id it sent.
+func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerprints, tlsID string) error {
 	// THIS may need external or after SIP ACK establishment
 	dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
 	role := "server"
 	if s.dtlsActsAsClient() {
 		role = "client"
+	}
+
+	// What a later offer or answer is compared against. The transport is the
+	// one signalled in the SDP, before ICE may replace the remote address with
+	// the nominated one.
+	assoc := &dtlsAssociation{
+		setup:              dtlsSetupPassive,
+		localFingerprints:  fingerprintSet(s.localDTLSFingerprints()),
+		remoteFingerprints: fingerprintSet(fingerprints),
+		remoteTLSID:        tlsID,
+		laddr:              s.Laddr,
+		raddr:              s.Raddr,
+	}
+	if role == "client" {
+		assoc.setup = dtlsSetupActive
 	}
 
 	// dialDTLS builds the DTLS conn over the media transport.
@@ -1257,20 +1332,16 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 		}
 
 		// Recorded only now, with the handshake done and both directions
-		// keyed: a fork that finds this record continues the pair without
-		// checks or a handshake of its own, so it must never see a pair that
-		// is not yet usable.
+		// keyed: a fork that finds these records continues the association,
+		// and the pair, without a handshake or checks of its own, so it must
+		// never see one that is not yet usable.
+		s.dtlsAssoc = assoc
 		if s.iceEnabled() {
-			established := &establishedICE{
+			s.establishedICE = &establishedICE{
 				local:       s.agentICESetup(),
 				remoteUfrag: s.remoteICEUfrag,
 				remotePwd:   s.remoteICEPwd,
-				dtlsSetup:   dtlsSetupPassive,
 			}
-			if role == "client" {
-				established.dtlsSetup = dtlsSetupActive
-			}
-			s.establishedICE = established
 		}
 
 		DefaultLogger().Debug("DTLS SRTP setuped")
@@ -1456,6 +1527,41 @@ func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// FinalizePending reports whether FinalizeContext has negotiation left to run:
+// the ICE connectivity checks and the DTLS handshake of a new session, or the
+// handshake of a new DTLS association that RemoteSDP found a renegotiation
+// asks for. A fork continuing its association has none, and is keyed already.
+func (s *MediaSession) FinalizePending() bool {
+	return s.onFinalize != nil
+}
+
+// localDTLSFingerprints returns the a=fingerprint values of our certificates,
+// which LocalSDP advertises and a DTLS association records.
+func (s *MediaSession) localDTLSFingerprints() []sdpFingerprints {
+	// DTLS
+	// This is only needed for self signed certificates?
+	// https://datatracker.ietf.org/doc/html/rfc5763#section-2
+	// 	 If Alice uses only self- signed certificates for the communication with Bob, a fingerprint is
+	//    included in the SDP offer/answer exchange.
+	// 		The fingerprint alone protects against active attacks on the media
+	//    but not active attacks on the signaling.  In order to prevent active
+	//    attacks on the signaling, "Enhancements for Authenticated Identity
+	//    Management in the Session Initiation Protocol (SIP)" [RFC4474]
+	fingerprints := make([]sdpFingerprints, len(s.DTLSConf.Certificates))
+	for i, cert := range s.DTLSConf.Certificates {
+		fingerprint, err := dtlsSHA256Fingerprint(cert)
+		if err != nil {
+			DefaultLogger().Error("Failed to generate dtls certificate fingerprint", "error", err)
+			continue
+		}
+		fingerprints[i] = sdpFingerprints{
+			fingerprint: fingerprint,
+			alg:         "SHA-256",
+		}
+	}
+	return fingerprints
 }
 
 // codecMatch reports whether local and remote describe the same audio format.
@@ -2028,7 +2134,8 @@ type iceSetup struct {
 }
 
 // establishedICE is what a session knows about the ICE pair its agent
-// nominated and the DTLS association built over it, and nothing more. It
+// nominated, and nothing more. The DTLS association built over it is
+// dtlsAssociation. It
 // deliberately never refers to the agent: the agent belongs to the session that
 // created it, and a fork that could reach it could also restart or close it
 // under the session whose media still runs on the pair.
@@ -2040,9 +2147,94 @@ type establishedICE struct {
 	// with. A renegotiation carrying anything else asks for an ICE restart.
 	remoteUfrag string
 	remotePwd   string
-	// dtlsSetup is the a=setup role the association was actually built with,
+}
+
+// dtlsAssociation is what a session knows about the DTLS association its
+// handshake completed: what RFC 8842 section 3.1 and section 4 compare a later
+// offer or answer against to decide whether it continues the association.
+type dtlsAssociation struct {
+	// setup is the a=setup role the association was actually built with,
 	// dtlsSetupActive or dtlsSetupPassive, never actpass.
-	dtlsSetup string
+	setup string
+	// localFingerprints and remoteFingerprints are the fingerprint sets each
+	// side advertised, as fingerprintSet renders them.
+	localFingerprints  []string
+	remoteFingerprints []string
+	// remoteTLSID is the peer's a=tls-id, empty when it sent none.
+	remoteTLSID string
+	// laddr and raddr are the transport addresses the association was
+	// signalled over.
+	laddr net.UDPAddr
+	raddr net.UDPAddr
+}
+
+// changedBy returns why the DTLS attributes RemoteSDP just read on s ask for a
+// new association, or "" when they continue this one.
+//
+// RFC 8842 section 3.1 asks for a new association when the roles change, a
+// fingerprint is modified, added or removed, or the tls-id changes. A peer
+// sending no tls-id asks for one by changing its transport instead (section
+// 4), and so do we when we move to a new local address, because we send no
+// tls-id. Under ICE the candidates carry the transport, and switching between
+// them is not a change (section 6).
+func (a *dtlsAssociation) changedBy(s *MediaSession, setup string, fingerprints []sdpFingerprints, tlsID string) string {
+	if role := dtlsRoleAgainst(setup); role != "" && role != a.setup {
+		return "a change of DTLS roles"
+	}
+	if !slices.Equal(fingerprintSet(fingerprints), a.remoteFingerprints) {
+		return "a change of the peer's fingerprints"
+	}
+	if !slices.Equal(fingerprintSet(s.localDTLSFingerprints()), a.localFingerprints) {
+		return "a change of our fingerprints"
+	}
+	if tlsID != "" && tlsID != a.remoteTLSID {
+		return "a new tls-id"
+	}
+	if s.iceEnabled() {
+		return ""
+	}
+	if !sameUDPAddr(s.Laddr, a.laddr) {
+		return "a change of our transport"
+	}
+	if tlsID == "" && !sameUDPAddr(s.Raddr, a.raddr) {
+		return "a change of the peer's transport"
+	}
+	return ""
+}
+
+// dtlsRoleAgainst returns the a=setup role this endpoint plays against the
+// peer's setup value, or "" when the peer leaves the choice to us. A peer
+// offering actpass on a session that has an association gets the role we
+// have, as RFC 8842 section 5.3 has the answerer keep it.
+func dtlsRoleAgainst(setup string) string {
+	switch strings.ToLower(strings.TrimSpace(setup)) {
+	case dtlsSetupActive:
+		return dtlsSetupPassive
+	case dtlsSetupPassive:
+		return dtlsSetupActive
+	}
+	return ""
+}
+
+// fingerprintSet renders fingerprints as a sorted set that compares equal for
+// the same certificates however the SDP spelled them: hash function names and
+// hex digits are case insensitive (RFC 8122 section 5), and the order of the
+// attributes carries no meaning.
+func fingerprintSet(fingerprints []sdpFingerprints) []string {
+	set := make([]string, 0, len(fingerprints))
+	for _, fp := range fingerprints {
+		if fp.fingerprint == "" {
+			continue
+		}
+		set = append(set, strings.ToLower(fp.alg)+" "+strings.ToUpper(fp.fingerprint))
+	}
+	slices.Sort(set)
+	return slices.Compact(set)
+}
+
+// sameUDPAddr reports whether a and b are the same IP, port and zone.
+func sameUDPAddr(a, b net.UDPAddr) bool {
+	return a.IP.Equal(b.IP) && a.Port == b.Port && a.Zone == b.Zone
 }
 
 // formatRTPMap renders the a=rtpmap line describing codec, followed by its

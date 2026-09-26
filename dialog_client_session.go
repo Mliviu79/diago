@@ -544,7 +544,7 @@ func (d *DialogClientSession) reInviteMediaSession(ctx context.Context, ms *medi
 	}
 
 	// Save new remote target contact and update media
-	return func() error {
+	err = func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.remoteContactTarget = res.Contact()
@@ -556,8 +556,20 @@ func (d *DialogClientSession) reInviteMediaSession(ctx context.Context, ms *medi
 			return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 		}
 
+		// The answer completes a new DTLS association, whose handshake runs
+		// before ms carries any media.
+		if ms.FinalizePending() {
+			if err := d.finalizeAndReplaceUnsafe(d.Context(), ms); err != nil {
+				return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
+			}
+			return nil
+		}
 		return d.mediaUpdateUnsafe(ms)
 	}()
+	if errors.Is(err, errMediaUpdateAfterAnswer) {
+		return errors.Join(err, d.hangupNoMedia())
+	}
+	return err
 }
 
 // reInvites withs empty SDP are way to keep alive or do some post media update after receiving offer on 2xx
@@ -670,7 +682,24 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
 	}
 
-	return d.handleMediaUpdate(req, tx, d.InviteRequest.Contact())
+	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteRequest.Contact()); err != nil {
+		if errors.Is(err, errMediaUpdateAfterAnswer) {
+			return errors.Join(err, d.hangupNoMedia())
+		}
+		return err
+	}
+	return nil
+}
+
+// hangupNoMedia ends a call that a failed media update left without media.
+// The offer/answer exchange was complete by then, so the peer has moved to the
+// new session. When that was a new DTLS association whose handshake failed,
+// RFC 5763 section 5 has the media session torn down at once, and with a single
+// audio stream that is the call.
+func (d *DialogClientSession) hangupNoMedia() error {
+	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
+	defer cancel()
+	return d.Hangup(ctx)
 }
 
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {

@@ -29,6 +29,11 @@ var (
 	}
 
 	errNoRTPSession = errors.New("no rtp session")
+
+	// errMediaUpdateAfterAnswer marks a media update that failed after its
+	// answer was sent. The peer has moved to the new session by then, so the
+	// call has no media left.
+	errMediaUpdateAfterAnswer = errors.New("media update failed after its answer")
 )
 
 // jitterBufferStopTimeout bounds how long Close waits for a jitter buffer's
@@ -117,6 +122,11 @@ type DialogMedia struct {
 
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
+
+	// mediaUpdating is set while a media update waits, with mu released, for
+	// the handshake of a new DTLS association. Another update is kept out
+	// until it is done.
+	mediaUpdating bool
 
 	closed bool
 }
@@ -500,7 +510,12 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 	return d.mediaSession
 }
 
-func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
+// handleMediaUpdate answers an in-dialog INVITE and applies its offer, if it
+// has one, to a fork of the media session. ctx is the dialog's: it bounds a
+// DTLS handshake the offer asks for. An error wrapping
+// errMediaUpdateAfterAnswer means the update failed after the 2xx was sent,
+// and the caller ends the call.
+func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	// A BYE handled while this request was pending has closed the media. The
@@ -509,6 +524,12 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 	if d.closed {
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
 	}
+	// The previous update is still running the handshake of a new DTLS
+	// association. RFC 3261 section 14.2 lets a request that cannot be taken
+	// now be retried after a 491.
+	if d.mediaUpdating {
+		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+	}
 	d.remoteContactTarget = req.Contact().Clone()
 
 	// When body is not present this can mean client is doing keep alive
@@ -516,11 +537,20 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 	// Content-Length: 0 can reach us as an empty but non nil body, so length is
 	// checked rather than nilness.
 	if len(req.Body()) > 0 {
-		if err := d.sdpReInviteUnsafe(req.Body()); err != nil {
-			// The offer is well formed but asks for an ICE restart, which this
-			// session cannot perform. The fork was never installed, so the call
-			// carries on over its current pair. The reason phrase is fixed and
-			// carries no error text, so nothing internal reaches the peer.
+		msess, err := d.sdpReInviteUnsafe(req.Body())
+		if err == nil && msess.FinalizePending() {
+			return d.answerNewAssociationUnsafe(ctx, req, tx, contactHDR, msess)
+		}
+		if err == nil {
+			err = d.replaceRTPSessionUnsafe(msess)
+		}
+		if err != nil {
+			// The offer is well formed but needs an ICE restart, to restart ICE
+			// or to run a new DTLS association over it (RFC 8842 section 6),
+			// which this session cannot perform. The fork was never installed,
+			// so the call carries on over its current pair. The reason phrase
+			// is fixed and carries no error text, so nothing internal reaches
+			// the peer.
 			if errors.Is(err, media.ErrICERestartUnsupported) {
 				return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
 			}
@@ -548,18 +578,78 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 	return tx.Respond(res)
 }
 
+// answerNewAssociationUnsafe answers a re-INVITE whose offer msess found to ask
+// for a new DTLS association, runs the handshake, and only then installs
+// msess. The handshake needs the answer, which tells the peer where msess is
+// and which certificate it presents (RFC 8842 section 5.3), and msess has no
+// SRTP keys until it completes, so the current session carries the media
+// meanwhile.
+func (d *DialogMedia) answerNewAssociationUnsafe(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", msess.LocalSDP())
+	res.AppendHeader(contactHDR)
+	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	if err := tx.Respond(res); err != nil {
+		return errors.Join(err, d.discardForkUnsafe(msess))
+	}
+
+	if err := d.finalizeAndReplaceUnsafe(ctx, msess); err != nil {
+		return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
+	}
+
+	if d.onMediaUpdate != nil {
+		d.mu.Unlock()
+		d.onMediaUpdate(d)
+		d.mu.Lock()
+	}
+	return nil
+}
+
+// finalizeAndReplaceUnsafe runs the negotiation msess has pending and then
+// installs it. d.mu is released while the negotiation waits for the peer, and
+// mediaUpdating keeps other media updates out meanwhile. When it fails, or the
+// dialog media is closed meanwhile, msess is not installed and is discarded.
+func (d *DialogMedia) finalizeAndReplaceUnsafe(ctx context.Context, msess *media.MediaSession) error {
+	d.mediaUpdating = true
+	d.mu.Unlock()
+	err := msess.FinalizeContext(ctx)
+	d.mu.Lock()
+	d.mediaUpdating = false
+
+	if err == nil && d.closed {
+		err = fmt.Errorf("media closed during the media update")
+	}
+	if err != nil {
+		return errors.Join(err, d.discardForkUnsafe(msess))
+	}
+	return d.replaceRTPSessionUnsafe(msess)
+}
+
+// discardForkUnsafe closes a fork that is not going to be installed, if it was
+// moved to sockets of its own. A fork on the sockets of the installed session
+// is only dropped, since closing it would close them.
+func (d *DialogMedia) discardForkUnsafe(msess *media.MediaSession) error {
+	cur := d.mediaSession
+	if cur != nil && cur.Laddr.IP.Equal(msess.Laddr.IP) && cur.Laddr.Port == msess.Laddr.Port {
+		return nil
+	}
+	return msess.Close()
+}
+
+// sdpReInviteUnsafe applies the offer of an inbound re-INVITE to a fork of the
+// media session, and returns the fork without installing it.
 // Must be protected with lock
-func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
+func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) (*media.MediaSession, error) {
 	if d.mediaSession == nil {
-		return fmt.Errorf("no media session present")
+		return nil, fmt.Errorf("no media session present")
 	}
 
 	// An inbound re-INVITE carries an offer, whichever side of the dialog we are.
 	d.mediaSession.RemoteSDPIsAnswer = false
-	if err := d.sdpUpdateUnsafe(sdp); err != nil {
-		return err
+	msess := d.mediaSession.Fork()
+	if err := msess.RemoteSDP(sdp); err != nil {
+		return nil, fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 	}
-	return nil
+	return msess, nil
 }
 
 func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {

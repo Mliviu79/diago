@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -124,7 +125,7 @@ func handleMediaUpdateNoPanic(d *DialogMedia, req *sip.Request, tx sip.ServerTra
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
-	return d.handleMediaUpdate(req, tx, contact)
+	return d.handleMediaUpdate(context.Background(), req, tx, contact)
 }
 
 // checkEarlyMediaNoPanic is handleMediaUpdateNoPanic for the early media path.

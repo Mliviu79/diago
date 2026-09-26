@@ -672,7 +672,7 @@ func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *medi
 	}
 
 	// Save new remote target contact and update media
-	return func() error {
+	err = func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.remoteContactTarget = res.Contact()
@@ -683,8 +683,21 @@ func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *medi
 		if err := ms.RemoteSDP(remoteSDP); err != nil {
 			return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 		}
+
+		// The answer completes a new DTLS association, whose handshake runs
+		// before ms carries any media.
+		if ms.FinalizePending() {
+			if err := d.finalizeAndReplaceUnsafe(d.Context(), ms); err != nil {
+				return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
+			}
+			return nil
+		}
 		return d.mediaUpdateUnsafe(ms)
 	}()
+	if errors.Is(err, errMediaUpdateAfterAnswer) {
+		return errors.Join(err, d.hangupNoMedia())
+	}
+	return err
 }
 
 func (d *DialogServerSession) reInviteDo(ctx context.Context, req *sip.Request) (*sip.Response, error) {
@@ -895,7 +908,24 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	// re-INVITE carries no Session-Expires and is a no-op here.
 	d.resetSessionTimerOnRefresh(req)
 
-	return d.handleMediaUpdate(req, tx, d.InviteResponse.Contact())
+	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteResponse.Contact()); err != nil {
+		if errors.Is(err, errMediaUpdateAfterAnswer) {
+			return errors.Join(err, d.hangupNoMedia())
+		}
+		return err
+	}
+	return nil
+}
+
+// hangupNoMedia ends a call that a failed media update left without media.
+// The offer/answer exchange was complete by then, so the peer has moved to the
+// new session. When that was a new DTLS association whose handshake failed,
+// RFC 5763 section 5 has the media session torn down at once, and with a single
+// audio stream that is the call.
+func (d *DialogServerSession) hangupNoMedia() error {
+	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
+	defer cancel()
+	return d.Hangup(ctx)
 }
 
 // resetSessionTimerOnRefresh rearms the peer-refresh watchdog when req is an RFC
