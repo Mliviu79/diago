@@ -73,6 +73,11 @@ type DialogMedia struct {
 	// Use this only as read only
 	RTPPacketWriter *media.RTPPacketWriter
 
+	// jitterBuffer is the buffer WithAudioReaderJitterBuffer put between the
+	// RTP session and RTPPacketReader, nil without one. A media update moves it
+	// onto the new RTP session rather than taking it off the packet reader.
+	jitterBuffer *media.RTPJitterBuffer
+
 	// In case we are chaining audio readers
 	audioReader io.Reader
 	audioWriter io.Writer
@@ -582,8 +587,15 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 		return errors.Join(err, rtpSess.Close())
 	}
 
-	// Make sure any current reader is not consuming old media session.
-	d.RTPPacketReader.UpdateRTPSession(rtpSess)
+	// Make sure any current reader is not consuming old media session. A
+	// jitter buffer stays in front of the packet reader and reads the new
+	// session itself, so its queue and playout carry over and no read loop is
+	// left on the old session.
+	if d.jitterBuffer != nil {
+		d.jitterBuffer.UpdateRTPSession(rtpSess)
+	} else {
+		d.RTPPacketReader.UpdateRTPSession(rtpSess)
+	}
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
 
 	old := d.mediaSession
@@ -630,10 +642,15 @@ func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 
 // WithAudioReaderJitterBuffer inserts an RTP jitter buffer before the payload reader.
 // Packet duration is derived from the negotiated audio codec.
+// The buffer stays in place across media updates, reading each new RTP session.
+// A dialog has at most one; asking for a second is an error.
 func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderOption {
 	return func(d *DialogMedia) error {
 		if d.mediaSession == nil || d.RTPPacketReader == nil {
 			return fmt.Errorf("no media setup")
+		}
+		if d.jitterBuffer != nil {
+			return fmt.Errorf("jitter buffer already set up")
 		}
 
 		codec := media.CodecAudioFromSession(d.mediaSession)
@@ -648,6 +665,7 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 
 		jitter := media.NewRTPJitterBuffer(reader, codec.SampleDur, opts)
 		d.RTPPacketReader.UpdateReader(jitter)
+		d.jitterBuffer = jitter
 
 		d.onCloseUnsafe(jitter.Close)
 		return nil

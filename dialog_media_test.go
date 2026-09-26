@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -227,4 +229,182 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		require.Equal(t, sip.StatusRequestTerminated, tx.res.StatusCode)
 		require.Contains(t, tx.res.Reason, "no media session present")
 	})
+}
+
+// jitterDialog is a dialog's media answered over loopback the way an answer
+// sets it up, with a jitter buffer on its audio reader, a consumer reading
+// that reader, and a peer socket sending it RTP.
+type jitterDialog struct {
+	d      *DialogMedia
+	jitter *media.RTPJitterBuffer
+	// offerer made the offer the media answered, and its SDP is what a
+	// re-INVITE from the peer carries again.
+	offerer *media.MediaSession
+	peer    *net.UDPConn
+	// reads carries the sequence number of every packet the consumer read, and
+	// the error that ended it.
+	reads chan jitterDialogRead
+}
+
+type jitterDialogRead struct {
+	seq uint16
+	err error
+}
+
+func newJitterDialog(t *testing.T) *jitterDialog {
+	t.Helper()
+	ours := newMediaSessionForTest(t)
+	offerer := newMediaSessionForTest(t)
+	require.NoError(t, ours.RemoteSDP(offerer.LocalSDP()))
+
+	rtpSess := media.NewRTPSession(ours)
+	d := &DialogMedia{}
+	d.initRTPSessionUnsafe(ours, rtpSess)
+	d.onCloseUnsafe(rtpSess.Close)
+	require.NoError(t, rtpSess.MonitorBackground())
+
+	ar, err := d.AudioReader(WithAudioReaderJitterBuffer(media.RTPJitterBufferOptions{
+		DelayPackets: 1,
+		MaxPackets:   4,
+	}))
+	require.NoError(t, err)
+	jitter, ok := d.RTPPacketReader.Reader().(*media.RTPJitterBuffer)
+	require.True(t, ok, "the audio reader reads no jitter buffer")
+
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+
+	jd := &jitterDialog{
+		d:       d,
+		jitter:  jitter,
+		offerer: offerer,
+		peer:    peer,
+		reads:   make(chan jitterDialogRead, 1),
+	}
+	stop := make(chan struct{})
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		buf := make([]byte, media.RTPBufSize)
+		for {
+			var r jitterDialogRead
+			if _, r.err = ar.Read(buf); r.err == nil {
+				r.seq = d.RTPPacketReader.PacketHeader.SequenceNumber
+			}
+			select {
+			case jd.reads <- r:
+			case <-stop:
+				return
+			}
+			if r.err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		_ = d.Close()
+		select {
+		case <-consumerDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the audio reader did not return after Close")
+		}
+	})
+	return jd
+}
+
+// sendAndRead sends the packet seq to addr and waits for the consumer to read
+// it, so each packet reaches a buffer that has played the one before.
+func (jd *jitterDialog) sendAndRead(t *testing.T, addr net.UDPAddr, seq uint16) {
+	t.Helper()
+	raw, err := (&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    0,
+			SequenceNumber: seq,
+			Timestamp:      uint32(seq) * 160,
+			SSRC:           1234,
+		},
+		Payload: make([]byte, 160),
+	}).Marshal()
+	require.NoError(t, err)
+	_, err = jd.peer.WriteToUDP(raw, &addr)
+	require.NoError(t, err)
+
+	select {
+	case r := <-jd.reads:
+		require.NoError(t, r.err, "reading packet %d", seq)
+		require.Equal(t, seq, r.seq)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("packet %d was never read", seq)
+	}
+}
+
+// TestDialogMediaJitterBufferFollowsReinvite pins that a jitter buffer on the
+// audio reader keeps playing the call after a re-INVITE, reading the session
+// the re-INVITE installs, with nothing left reading the one it replaced. A
+// re-INVITE that only renegotiates forks the session onto the same socket, and
+// one that moves our media rebinds it and closes the old socket.
+func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
+	t.Run("SameSocket", func(t *testing.T) {
+		jd := newJitterDialog(t)
+		addr := jd.d.MediaSession().Laddr
+		for seq := uint16(0); seq < 10; seq++ {
+			jd.sendAndRead(t, addr, seq)
+		}
+
+		tx := &fakeServerTransaction{}
+		contactHDR := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
+		require.NoError(t, jd.d.handleMediaUpdate(newReInvite(t, jd.offerer.LocalSDP()), tx, contactHDR))
+		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
+		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")
+
+		// The fork reads the socket the peer already sends to. A read loop
+		// left on the replaced session would take every other packet from it.
+		for seq := uint16(10); seq < 50; seq++ {
+			jd.sendAndRead(t, addr, seq)
+		}
+	})
+
+	t.Run("NewSocket", func(t *testing.T) {
+		jd := newJitterDialog(t)
+		for seq := uint16(0); seq < 10; seq++ {
+			jd.sendAndRead(t, jd.d.MediaSession().Laddr, seq)
+		}
+
+		// Our own re-INVITE moves the media to a new socket, as
+		// reInviteMediaSession does.
+		ms := jd.d.MediaSession().Fork()
+		ms.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+		require.NoError(t, ms.Init())
+		t.Cleanup(func() { _ = ms.Close() })
+		answerer := newMediaSessionForTest(t)
+		require.NoError(t, answerer.RemoteSDP(ms.LocalSDP()))
+		ms.RemoteSDPIsAnswer = true
+		require.NoError(t, ms.RemoteSDP(answerer.LocalSDP()))
+
+		jd.d.mu.Lock()
+		err := jd.d.mediaUpdateUnsafe(ms)
+		jd.d.mu.Unlock()
+		require.NoError(t, err)
+		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")
+
+		// The replaced session is closed under the read loop's read, which
+		// must continue on the new socket rather than end the stream.
+		for seq := uint16(10); seq < 50; seq++ {
+			jd.sendAndRead(t, ms.Laddr, seq)
+		}
+	})
+}
+
+// TestDialogMediaJitterBufferSetUpOnce pins that a second jitter buffer is
+// refused. Stacked on the first it would read it, and a media update, which
+// moves only the buffer reading the RTP session, would leave a read loop
+// behind.
+func TestDialogMediaJitterBufferSetUpOnce(t *testing.T) {
+	jd := newJitterDialog(t)
+	_, err := jd.d.AudioReader(WithAudioReaderJitterBuffer(media.RTPJitterBufferOptions{}))
+	require.Error(t, err)
+	require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the first jitter buffer was replaced")
 }

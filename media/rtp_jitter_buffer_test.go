@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/fakes"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -370,6 +371,37 @@ func TestRTPJitterBufferDone(t *testing.T) {
 			close(reader.packets)
 		}
 	})
+
+	t.Run("noReadOnReplacedReaderAfterClose", func(t *testing.T) {
+		// The read loop is blocked on the first reader when UpdateRTPSession
+		// replaces it and Close follows. The first read then fails, which
+		// would otherwise move the loop onto the new session.
+		first := newClosedRTPReader()
+		jb := NewRTPJitterBuffer(first, time.Millisecond, RTPJitterBufferOptions{})
+		jb.start()
+		waitReadStarted(t, first)
+
+		next := &startSignalReader{started: make(chan struct{}, 1)}
+		sess := &MediaSession{Codecs: []Codec{CodecAudioUlaw}}
+		sess.rtpConn = &fakes.UDPConn{Reader: next}
+		jb.UpdateRTPSession(NewRTPSession(sess))
+		require.NoError(t, jb.Close())
+		close(first.closed)
+
+		requireJitterDone(t, jb)
+		require.Empty(t, next.started, "the read loop read the new session after Close")
+	})
+}
+
+// startSignalReader reports on started each read that begins, and blocks it
+// for good.
+type startSignalReader struct {
+	started chan struct{}
+}
+
+func (r *startSignalReader) Read([]byte) (int, error) {
+	r.started <- struct{}{}
+	select {}
 }
 
 func TestRTPJitterBufferResumesAfterPause(t *testing.T) {

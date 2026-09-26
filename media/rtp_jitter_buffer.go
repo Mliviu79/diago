@@ -84,11 +84,14 @@ type rtpJitterInput struct {
 // direction, arriving with nothing queued, starts the stream again, as from a
 // sender that restarted its sequence numbers.
 type RTPJitterBuffer struct {
+	// mu guards reader and packetDuration, which UpdateRTPSession changes while
+	// the read loop and ReadRTP use them.
+	mu sync.Mutex
 	// reader is the upstream network-facing RTP source.
 	reader RTPReader
-
 	// packetDuration controls the interval between playout decisions.
 	packetDuration time.Duration
+
 	// delayPackets is the number of queued packets required to start playout early.
 	delayPackets int
 	// maxPackets is both the queue capacity and accepted forward sequence window.
@@ -371,7 +374,7 @@ func (j *RTPJitterBuffer) readLoop() {
 		}
 
 		slot := &j.slots[slotIndex]
-		n, err := j.reader.ReadRTP(slot.raw, &slot.packet)
+		n, err := j.readUpstream(slot)
 		if err != nil {
 			j.sendInput(rtpJitterInput{err: err})
 			return
@@ -388,6 +391,60 @@ func (j *RTPJitterBuffer) readLoop() {
 		if !j.sendInput(rtpJitterInput{slot: slotIndex}) {
 			return
 		}
+	}
+}
+
+// readUpstream reads one packet into slot. A read that fails on a reader
+// replaced meanwhile, typically because UpdateRTPSession moved the buffer off a
+// session that was then closed under the read, continues on the reader in
+// place. Replacements can follow each other while a read is blocked, so this
+// repeats until a read succeeds, fails on the reader still in place, or fails
+// after Close.
+func (j *RTPJitterBuffer) readUpstream(slot *rtpJitterSlot) (int, error) {
+	reader := j.upstream()
+	for {
+		n, err := reader.ReadRTP(slot.raw, &slot.packet)
+		if err == nil {
+			return n, nil
+		}
+		next := j.upstream()
+		if next == reader {
+			return n, err
+		}
+		select {
+		case <-j.done:
+			return n, err
+		default:
+		}
+		reader = next
+	}
+}
+
+func (j *RTPJitterBuffer) upstream() RTPReader {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.reader
+}
+
+func (j *RTPJitterBuffer) duration() time.Duration {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.packetDuration
+}
+
+// UpdateRTPSession moves the buffer onto rtpSess, the session a media update
+// installed in place of the one it reads, and paces playout by the packet
+// duration of its negotiated audio codec. What is queued and the playout state
+// carry over. A read the read loop has in progress on the previous reader
+// finishes there, or, if it fails, for example because the previous session
+// was closed, continues on rtpSess.
+func (j *RTPJitterBuffer) UpdateRTPSession(rtpSess *RTPSession) {
+	packetDuration := CodecAudioFromSession(rtpSess.Sess).SampleDur
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.reader = rtpSess
+	if packetDuration > 0 {
+		j.packetDuration = packetDuration
 	}
 }
 
@@ -462,7 +519,7 @@ func (j *RTPJitterBuffer) handleSlot(slotIndex int) {
 	j.queued++
 	if j.resync && j.queued == 1 {
 		// The stream resumed, so buffer again as at its start.
-		j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.packetDuration)
+		j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.duration())
 	}
 }
 
@@ -490,7 +547,7 @@ func (j *RTPJitterBuffer) resetStream(ssrc uint32, seq uint16) {
 	j.startNow = false
 	j.resync = false
 	j.stopAndDrainTimer(j.playoutTimer)
-	j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.packetDuration)
+	j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.duration())
 }
 
 func (j *RTPJitterBuffer) clearSequence() {
@@ -533,7 +590,7 @@ func (j *RTPJitterBuffer) stopPlayout() {
 }
 
 func (j *RTPJitterBuffer) resetPlayoutTimer() {
-	j.resetTimer(j.playoutTimer, j.packetDuration)
+	j.resetTimer(j.playoutTimer, j.duration())
 }
 
 func (j *RTPJitterBuffer) resetTimer(timer *time.Timer, duration time.Duration) {
@@ -609,14 +666,15 @@ func (j *RTPJitterBuffer) debugArrival(slot *rtpJitterSlot) {
 	}
 
 	now := time.Now()
+	packetDuration := j.duration()
 	if j.lastArrivalSet {
 		arrivalDelta := now.Sub(j.lastArrivalTime)
-		if arrivalDelta > j.packetDuration+j.packetDuration/2 {
+		if arrivalDelta > packetDuration+packetDuration/2 {
 			jitterDebugf("event=delayed_arrival seq=%d prev_seq=%d arrival_delta=%s packet_duration=%s",
 				slot.seq,
 				j.lastArrivalSeq,
 				arrivalDelta,
-				j.packetDuration,
+				packetDuration,
 			)
 		}
 
