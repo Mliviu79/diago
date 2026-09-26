@@ -258,6 +258,16 @@ type MediaSession struct {
 	// value or they can contradict each other.
 	dtlsRemoteSetup string
 
+	// localTLSID is our a=tls-id value (RFC 8842 section 4) for the DTLS
+	// association this session runs or negotiates, empty when that
+	// association has none of ours. A new association gets a new value, and
+	// Fork carries it with the association.
+	localTLSID string
+	// dtlsRemoteTLSID is the a=tls-id of the SDP RemoteSDP applied, empty when
+	// it had none. An answer carries a tls-id only when the offer does (RFC
+	// 8842 section 5.3).
+	dtlsRemoteTLSID string
+
 	// DTLS
 	dtlsConn *dtls.Conn
 	// dtlsTr is the transport dtlsConn was built on. It is held so the handshake
@@ -632,6 +642,9 @@ func (s *MediaSession) Fork() *MediaSession {
 		// owns. Fork is called inside the re-negotiation path, where the fork
 		// itself is not reachable to configure.
 		RemoteSDPIsAnswer: s.RemoteSDPIsAnswer,
+		// Our tls-id belongs to the association, which the fork continues
+		// unless RemoteSDP or LocalSDP finds a new one asked for.
+		localTLSID: s.localTLSID,
 		// The security mode and its algorithm are properties of the negotiated
 		// session, not of one exchange within it, so a fork that drops them
 		// silently downgrades. LocalSDP keys every secure branch off SecureRTP, so
@@ -812,6 +825,7 @@ func (s *MediaSession) LocalSDP() []byte {
 		dtlsSet = &dtlsSetup{
 			setup:        s.localDTLSSetup(),
 			fingerprints: s.localDTLSFingerprints(),
+			tlsID:        s.localSDPTLSID(),
 		}
 	}
 
@@ -1171,6 +1185,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		// is what governs the handshake, and localDTLSSetup derives that from this
 		// value -- so the role we advertise and the role we play are one decision.
 		s.dtlsRemoteSetup = setup
+		s.dtlsRemoteTLSID = tlsID
 
 		if err := s.negotiateDTLSAssociation(setup, fingerprints, tlsID); err != nil {
 			return err
@@ -1213,6 +1228,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []sdpFingerprints, tlsID string) error {
 	assoc := s.dtlsAssoc
 	if assoc == nil {
+		s.newAnswerTLSID(tlsID)
 		return s.armDTLSHandshake(setup, fingerprints, tlsID)
 	}
 
@@ -1250,6 +1266,7 @@ func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []sdp
 	s.dtlsAssoc = nil
 	s.localCtxSRTP = nil
 	s.remoteCtxSRTP = nil
+	s.newAnswerTLSID(tlsID)
 	if err := s.armDTLSHandshake(setup, fingerprints, tlsID); err != nil {
 		if rebound {
 			// Nothing but this session refers to the sockets just bound, and
@@ -1259,6 +1276,50 @@ func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []sdp
 		return err
 	}
 	return nil
+}
+
+// newAnswerTLSID gives a session answering an offer with a new DTLS
+// association our tls-id for it: a new value when the offer carries a tls-id,
+// which the answer then carries, and none when it does not (RFC 8842 section
+// 5.3). A session applying an answer keeps the value its offer carried.
+func (s *MediaSession) newAnswerTLSID(remoteTLSID string) {
+	if s.RemoteSDPIsAnswer {
+		return
+	}
+	s.localTLSID = ""
+	if remoteTLSID != "" {
+		s.localTLSID = newTLSID()
+	}
+}
+
+// localSDPTLSID returns the a=tls-id value LocalSDP writes, or "" for none
+// (RFC 8842 section 5). An answer carries the value RemoteSDP settled on, and
+// only when the offer carried a tls-id. An offer carries the value of the
+// association the session continues, or a new one when it has no association
+// or asks for a new one from other sockets or with other certificates.
+func (s *MediaSession) localSDPTLSID() string {
+	if s.answeringOffer() {
+		if s.dtlsRemoteTLSID == "" {
+			return ""
+		}
+		return s.localTLSID
+	}
+
+	assoc := s.dtlsAssoc
+	switch {
+	case assoc != nil && !assoc.localChangedBy(s):
+		s.localTLSID = assoc.localTLSID
+	case assoc != nil && s.localTLSID == assoc.localTLSID, assoc == nil && s.localTLSID == "":
+		s.localTLSID = newTLSID()
+	}
+	return s.localTLSID
+}
+
+// newTLSID draws a tls-id value: 26 characters of the base32 alphabet, which
+// the tls-id-value grammar allows, carrying 128 bits from a cryptographically
+// secure source, where RFC 8842 section 4 asks for at least 120.
+func newTLSID() string {
+	return rand.Text()
 }
 
 // armDTLSHandshake prepares the DTLS association RemoteSDP negotiated and arms
@@ -1281,6 +1342,7 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 		localFingerprints:  fingerprintSet(s.localDTLSFingerprints()),
 		remoteFingerprints: fingerprintSet(fingerprints),
 		remoteTLSID:        tlsID,
+		localTLSID:         s.localTLSID,
 		laddr:              s.Laddr,
 		raddr:              s.Raddr,
 	}
@@ -2418,6 +2480,8 @@ type sdpFingerprints struct {
 type dtlsSetup struct {
 	setup        string
 	fingerprints []sdpFingerprints
+	// tlsID is our a=tls-id value, "" to write none.
+	tlsID string
 }
 
 type iceSetup struct {
@@ -2457,8 +2521,10 @@ type dtlsAssociation struct {
 	// side advertised, as fingerprintSet renders them.
 	localFingerprints  []string
 	remoteFingerprints []string
-	// remoteTLSID is the peer's a=tls-id, empty when it sent none.
+	// remoteTLSID is the peer's a=tls-id, empty when it sent none, and
+	// localTLSID ours, empty when we sent none.
 	remoteTLSID string
+	localTLSID  string
 	// laddr and raddr are the transport addresses the association was
 	// signalled over.
 	laddr net.UDPAddr
@@ -2471,9 +2537,10 @@ type dtlsAssociation struct {
 // RFC 8842 section 3.1 asks for a new association when the roles change, a
 // fingerprint is modified, added or removed, or the tls-id changes. A peer
 // sending no tls-id asks for one by changing its transport instead (section
-// 4), and so do we when we move to a new local address, because we send no
-// tls-id. Under ICE the candidates carry the transport, and switching between
-// them is not a change (section 6).
+// 4). We ask for one from a new local address (section 5.1), with a new
+// tls-id, so a change of our own transport is a new association whatever the
+// peer sends. Under ICE the candidates carry the transport, and switching
+// between them is not a change (section 6).
 func (a *dtlsAssociation) changedBy(s *MediaSession, setup string, fingerprints []sdpFingerprints, tlsID string) string {
 	if role := dtlsRoleAgainst(setup); role != "" && role != a.setup {
 		return "a change of DTLS roles"
@@ -2497,6 +2564,15 @@ func (a *dtlsAssociation) changedBy(s *MediaSession, setup string, fingerprints 
 		return "a change of the peer's transport"
 	}
 	return ""
+}
+
+// localChangedBy reports whether s no longer presents our side of the
+// association: our fingerprints changed or, without ICE, our transport did.
+func (a *dtlsAssociation) localChangedBy(s *MediaSession) bool {
+	if !slices.Equal(fingerprintSet(s.localDTLSFingerprints()), a.localFingerprints) {
+		return true
+	}
+	return !s.iceEnabled() && !sameUDPAddr(s.Laddr, a.laddr)
 }
 
 // dtlsRoleAgainst returns the a=setup role this endpoint plays against the
@@ -2634,6 +2710,9 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 				continue
 			}
 			s = append(s, fmt.Sprintf("a=fingerprint:%s %s", d.alg, d.fingerprint))
+		}
+		if dtlsSet.tlsID != "" {
+			s = append(s, "a=tls-id:"+dtlsSet.tlsID)
 		}
 	}
 

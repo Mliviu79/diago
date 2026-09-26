@@ -6,6 +6,7 @@ package media
 import (
 	"crypto/tls"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,6 +101,17 @@ func replaceSDPLine(t *testing.T, body string, prefix string, line string) strin
 // addSDPAttribute appends an attribute line to body.
 func addSDPAttribute(body string, attr string) string {
 	return body + attr + "\r\n"
+}
+
+// removeSDPLine removes the line of body that starts with prefix. It panics
+// when there is none, since it rewrites offers where no test is at hand.
+func removeSDPLine(body string, prefix string) string {
+	for _, l := range strings.Split(body, "\r\n") {
+		if strings.HasPrefix(l, prefix) {
+			return strings.Replace(body, l+"\r\n", "", 1)
+		}
+	}
+	panic("SDP has no " + prefix + " line")
 }
 
 // TestDTLSForkKeepsAssociation is a re-INVITE on an established DTLS-SRTP call
@@ -237,21 +249,21 @@ func TestDTLSForkNewAssociation(t *testing.T) {
 			wantNew: true,
 		},
 		{
-			name:    "tls-id appears",
-			reoffer: func(t *testing.T, offer string) string { return addSDPAttribute(offer, tlsID) },
-			wantNew: true,
+			// A peer that sent no tls-id starts sending one.
+			name:        "tls-id appears",
+			mutateOffer: func(s string) string { return removeSDPLine(s, "a=tls-id:") },
+			reoffer:     func(t *testing.T, offer string) string { return addSDPAttribute(offer, tlsID) },
+			wantNew:     true,
 		},
 		{
-			name:        "tls-id changes",
-			mutateOffer: func(s string) string { return addSDPAttribute(s, tlsID) },
-			reoffer:     func(t *testing.T, offer string) string { return replaceSDPLine(t, offer, "a=tls-id:", otherTLSID) },
-			wantNew:     true,
+			name:    "tls-id changes",
+			reoffer: func(t *testing.T, offer string) string { return replaceSDPLine(t, offer, "a=tls-id:", otherTLSID) },
+			wantNew: true,
 		},
 		{
 			// RFC 8842 section 4: an unchanged tls-id with unchanged
 			// fingerprints reuses the association, wherever the peer moved.
-			name:        "tls-id unchanged, peer transport changes",
-			mutateOffer: func(s string) string { return addSDPAttribute(s, tlsID) },
+			name: "tls-id unchanged, peer transport changes",
 			reoffer: func(t *testing.T, offer string) string {
 				return replaceSDPLine(t, offer, "m=audio ", "m=audio 40000 UDP/TLS/RTP/SAVP 0")
 			},
@@ -259,7 +271,8 @@ func TestDTLSForkNewAssociation(t *testing.T) {
 		{
 			// RFC 8842 section 4: a peer without tls-id asks for a new
 			// association by changing its transport.
-			name: "no tls-id, peer transport changes",
+			name:        "no tls-id, peer transport changes",
+			mutateOffer: func(s string) string { return removeSDPLine(s, "a=tls-id:") },
 			reoffer: func(t *testing.T, offer string) string {
 				return replaceSDPLine(t, offer, "m=audio ", "m=audio 40000 UDP/TLS/RTP/SAVP 0")
 			},
@@ -371,4 +384,114 @@ func TestDTLSForkRefusesNewAssociationOnSharedTransport(t *testing.T) {
 	require.Equal(t, offerer.Laddr, offerFork.Laddr)
 
 	requireMediaDelivered(t, offerer, answerer, 61)
+}
+
+// tlsIDSyntax is the tls-id-value grammar of RFC 8842 section 4.
+var tlsIDSyntax = regexp.MustCompile(`^[A-Za-z0-9+/_-]{20,255}$`)
+
+// sdpTLSID returns the a=tls-id value of body, or "" when it has none.
+func sdpTLSID(body []byte) string {
+	for _, l := range strings.Split(string(body), "\r\n") {
+		if v, ok := strings.CutPrefix(l, "a=tls-id:"); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// TestDTLSTLSID pins the a=tls-id procedures of RFC 8842 section 5 on both
+// sides of the exchange. Each DTLS association has a value of ours, written in
+// every offer (sections 5.2 and 5.5) and in an answer to an offer that carries
+// one (section 5.3), and never in an answer to an offer that does not. A
+// session continuing an association writes the value it was negotiated with;
+// one asking for a new association writes a new value (section 4), whether
+// the new association is asked for by our offer, from new sockets, or by the
+// peer's.
+func TestDTLSTLSID(t *testing.T) {
+	t.Run("initial offer and answer", func(t *testing.T) {
+		offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+		answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+		offer, answer := negotiateDTLS(t, offerer, answerer, nil)
+
+		offerID, answerID := sdpTLSID(offer), sdpTLSID(answer)
+		require.Regexp(t, tlsIDSyntax, offerID, "the initial offer must carry a tls-id (section 5.2)")
+		require.Regexp(t, tlsIDSyntax, answerID, "the answer to an offer with a tls-id must carry one (section 5.3)")
+		require.NotEqual(t, offerID, answerID)
+		require.Equal(t, offerID, sdpTLSID(offerer.LocalSDP()), "an offer made again is the same offer")
+
+		other := newDTLSForkTestSession(t, testdata.ClientCertificate())
+		require.NotEqual(t, offerID, sdpTLSID(other.LocalSDP()), "every session draws its own value")
+	})
+
+	t.Run("answer to an offer without one", func(t *testing.T) {
+		offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+		answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+		_, answer := negotiateDTLS(t, offerer, answerer, func(s string) string { return removeSDPLine(s, "a=tls-id:") })
+		require.Empty(t, sdpTLSID(answer), "an answer to an offer without a tls-id must not carry one (section 5.3)")
+		finalizeBoth(t, offerer, answerer)
+
+		// A subsequent offer from that answerer continues an association that
+		// has no tls-id of ours, so it still carries none.
+		require.Empty(t, sdpTLSID(answerer.Fork().LocalSDP()))
+	})
+
+	t.Run("association continues", func(t *testing.T) {
+		offerer, answerer, offer, answer := newEstablishedDTLSPair(t, nil)
+
+		offerFork := offerer.Fork()
+		reoffer := offerFork.LocalSDP()
+		require.Equal(t, sdpTLSID(offer), sdpTLSID(reoffer), "a subsequent offer continuing the association keeps its value (section 5.5)")
+
+		answerFork := answerer.Fork()
+		answerFork.RemoteSDPIsAnswer = false
+		require.NoError(t, answerFork.RemoteSDP(reoffer))
+		require.False(t, answerFork.FinalizePending())
+		require.Equal(t, sdpTLSID(answer), sdpTLSID(answerFork.LocalSDP()), "an answer continuing the association keeps its value (section 5.3)")
+	})
+
+	t.Run("new association from our offer", func(t *testing.T) {
+		offerer, answerer, offer, answer := newEstablishedDTLSPair(t, nil)
+
+		// The offerer wants a new association, so it offers from new sockets
+		// (section 5.1).
+		offerFork := offerer.Fork()
+		rebindFork(t, offerFork)
+		answerFork := answerer.Fork()
+		reoffer, reanswer := negotiateDTLS(t, offerFork, answerFork, nil)
+		t.Cleanup(func() { _ = answerFork.Close() })
+		require.True(t, offerFork.FinalizePending())
+		require.True(t, answerFork.FinalizePending())
+
+		newOfferID, newAnswerID := sdpTLSID(reoffer), sdpTLSID(reanswer)
+		require.Regexp(t, tlsIDSyntax, newOfferID)
+		require.NotEqual(t, sdpTLSID(offer), newOfferID, "an offer asking for a new association must carry a new value (section 5.5)")
+		require.Regexp(t, tlsIDSyntax, newAnswerID)
+		require.NotEqual(t, sdpTLSID(answer), newAnswerID, "the answer to a new association must carry a new value (section 5.3)")
+
+		// The new association records the new values: a fork of either side
+		// continues it with them.
+		finalizeBoth(t, offerFork, answerFork)
+		requireMediaDelivered(t, offerFork, answerFork, 71)
+		require.Equal(t, newOfferID, sdpTLSID(offerFork.Fork().LocalSDP()))
+		againFork := answerFork.Fork()
+		againFork.RemoteSDPIsAnswer = false
+		require.NoError(t, againFork.RemoteSDP(offerFork.Fork().LocalSDP()))
+		require.False(t, againFork.FinalizePending())
+		require.Equal(t, newAnswerID, sdpTLSID(againFork.LocalSDP()))
+	})
+
+	t.Run("new association asked for by the peer", func(t *testing.T) {
+		_, answerer, offer, answer := newEstablishedDTLSPair(t, nil)
+
+		// The peer takes the active role itself, which changes the roles.
+		fork := answerer.Fork()
+		fork.RemoteSDPIsAnswer = false
+		require.NoError(t, fork.RemoteSDP([]byte(replaceSDPLine(t, string(offer), "a=setup:", "a=setup:active"))))
+		t.Cleanup(func() { _ = fork.Close() })
+		require.True(t, fork.FinalizePending())
+
+		reanswer := fork.LocalSDP()
+		require.Regexp(t, tlsIDSyntax, sdpTLSID(reanswer))
+		require.NotEqual(t, sdpTLSID(answer), sdpTLSID(reanswer), "the answer to a new association must carry a new value (section 5.3)")
+	})
 }
