@@ -598,3 +598,42 @@ func TestDTLSLibConfRequiresClientCertificate(t *testing.T) {
 		})
 	}
 }
+
+// TestDTLSSessionNeedsCertificate asserts a DTLS session without a usable
+// certificate is refused by Init, before it binds a socket. Its SDP would carry
+// a=setup and no a=fingerprint, which RFC 5763 section 5 forbids and a
+// conformant peer refuses, and as the DTLS server it would have nothing to
+// present, so it could only fail once the call was already answered.
+func TestDTLSSessionNeedsCertificate(t *testing.T) {
+	tests := []struct {
+		name         string
+		secure       int
+		certificates []tls.Certificate
+		wantErr      bool
+	}{
+		{name: "dtls without certificate", secure: SecureRTPModeDTLS, wantErr: true},
+		{name: "dtls with an empty certificate", secure: SecureRTPModeDTLS, certificates: []tls.Certificate{{}}, wantErr: true},
+		{name: "dtls with certificate", secure: SecureRTPModeDTLS, certificates: []tls.Certificate{testdata.ServerCertificate()}},
+		{name: "plain rtp without certificate", secure: SecureRTPModeNone},
+		{name: "sdes without certificate", secure: SecureRTPModeSDES},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &MediaSession{
+				Codecs:    []Codec{CodecAudioUlaw},
+				Mode:      sdp.ModeSendrecv,
+				SecureRTP: tc.secure,
+				DTLSConf:  DTLSConfig{Certificates: tc.certificates},
+			}
+			s.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+			err := s.Init()
+			t.Cleanup(func() { _ = s.Close() })
+			if tc.wantErr {
+				require.ErrorContains(t, err, "certificate")
+				assert.Nil(t, s.rtpConn, "a refused session must not bind a socket")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

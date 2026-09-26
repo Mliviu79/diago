@@ -58,13 +58,19 @@ func initSessionFor(t *testing.T, dg *Diago, tran *Transport) *media.MediaSessio
 // reaches one.
 func TestMediaConfigICEWiring(t *testing.T) {
 	codecs := []media.Codec{media.CodecAudioUlaw}
+	// A DTLS session needs a certificate for the a=fingerprint RFC 5763 section
+	// 5 requires, and Init refuses one without.
+	dtlsTransport := Transport{
+		MediaSRTP:     media.SecureRTPModeDTLS,
+		MediaDTLSConf: media.DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}},
+	}
 
 	// An ICEConfig on the Diago wide media config must reach the session and
 	// switch ICE on. ice-ufrag is only written once an agent exists, so it says
 	// the session really is negotiating ICE rather than just holding the config.
 	t.Run("ICEConfigEnablesICE", func(t *testing.T) {
 		dg, tran := newMediaConfDiago(t,
-			Transport{MediaSRTP: media.SecureRTPModeDTLS},
+			dtlsTransport,
 			MediaConfig{Codecs: codecs, ICEConfig: &media.ICEConfig{}},
 		)
 
@@ -81,7 +87,7 @@ func TestMediaConfigICEWiring(t *testing.T) {
 	// offer and the two socket RTP/RTCP layout.
 	t.Run("NilICEConfigKeepsNonICEPath", func(t *testing.T) {
 		dg, tran := newMediaConfDiago(t,
-			Transport{MediaSRTP: media.SecureRTPModeDTLS},
+			dtlsTransport,
 			MediaConfig{Codecs: codecs},
 		)
 

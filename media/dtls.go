@@ -143,6 +143,23 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []sdpFingerprints) *dtls.Config {
 	return config
 }
 
+// checkCertificates reports a configuration that cannot take part in DTLS-SRTP
+// negotiation. RFC 5763 section 5 requires an a=fingerprint in the SDP, and it
+// is computed from our certificate. Without one the SDP names a DTLS setup with
+// nothing to check the handshake against, which a conformant peer refuses, and
+// the handshake fails for want of a certificate to present.
+func (conf *DTLSConfig) checkCertificates() error {
+	if len(conf.Certificates) == 0 {
+		return fmt.Errorf("dtls needs a certificate, none is configured")
+	}
+	for i, cert := range conf.Certificates {
+		if _, err := dtlsSHA256Fingerprint(cert); err != nil {
+			return fmt.Errorf("dtls certificate %d has no fingerprint: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // clientAuth is the policy the DTLS server applies to the client certificate.
 // The peer is checked against its SDP fingerprints, which needs its
 // certificate, so the policy requires one at least. A server that sends no

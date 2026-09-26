@@ -412,6 +412,12 @@ func (s *MediaSession) Init() error {
 		s.SRTPAlg = uint16(srtp.ProtectionProfileAes128CmHmacSha1_80)
 	}
 
+	if s.SecureRTP == SecureRTPModeDTLS {
+		if err := s.DTLSConf.checkCertificates(); err != nil {
+			return fmt.Errorf("media session: %w", err)
+		}
+	}
+
 	// A session that already holds a connection and is initialized again is
 	// rebinding: this is Fork followed by a new Laddr, which starts a new
 	// listener below. ExternalIP is the address the OLD socket was reachable on,
