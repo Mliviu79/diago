@@ -639,7 +639,9 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // A BYE that arrives before our answer is complete is read once it is. The ACK
 // the peer sent ahead of it is then not read on a dialog that has already
 // ended, which sipgo would take as confirming it, and an answer that sets up
-// its media after the ACK is not ended under it.
+// its media after the ACK is not ended under it. A BYE that arrives while a
+// re-INVITE is being handled is read once that re-INVITE is answered, so the
+// peer never gets a 200 to the re-INVITE after the one to its BYE.
 //
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
@@ -655,6 +657,8 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // is answered here and the error returned: the dialog goes on.
 func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.awaitAnswer(tx)
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
 	d.terminatingBye.Store(req)
 	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
 		// Not this dialog's ending: leave no cause planted on it.
@@ -934,6 +938,11 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	if !d.awaitAnswer(tx) {
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
+
+	// Held until the re-INVITE is answered, so a BYE ends the dialog either
+	// after that answer or before the check below.
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
 
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
 	// media.

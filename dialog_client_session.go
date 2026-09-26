@@ -698,7 +698,21 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 	dialogHandleRefer(d, dg, req, tx, onRefDialog)
 }
 
+// ReadBye reads the peer's BYE as the embedded session does, once a re-INVITE
+// being handled has been answered, so a re-INVITE is never answered 200 after
+// the BYE that ended the dialog.
+func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
+	return d.DialogClientSession.ReadBye(req, tx)
+}
+
 func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
+	// Held until the re-INVITE is answered, so a BYE ends the dialog either
+	// after that answer or before the check below.
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
+
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
 	// media.
 	if ended, err := respondDialogEnded(d, req, tx); ended {

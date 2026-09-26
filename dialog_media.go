@@ -52,6 +52,13 @@ func init() {
 type DialogMedia struct {
 	mu sync.Mutex
 
+	// requestMu makes the peer's BYE and its re-INVITEs take turns, each held
+	// from the check that the dialog is live to its answer. A re-INVITE is then
+	// answered either before a BYE ends the dialog or, after that, as a request
+	// for an ended dialog, never with a 200 behind the BYE's. It is taken
+	// before mu and held while the answer is sent.
+	requestMu sync.Mutex
+
 	// media session is RTP local and remote
 	// it is forked on media changes and updated on writer and reader
 	// must be mutex protected

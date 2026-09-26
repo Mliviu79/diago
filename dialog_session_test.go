@@ -5,12 +5,15 @@ package diago
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -385,6 +388,35 @@ func newRecordingDialogUA(t *testing.T) (*sipgo.DialogUA, *sentRequests) {
 	return &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "dg", Host: "127.0.0.1", Port: 5060}}}, sent
 }
 
+// peerSDP is the session description the peer of newAnsweredTestClientDialog
+// answers and offers with.
+func peerSDP() []byte {
+	return sdp.GenerateForAudio(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1), 34455, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ULAW})
+}
+
+// newAnsweredTestClientDialog returns an outgoing call, invited, answered with
+// peerSDP and acknowledged, over a client that answers every request 200
+// without a transport, and what the dialog sent after the ACK.
+func newAnsweredTestClientDialog(t *testing.T) (*DialogClientSession, *sentRequests) {
+	t.Helper()
+	sent := &sentRequests{}
+	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+		res := sent.record(req)
+		if req.IsInvite() {
+			res.SetBody(peerSDP())
+		}
+		return res
+	})
+	ctx := context.Background()
+	d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	require.NoError(t, d.Invite(ctx, InviteClientOptions{}))
+	require.NoError(t, d.Ack(ctx))
+	sent.reset()
+	return d, sent
+}
+
 // newPeerInDialogRequest builds a request of the given method the peer sends
 // inside a dialog.
 func newPeerInDialogRequest(method sip.RequestMethod, seq uint32) *sip.Request {
@@ -435,24 +467,9 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 		{
 			name: "outbound",
 			newEnded: func(t *testing.T, onRefer OnReferDialogFunc) (inDialogHandlers, *sentRequests) {
-				// A call answered and hung up by us, all over a client that
-				// answers without a transport.
-				sent := &sentRequests{}
-				dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
-					res := sent.record(req)
-					if req.IsInvite() {
-						res.SetBody(sdp.GenerateForAudio(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1), 34455, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ULAW}))
-					}
-					return res
-				})
-				ctx := context.Background()
-				d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
-				require.NoError(t, err)
-				t.Cleanup(func() { _ = d.Close() })
-				require.NoError(t, d.Invite(ctx, InviteClientOptions{}))
-				require.NoError(t, d.Ack(ctx))
+				d, sent := newAnsweredTestClientDialog(t)
 				d.onReferDialog = onRefer
-				require.NoError(t, d.Hangup(ctx))
+				require.NoError(t, d.Hangup(context.Background()))
 				require.Equal(t, sip.DialogStateEnded, d.LoadState())
 				sent.reset()
 				return d, sent
@@ -530,6 +547,132 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				d.Media().referMu.Unlock()
 				assert.Equal(t, ReferEndFinalNotify, end, "the transfer outcome was not delivered")
 			})
+		})
+	}
+}
+
+// answerLog records, across transactions, the order in which requests are
+// answered.
+type answerLog struct {
+	mu      sync.Mutex
+	answers []string
+}
+
+func (l *answerLog) list() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.answers...)
+}
+
+// loggedServerTx is a byeServerTx that writes each response to a shared log
+// under its request's name.
+type loggedServerTx struct {
+	*byeServerTx
+	name string
+	log  *answerLog
+}
+
+func newLoggedServerTx(name string, log *answerLog) *loggedServerTx {
+	return &loggedServerTx{byeServerTx: newByeServerTx(), name: name, log: log}
+}
+
+func (tx *loggedServerTx) Respond(res *sip.Response) error {
+	tx.log.mu.Lock()
+	tx.log.answers = append(tx.log.answers, fmt.Sprintf("%s %d", tx.name, res.StatusCode))
+	tx.log.mu.Unlock()
+	return nil
+}
+
+// TestDialogReInviteRacingBye pins that the peer's re-INVITE and BYE on one
+// dialog are handled one after the other, on either side. sipgo hands each
+// request to its handler on its own goroutine, and a re-INVITE that has found
+// the dialog live goes on to renegotiate the media and answer 200. A BYE
+// handled meanwhile answers 200 and ends the dialog, so the peer could get
+// the 200 to its BYE and then a 200 to a re-INVITE on the dialog it ended. The
+// re-INVITE here carries an offer, and its media update callback reads the
+// BYE, which holds the re-INVITE in that window for as long as the BYE takes.
+func TestDialogReInviteRacingBye(t *testing.T) {
+	sides := []struct {
+		name string
+		// setup returns a live dialog's media and the handling of the
+		// peer's re-INVITE, with an offer, and of its BYE.
+		setup func(t *testing.T) (*DialogMedia, func(sip.ServerTransaction) error, func(sip.ServerTransaction) error)
+	}{
+		{
+			name: "inbound",
+			setup: func(t *testing.T) (*DialogMedia, func(sip.ServerTransaction) error, func(sip.ServerTransaction) error) {
+				d, _ := newByeTestDialog(t)
+				res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+				res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+				d.InviteResponse = res
+				confirm(t, d)
+
+				peer := newMediaSessionForTest(t)
+				sess := newMediaSessionForTest(t)
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+				rtpSess := media.NewRTPSession(sess)
+				d.mu.Lock()
+				d.initRTPSessionUnsafe(sess, rtpSess)
+				d.mu.Unlock()
+				require.NoError(t, rtpSess.MonitorBackground())
+				t.Cleanup(func() { _ = d.DialogMedia.Close() })
+
+				seq := d.InviteRequest.CSeq().SeqNo
+				reInvite := newInDialogReInvite(t, d, seq+1)
+				reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+				reInvite.SetBody(peer.LocalSDP())
+				bye := newBye(t, d, seq+2)
+				return &d.DialogMedia,
+					func(tx sip.ServerTransaction) error { return d.handleReInvite(reInvite, tx) },
+					func(tx sip.ServerTransaction) error { return d.ReadBye(bye, tx) }
+			},
+		},
+		{
+			name: "outbound",
+			setup: func(t *testing.T) (*DialogMedia, func(sip.ServerTransaction) error, func(sip.ServerTransaction) error) {
+				d, _ := newAnsweredTestClientDialog(t)
+
+				seq := d.InviteRequest.CSeq().SeqNo
+				reInvite := newPeerReInvite(d, seq+1)
+				reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+				reInvite.SetBody(peerSDP())
+				bye := newPeerInDialogRequest(sip.BYE, seq+2)
+				return &d.DialogMedia,
+					func(tx sip.ServerTransaction) error { return d.handleReInvite(reInvite, tx) },
+					func(tx sip.ServerTransaction) error { return d.ReadBye(bye, tx) }
+			},
+		},
+	}
+
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			m, handleReInvite, readBye := side.setup(t)
+			log := &answerLog{}
+
+			var byeErr error
+			byeDone := make(chan struct{})
+			m.mu.Lock()
+			m.onMediaUpdate = func(*DialogMedia) {
+				go func() {
+					defer close(byeDone)
+					byeErr = readBye(newLoggedServerTx("BYE", log))
+				}()
+				// Long enough for a BYE nothing holds back to be answered.
+				select {
+				case <-byeDone:
+				case <-time.After(300 * time.Millisecond):
+				}
+			}
+			m.mu.Unlock()
+
+			require.NoError(t, handleReInvite(newLoggedServerTx("re-INVITE", log)))
+			select {
+			case <-byeDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the BYE was never handled")
+			}
+			require.NoError(t, byeErr)
+			assert.Equal(t, []string{"re-INVITE 200", "BYE 200"}, log.list(), "the re-INVITE was answered after the BYE that ended the dialog")
 		})
 	}
 }
