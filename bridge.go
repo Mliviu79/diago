@@ -150,28 +150,42 @@ func (b *Bridge) ProxyMedia() error {
 
 // ProxyMediaControl starts proxy in background and allows to stop proxy at any time.
 // Stop should be called once and it is not needed to be called if call is terminating
+// Like ProxyMedia, it requires WaitDialogsNum higher than 2, so no other proxy
+// runs on the dialogs.
 //
 // Experimental
 func (b *Bridge) ProxyMediaControl() (func() error, error) {
+	if len(b.dialogs) < 2 {
+		return nil, fmt.Errorf("number of dialogs must equal to 2")
+	}
+
+	if b.WaitDialogsNum < 3 {
+		return nil, fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
+	}
+
 	proxyErr := make(chan error, 1)
 	go func() {
 		proxyErr <- b.proxyMedia()
 	}()
 
+	// The stop ends the proxy's reads, which it waits in while the dialogs are
+	// silent, and then clears their deadline so the dialogs can be read again.
 	stopF := func() error {
+		var stopErr error
 		for _, d := range b.dialogs {
-			d.Media().mediaSession.StopRTP(2, 0)
+			stopErr = errors.Join(stopErr, bridgeRTPControlErr(d.Media().StopRTP(1, 0)))
 		}
 
 		// Wait goroutine termination
 		err := <-proxyErr
+		var startErr error
 		for _, d := range b.dialogs {
-			d.Media().mediaSession.StartRTP(2)
+			startErr = errors.Join(startErr, bridgeRTPControlErr(d.Media().StartRTP(1, 0)))
 		}
-		return err
+		return errors.Join(stopErr, err, startErr)
 	}
 
-	return stopF, b.proxyMedia()
+	return stopF, nil
 }
 
 // proxyMedia starts routine to proxy media between
@@ -235,7 +249,7 @@ func proxyMediaBackground(log *slog.Logger, reader io.Reader, writer io.Writer, 
 
 	written, err := copyWithBuf(reader, writer, buf.([]byte))
 	log.Debug("Proxy media routine finished", "bytes", written)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
 		log.Debug("Proxy media stopped with timeout. RTP Deadline", "error", err)
 		err = nil
 	}
@@ -265,6 +279,10 @@ func (b *Bridge) proxyMediaWithDTMF(m1 *DialogMedia, m2 *DialogMedia) error {
 	log.Debug("Starting proxy media routine")
 	written, err := copyWithBuf(r, w, buf.([]byte))
 	log.Debug("Bridge proxy stream finished", "bytes", written)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		// A read deadline is how the proxy is stopped
+		return nil
+	}
 	return err
 }
 

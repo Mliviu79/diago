@@ -155,6 +155,100 @@ func TestBridgeProxyMediaProxiesEveryFrame(t *testing.T) {
 	}
 }
 
+// proxyMediaControl calls ProxyMediaControl and waits, bounded, for it to return.
+func proxyMediaControl(t *testing.T, b *Bridge) (func() error, error) {
+	t.Helper()
+	type control struct {
+		stop func() error
+		err  error
+	}
+	started := make(chan control, 1)
+	go func() {
+		stop, err := b.ProxyMediaControl()
+		started <- control{stop, err}
+	}()
+	select {
+	case ctl := <-started:
+		return ctl.stop, ctl.err
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProxyMediaControl did not return while its proxy runs")
+		return nil, nil
+	}
+}
+
+// TestBridgeProxyMediaControl checks that ProxyMediaControl returns once its
+// proxy runs in the background, and that the stop it returns ends the proxy
+// while both dialogs are silent and leaves their reads usable. It is refused,
+// as ProxyMedia is, with fewer than two dialogs or with the proxy that
+// AddDialogSession starts already running, which its stop would not stop.
+func TestBridgeProxyMediaControl(t *testing.T) {
+	for _, dtmfPass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("DTMFpass=%t", dtmfPass), func(t *testing.T) {
+			b := NewBridge()
+			b.WaitDialogsNum = 3 // The proxy is started by hand
+			b.DTMFpass = dtmfPass
+			a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+			c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+			require.NoError(t, b.AddDialogSession(a))
+			require.NoError(t, b.AddDialogSession(c))
+
+			stop, err := proxyMediaControl(t, &b)
+			require.NoError(t, err)
+
+			frame := bytes.Repeat([]byte{0x20}, 160)
+			a.sendRTP(t, 1, 0, frame)
+			require.Equal(t, frame, c.recvRTP(t), "the proxy does not run")
+
+			// Both dialogs are silent
+			stopped := make(chan error, 1)
+			go func() { stopped <- stop() }()
+			select {
+			case err := <-stopped:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("the stop did not end the proxy")
+			}
+
+			// The dialog's next frame goes to its own reader, which the stop
+			// left no deadline on
+			a.sendRTP(t, 2, 160, frame)
+			r, err := a.media.AudioReader()
+			require.NoError(t, err)
+			read := make(chan error, 1)
+			go func() {
+				buf := make([]byte, media.RTPBufSize)
+				n, err := r.Read(buf)
+				if err == nil && !bytes.Equal(frame, buf[:n]) {
+					err = fmt.Errorf("read %x", buf[:n])
+				}
+				read <- err
+			}()
+			select {
+			case err := <-read:
+				require.NoError(t, err, "the dialog's reads must work once the proxy has stopped")
+			case <-time.After(2 * time.Second):
+				t.Fatal("the dialog's reader did not get its frame")
+			}
+		})
+	}
+
+	t.Run("TooFewDialogs", func(t *testing.T) {
+		b := NewBridge()
+		b.WaitDialogsNum = 3
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "a", media.CodecAudioUlaw)))
+		_, err := proxyMediaControl(t, &b)
+		require.Error(t, err)
+	})
+
+	t.Run("ProxyAlreadyRunning", func(t *testing.T) {
+		b := NewBridge()
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "a", media.CodecAudioUlaw)))
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "c", media.CodecAudioUlaw)))
+		_, err := proxyMediaControl(t, &b)
+		require.Error(t, err)
+	})
+}
+
 func TestIntegrationBridging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
