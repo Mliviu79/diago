@@ -146,7 +146,21 @@ type DialogMedia struct {
 	// until it is done.
 	mediaUpdating bool
 
+	// ackOffer is the offer we sent in the 2xx to a re-INVITE of the peer's
+	// that carried none, until the ACK to that 2xx brings the answer (RFC 3261
+	// section 14.2). Guarded by mu.
+	ackOffer *ackOffer
+
 	closed bool
+}
+
+// ackOffer is an offer we sent in a 2xx to a re-INVITE, awaiting its answer in
+// the ACK.
+type ackOffer struct {
+	// cseq is the CSeq of the re-INVITE, which the ACK to its 2xx carries.
+	cseq uint32
+	// msess is the fork that made the offer, which the answer is applied to.
+	msess *media.MediaSession
 }
 
 // pendingReInvite is a re-INVITE of the peer's being handled. Every field is
@@ -692,13 +706,70 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - no media session present", nil))
 	}
 
-	// Reply with updated SDP
-	sd := d.mediaSession.LocalSDP()
+	var sd []byte
+	var offer *ackOffer
+	if len(req.Body()) > 0 {
+		// The installed fork answers the peer's offer.
+		sd = d.mediaSession.LocalSDP()
+	} else {
+		// Our 2xx carries an offer, which the ACK answers (RFC 3261 section
+		// 14.2). A fork makes it and takes the answer, so neither changes the
+		// installed session, which carries the media meanwhile.
+		offer = &ackOffer{msess: d.mediaSession.Fork()}
+		if cseq := req.CSeq(); cseq != nil {
+			offer.cseq = cseq.SeqNo
+		}
+		sd = negotiatedOffer(offer.msess, d.mediaSession)
+		d.ackOffer = offer
+	}
 	d.mu.Unlock()
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sd)
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	return respond(res)
+	sent, err := d.respondPeerReInvite(tx, res)
+	if offer != nil && !sent {
+		// No 2xx went out, so no ACK will answer the offer.
+		d.mu.Lock()
+		if d.ackOffer == offer {
+			d.ackOffer = nil
+		}
+		d.mu.Unlock()
+	}
+	return err
+}
+
+// applyAckAnswer applies the answer an ACK carries to the offer we sent in the
+// 2xx to a re-INVITE of the peer's, on the fork that made the offer, and
+// installs the fork. It reports whether req is the ACK to that 2xx. An ACK
+// without an answer, or once the media is closed, drops the offer. ctx is the
+// dialog's: it bounds a DTLS handshake the answer asks for.
+//
+// An ACK cannot be refused, so an error means the answer could not be applied
+// or keyed, the media is left as it was, and the caller ends the call, as RFC
+// 3261 section 14.2 has a UAC do with an offer it cannot accept.
+func (d *DialogMedia) applyAckAnswer(ctx context.Context, req *sip.Request) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	offer := d.ackOffer
+	cseq := req.CSeq()
+	if offer == nil || cseq == nil || cseq.SeqNo != offer.cseq {
+		return false, nil
+	}
+	d.ackOffer = nil
+	msess := offer.msess
+
+	contentType := req.ContentType()
+	if d.closed || len(req.Body()) == 0 || contentType == nil || contentType.Value() != "application/sdp" {
+		return true, d.discardForkUnsafe(msess)
+	}
+	msess.RemoteSDPIsAnswer = true
+	if err := msess.RemoteSDP(req.Body()); err != nil {
+		return true, errors.Join(fmt.Errorf("sdp update media remote SDP applying failed: %w", err), d.discardForkUnsafe(msess))
+	}
+	if msess.FinalizePending() {
+		return true, d.finalizeAndReplaceUnsafe(ctx, msess)
+	}
+	return true, d.replaceRTPSessionUnsafe(msess)
 }
 
 // answerNewAssociation answers a re-INVITE whose offer msess found to ask for
@@ -801,6 +872,21 @@ func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) (*media.MediaSession, error)
 		return nil, fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 	}
 	return msess, nil
+}
+
+// negotiatedOffer returns the offer of fork, a fork of the installed session
+// cur, made to renegotiate nothing. It carries the codecs cur runs on, with the
+// payload types they were negotiated with, as the offer of cur itself would,
+// so the peer is not asked to move the call to another codec. fork keeps every
+// codec it was set up with for the answer and what follows.
+func negotiatedOffer(fork, cur *media.MediaSession) []byte {
+	codecs := fork.Codecs
+	if negotiated := cur.CommonCodecs(); len(negotiated) > 0 {
+		fork.Codecs = slices.Clone(negotiated)
+	}
+	offer := fork.LocalSDP()
+	fork.Codecs = codecs
+	return offer
 }
 
 func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {

@@ -792,29 +792,28 @@ func (d *DialogClientSession) hangupNoMedia() error {
 	return d.Hangup(ctx)
 }
 
+// handleReInviteACK reads the ACK to our 2xx to a re-INVITE of the peer's.
+// When the re-INVITE carried no offer, the 2xx carried ours and the ACK
+// carries the answer (RFC 3261 section 14.2), which is applied to the fork
+// that made the offer, and the fork is installed. An answer that cannot be
+// applied or keyed ends the call, since an ACK cannot be refused.
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
-	// Check do we need to handle Late Offer from ACK and update media
-	body := req.Body()
-	if body != nil {
-		// Update media session state under lock, but invoke the app callback after unlock to avoid deadlocks.
-		d.mu.Lock()
-		// A body in the ACK answers the late offer we sent in our 200 OK.
-		d.mediaSession.RemoteSDPIsAnswer = true
-		err := d.sdpUpdateUnsafe(body)
-		onMediaUpdate := d.onMediaUpdate
-		d.mu.Unlock()
-		if err != nil {
-			return err
-		}
-
-		if onMediaUpdate != nil {
-			onMediaUpdate(d.Media())
-		}
+	reInvite, err := d.applyAckAnswer(d.Context(), req)
+	if err != nil {
+		return errors.Join(err, d.hangupNoMedia())
+	}
+	if !reInvite {
+		return nil
 	}
 
-	// Another in-dialog offer can swap the session under the lock meanwhile.
-	// The handshake ends with the call.
-	return d.MediaSession().FinalizeContext(d.Context())
+	// The app callback runs without the lock, to avoid deadlocks.
+	d.mu.Lock()
+	onMediaUpdate := d.onMediaUpdate
+	d.mu.Unlock()
+	if onMediaUpdate != nil {
+		onMediaUpdate(d.Media())
+	}
+	return nil
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {

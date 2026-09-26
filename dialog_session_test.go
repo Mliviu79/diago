@@ -673,3 +673,111 @@ func TestDialogReInviteRacingBye(t *testing.T) {
 		})
 	}
 }
+
+// TestDialogAckAnswerAppliedOnFork is a re-INVITE of the peer's without an
+// offer, on either side, while our media is written. Our 2xx carries an offer,
+// and the ACK carries the answer, which moves the peer's RTP to another port.
+// The answer is applied to the fork that made the offer, which is installed,
+// and the session that carried the media is left as it was: applied to it in
+// place, the answer rewrote its codecs and remote address while the writer
+// read them.
+func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
+	sides := []struct {
+		name string
+		// setup returns a live dialog's media, a re-INVITE of the peer's
+		// without an offer, and the handling of it and of the ACK.
+		setup func(t *testing.T) (*DialogMedia, *sip.Request, func(*sip.Request, sip.ServerTransaction) error, func(*sip.Request) error)
+	}{
+		{
+			name: "inbound",
+			setup: func(t *testing.T) (*DialogMedia, *sip.Request, func(*sip.Request, sip.ServerTransaction) error, func(*sip.Request) error) {
+				d, _ := newByeTestDialog(t)
+				res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+				res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+				d.InviteResponse = res
+				confirm(t, d)
+
+				peer := newMediaSessionForTest(t)
+				sess := newMediaSessionForTest(t)
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+				rtpSess := media.NewRTPSession(sess)
+				d.mu.Lock()
+				d.initRTPSessionUnsafe(sess, rtpSess)
+				d.mu.Unlock()
+				require.NoError(t, rtpSess.MonitorBackground())
+				t.Cleanup(func() { _ = d.DialogMedia.Close() })
+
+				return &d.DialogMedia, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), d.handleReInvite,
+					func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) }
+			},
+		},
+		{
+			name: "outbound",
+			setup: func(t *testing.T) (*DialogMedia, *sip.Request, func(*sip.Request, sip.ServerTransaction) error, func(*sip.Request) error) {
+				d, _ := newAnsweredTestClientDialog(t)
+				return &d.DialogMedia, newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1), d.handleReInvite,
+					func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) }
+			},
+		},
+	}
+
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			m, reInvite, handleReInvite, readAck := side.setup(t)
+			orig := m.MediaSession()
+			origPort := orig.Raddr.Port
+			m.mu.Lock()
+			w := m.RTPPacketWriter
+			m.mu.Unlock()
+
+			stop := make(chan struct{})
+			written := make(chan struct{})
+			go func() {
+				defer close(written)
+				payload := make([]byte, 160)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					_, _ = w.Write(payload)
+				}
+			}()
+			stopWriter := func() {
+				close(stop)
+				select {
+				case <-written:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the writer did not stop")
+				}
+			}
+
+			tx := newRespondedServerTx()
+			require.NoError(t, handleReInvite(reInvite, tx))
+			var res *sip.Response
+			select {
+			case res = <-tx.responded:
+			case <-time.After(5 * time.Second):
+				stopWriter()
+				t.Fatal("the re-INVITE was not answered")
+			}
+			require.Equal(t, sip.StatusOK, res.StatusCode, "reason: %s", res.Reason)
+
+			answerer := newMediaSessionForTest(t)
+			require.NoError(t, answerer.RemoteSDP(res.Body()))
+			ack := sip.NewRequest(sip.ACK, reInvite.Recipient)
+			ack.AppendHeader(&sip.CSeqHeader{SeqNo: reInvite.CSeq().SeqNo, MethodName: sip.ACK})
+			ack.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			ack.SetBody(answerer.LocalSDP())
+			err := readAck(ack)
+			stopWriter()
+			require.NoError(t, err)
+
+			cur := m.MediaSession()
+			require.False(t, orig == cur, "the answer was not applied to a fork")
+			assert.Equal(t, origPort, orig.Raddr.Port, "the answer rewrote the session carrying the media")
+			assert.Equal(t, answerer.Laddr.Port, cur.Raddr.Port, "the answer was not applied")
+		})
+	}
+}

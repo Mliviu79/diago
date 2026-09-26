@@ -604,8 +604,12 @@ func (d *DialogServerSession) AnswerLate() error {
 }
 
 // ReadAck reads the ACK to our 2xx. When the 2xx carried an offer, the ACK
-// carries the answer (RFC 3261 section 13.2.1), which is applied to the media
-// session and finalizes it, running the DTLS handshake of a DTLS-SRTP session.
+// carries the answer (RFC 3261 section 13.2.1). The answer to the offer in the
+// 2xx to our INVITE is applied to the media session, not carrying media yet,
+// and finalizes it, running the DTLS handshake of a DTLS-SRTP session. The
+// answer to the offer in the 2xx to a re-INVITE of the peer's is applied to the
+// fork that made the offer, which is then installed, since the media session
+// carries the media meanwhile.
 //
 // An ACK cannot be refused, so an answer that cannot be applied, or a handshake
 // that fails, ends the call with a BYE once the ACK has confirmed the dialog:
@@ -614,6 +618,20 @@ func (d *DialogServerSession) AnswerLate() error {
 // fingerprint mismatch. An answer waiting for this ACK sends the BYE and
 // reports the error itself.
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
+	if reInvite, err := d.applyAckAnswer(d.Context(), req); reInvite {
+		ackErr := d.DialogServerSession.ReadAck(req, tx)
+		if err != nil {
+			return errors.Join(err, ackErr, d.hangupNoMedia())
+		}
+		d.mu.Lock()
+		onMediaUpdate := d.onMediaUpdate
+		d.mu.Unlock()
+		if onMediaUpdate != nil {
+			onMediaUpdate(&d.DialogMedia)
+		}
+		return ackErr
+	}
+
 	// Check do we have some session
 	answerWaiting := false
 	err := func() error {
@@ -621,6 +639,11 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		defer d.mu.Unlock()
 		sess := d.mediaSession
 		if sess == nil {
+			return nil
+		}
+		// Only the ACK confirming the dialog answers the offer in the 2xx to
+		// our INVITE. A copy of it read later answers nothing more.
+		if d.LoadState() != sip.DialogStateEstablished {
 			return nil
 		}
 		contentType := req.ContentType()
