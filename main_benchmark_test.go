@@ -43,10 +43,20 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 		// {transport: "wss", serverAddr: "127.1.1.100:5063", encrypted: true},
 	}
 
+	// The server's handlers run on request goroutines, and the benchmark waits
+	// for them before it completes. A handler registers under handlersMu, and
+	// none registers once the wait has begun, so no Add races the Wait.
 	ctx, shutdown := context.WithCancel(context.Background())
-	wg := sync.WaitGroup{}
+	var (
+		wg             sync.WaitGroup
+		handlersMu     sync.Mutex
+		handlersClosed bool
+	)
 	t.Cleanup(func() {
 		shutdown()
+		handlersMu.Lock()
+		handlersClosed = true
+		handlersMu.Unlock()
 		wg.Wait()
 	})
 
@@ -60,7 +70,13 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 	srv := NewDiago(ua, WithTransport(tran))
 
 	err := srv.ServeBackground(ctx, func(d *DialogServerSession) {
+		handlersMu.Lock()
+		if handlersClosed {
+			handlersMu.Unlock()
+			return
+		}
 		wg.Add(1)
+		handlersMu.Unlock()
 		defer wg.Done()
 
 		ctx := d.Context()
@@ -89,8 +105,9 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 	})
 	require.NoError(t, err)
 
+	// Calls are limited only when MAX_REQUESTS is set, which is what refills
+	// the limit every second.
 	var maxInvitesPerSec chan struct{}
-	maxInvitesPerSec = make(chan struct{}, 100)
 	if v := os.Getenv("MAX_REQUESTS"); v != "" {
 		t.Logf("Limiting number of requests: %s req/s", v)
 		maxInvites, _ := strconv.Atoi(v)
@@ -135,14 +152,19 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 					dialog, err := phone.Invite(dialCtx, sip.Uri{Host: tran.BindHost, Port: tran.BindPort, User: "dialer"}, InviteOptions{})
 					cancel()
 
-					require.NoError(t, err)
+					// The body runs on a goroutine of its own, not the
+					// benchmark's, so a failed call is reported and skipped
+					// rather than failed with FailNow.
+					if !assert.NoError(t, err) {
+						continue
+					}
 
 					mediapkts := 0
 					outoforder := 0
 					audioReader, _ := dialog.AudioReader()
-					wg.Add(1)
+					readDone := make(chan struct{})
 					go func() {
-						defer wg.Done()
+						defer close(readDone)
 
 						buf := make([]byte, media.RTPBufSize)
 						var prevSeq uint16
@@ -174,6 +196,14 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 					}
 					// callDuration := time.Since(start)
 					dialog.Close()
+					// Closing the dialog ends the read. The counts are read
+					// once the reader has returned.
+					select {
+					case <-readDone:
+					case <-time.After(5 * time.Second):
+						t.Error("the media reader did not stop")
+						continue
+					}
 					assert.Empty(t, outoforder, "Out of order media detected")
 					assert.True(t, clientHangup)
 					assert.Greater(t, mediapkts, int(2*time.Second/(20*time.Millisecond))-10, "Not enough received packets")
