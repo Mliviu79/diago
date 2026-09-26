@@ -4,10 +4,13 @@
 package diago
 
 import (
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -222,6 +225,81 @@ func TestDialogServerRequestBeforeAnswerMedia(t *testing.T) {
 
 			assert.NotEqual(t, sip.StatusRequestPending, res.StatusCode)
 			assert.Equal(t, tc.wantState, d.LoadState())
+		})
+	}
+}
+
+// TestDialogServerAnswerWithByeBehindAck pins that an answer whose 2xx is
+// acknowledged returns without error when a BYE right behind the ACK ends the
+// dialog. The ACK and the BYE are read on goroutines of their own, and the
+// dialog notifies each state change to its observers one after another, so the
+// BYE, woken by the ACK's notification, can end the dialog while that
+// notification is still on its way to the answer. The answer then sees the
+// dialog end before it sees the ACK, and reports "No ACK received". The
+// observer registered here holds the ACK's notification at that point, which
+// makes the window certain instead of rare.
+func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
+	answers := []struct {
+		name   string
+		answer func(d *DialogServerSession) error
+	}{
+		{name: "early media Answer", answer: (*DialogServerSession).Answer},
+		{name: "early media AnswerOptions", answer: func(d *DialogServerSession) error {
+			return d.AnswerOptions(AnswerOptions{})
+		}},
+		{name: "RespondSDP", answer: func(d *DialogServerSession) error {
+			return d.RespondSDP(d.mediaSession.LocalSDP())
+		}},
+	}
+	for _, tc := range answers {
+		t.Run(tc.name, func(t *testing.T) {
+			d, inviteTx := newAnswerTestDialog(t)
+			sess := &media.MediaSession{
+				Codecs: []media.Codec{media.CodecAudioUlaw},
+				Mode:   sdp.ModeSendrecv,
+				Laddr:  net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+			}
+			require.NoError(t, sess.Init())
+			t.Cleanup(func() { _ = sess.Close() })
+			// Early media: the session exists before the answer.
+			d.mediaSession = sess
+
+			answered := make(chan error, 1)
+			go func() { answered <- tc.answer(d) }()
+			select {
+			case <-inviteTx.sent:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the 2xx was never sent")
+			}
+
+			// Registered after the answer's own observer and before the BYE's,
+			// so it runs between the two. It holds the ACK's notification until
+			// the dialog has ended, or for a bounded time when the BYE waits.
+			d.OnState(func(state sip.DialogState) {
+				if state != sip.DialogStateConfirmed {
+					return
+				}
+				select {
+				case <-d.Context().Done():
+				case <-time.After(300 * time.Millisecond):
+				}
+			})
+
+			bye := newBye(t, d, d.InviteRequest.CSeq().SeqNo+1)
+			res := handleEarly(t, func(tx sip.ServerTransaction) error {
+				return d.ReadBye(bye, tx)
+			}, func() {
+				readAck(t, d)
+			})
+			assert.Equal(t, sip.StatusOK, res.StatusCode)
+
+			select {
+			case err := <-answered:
+				assert.NoError(t, err, "the ACK was read, the answer must not report it missing")
+			case <-time.After(5 * time.Second):
+				t.Fatal("the answer did not return")
+			}
+			assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 		})
 	}
 }

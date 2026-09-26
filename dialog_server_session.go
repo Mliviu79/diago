@@ -45,9 +45,10 @@ type DialogServerSession struct {
 	// watchdog is the armed peer-refresh watchdog, set when the peer is the
 	// refresher and reset on an inbound refresh re-INVITE. Guarded by d.mu.
 	watchdog *peerRefreshWatchdog
-	// answering is set by an answer that sets up its media after the ACK,
-	// before it sends its 2xx, and closed when that answer returns.
-	// awaitAnswer waits on it. Guarded by d.mu.
+	// answering is set by an answer before it sends its 2xx, and closed when
+	// that answer returns: after the ACK is read and, for an answer that sets
+	// up its media after the ACK, after that too. awaitAnswer waits on it.
+	// Guarded by d.mu.
 	answering chan struct{}
 
 	// terminatingBye holds the BYE request that ended this dialog, captured by
@@ -286,7 +287,23 @@ func (d *DialogServerSession) launchSessionTimers(ta *timerAnswer) {
 	})
 }
 
+// RespondSDP answers the INVITE with a 2xx carrying body and waits for its
+// ACK. An in-dialog request that arrives meanwhile is handled once it returns,
+// see awaitAnswer.
 func (d *DialogServerSession) RespondSDP(body []byte) error {
+	d.mu.Lock()
+	answering := make(chan struct{})
+	d.answering = answering
+	d.mu.Unlock()
+	defer close(answering)
+
+	return d.respondSDP(body)
+}
+
+// respondSDP is RespondSDP for an answer that has marked itself in progress,
+// because it sets up media after the ACK and must keep in-dialog requests
+// waiting until that is done too.
+func (d *DialogServerSession) respondSDP(body []byte) error {
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
 
 	d.mu.Lock()
@@ -424,7 +441,7 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
-	if err := d.RespondSDP(sess.LocalSDP()); err != nil {
+	if err := d.respondSDP(sess.LocalSDP()); err != nil {
 		return err
 	}
 
@@ -480,7 +497,7 @@ func (d *DialogServerSession) AnswerLate() error {
 
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
-	if err := d.RespondSDP(localSDP); err != nil {
+	if err := d.respondSDP(localSDP); err != nil {
 		return err
 	}
 	// Must be called after media and reader writer is setup
@@ -524,13 +541,16 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 
 // awaitAnswer waits until our answer is complete before an in-dialog request is
 // handled, and reports whether it is. Complete means the ACK to our 2xx is read
-// and, for an answer that sets up its media after the ACK, that the answer has
-// returned. A peer sends its ACK before any request that follows it, but sipgo
-// hands each request to its handler on its own goroutine, so a later request
-// can be handled before the ACK, or before the answer has finalized and started
-// the media that a re-INVITE would replace. Waiting restores the order the
-// peer sent them in. The wait ends with tx, or after two T1 intervals, which
-// covers an ACK lost in transit and resent when our 2xx is first retransmitted.
+// and the answer has returned. A peer sends its ACK before any request that
+// follows it, but sipgo hands each request to its handler on its own
+// goroutine, so a later request can be handled before the ACK, or before the
+// answer has finalized and started the media that a re-INVITE would replace.
+// Reading the ACK is not enough either: the dialog notifies the ACK to its
+// observers one after another, and a BYE woken by that notification could end
+// the dialog before the notification reaches the answer, which would then
+// report the ACK missing. Waiting restores the order the peer sent them in.
+// The wait ends with tx, or after two T1 intervals, which covers an ACK lost
+// in transit and resent when our 2xx is first retransmitted.
 func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 	timer := time.NewTimer(2 * sip.T1)
 	defer timer.Stop()
