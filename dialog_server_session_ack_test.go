@@ -67,15 +67,16 @@ func newInDialogReInvite(t *testing.T, d *DialogServerSession, seq uint32) *sip.
 	return req
 }
 
-// sendOK sends our 2xx on another goroutine and returns once it is out. Like
-// Answer, the send then waits for the ACK; its result arrives on the channel.
+// sendOK sends our 2xx through RespondSDP on another goroutine and returns
+// once it is out. Like every answer, it marks itself in progress, which holds
+// in-dialog requests until it has returned, and waits for the ACK; its result
+// arrives on the channel.
 func sendOK(t *testing.T, d *DialogServerSession, inviteTx *sentServerTx) <-chan error {
 	t.Helper()
 
 	answered := make(chan error, 1)
 	go func() {
-		res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
-		answered <- d.DialogServerSession.WriteResponse(res)
+		answered <- d.RespondSDP(nil)
 	}()
 	select {
 	case <-inviteTx.sent:
@@ -166,6 +167,7 @@ var inDialogRequests = []struct {
 // so the later one can be handled first. A re-INVITE handled then is refused
 // 491 although the peer did nothing wrong. A BYE handled then ends the dialog
 // ahead of the ACK, and the ACK read after it confirms the ended dialog again.
+// Either way the 2xx send sees its ACK and returns without error.
 func TestDialogServerRequestBeforeAck(t *testing.T) {
 	for _, tc := range inDialogRequests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -179,7 +181,8 @@ func TestDialogServerRequestBeforeAck(t *testing.T) {
 				readAck(t, d)
 			})
 			select {
-			case <-answered:
+			case err := <-answered:
+				require.NoError(t, err, "the ACK was read, the 2xx send must not report it missing")
 			case <-time.After(5 * time.Second):
 				t.Fatal("the 2xx send did not return")
 			}
