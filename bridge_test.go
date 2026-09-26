@@ -17,6 +17,7 @@ import (
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -314,11 +315,32 @@ func (d *bridgeTestDialog) Do(ctx context.Context, req *sip.Request) (*sip.Respo
 	return nil, errors.New("bridge test dialog sends no requests")
 }
 
-// bridgeTestConn is a dialog's RTP socket. With deadlineErr set, every read
-// deadline it is given is applied and then reported as failed.
+// sendRTP sends the dialog one RTP packet from its peer.
+func (d *bridgeTestDialog) sendRTP(t *testing.T, seq uint16, ts uint32, payload []byte) {
+	t.Helper()
+	pkt := rtp.Packet{
+		Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: ts, SSRC: 1},
+		Payload: payload,
+	}
+	data, err := pkt.Marshal()
+	require.NoError(t, err)
+	_, err = d.peer.WriteTo(data, d.conn.LocalAddr())
+	require.NoError(t, err)
+}
+
+// bridgeTestConn is a dialog's RTP socket. It counts the reads in progress on
+// it. With deadlineErr set, every read deadline it is given is applied and then
+// reported as failed.
 type bridgeTestConn struct {
 	*net.UDPConn
 	deadlineErr error
+	reading     atomic.Int32
+}
+
+func (c *bridgeTestConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	c.reading.Add(1)
+	defer c.reading.Add(-1)
+	return c.UDPConn.ReadFrom(b)
 }
 
 func (c *bridgeTestConn) SetReadDeadline(t time.Time) error {
@@ -445,6 +467,31 @@ func TestBridgeMixWaitsForStopInProgress(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []DialogSession{c}, b.DialogSessionsList())
+}
+
+// TestBridgeMixLeaveStopsReadersOfEndedLoop checks that a leave stops the
+// readers of a mix whose loop ended on its own before it returns. The loop ends
+// on its own when a write to a dialog fails, as it does once a BYE has closed
+// that dialog's media, and its readers are then still reading the others.
+func TestBridgeMixLeaveStopsReadersOfEndedLoop(t *testing.T) {
+	b := NewBridgeMix()
+	talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
+	hungUp := newBridgeTestDialog(t, "hungup", media.CodecAudioUlaw)
+	for _, d := range []*bridgeTestDialog{talker, hungUp} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	// The talker's frame is mixed and written to the hung-up dialog, whose
+	// closed connection fails the write and ends the loop
+	require.NoError(t, hungUp.conn.Close())
+	talker.sendRTP(t, 1, 160, make([]byte, 160))
+	require.Eventually(t, func() bool { return b.stateRead() == 0 }, 2*time.Second, time.Millisecond, "mix loop did not end")
+	require.Eventually(t, func() bool { return talker.conn.reading.Load() == 1 }, 2*time.Second, time.Millisecond,
+		"the talker's reader did not go back to reading")
+
+	require.NoError(t, b.RemoveDialogSession(talker))
+	assert.Zero(t, talker.conn.reading.Load(), "a reader of the ended mix is still reading the dialog that left")
 }
 
 func TestIntegrationBridgingMix(t *testing.T) {

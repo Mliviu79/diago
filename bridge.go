@@ -397,9 +397,11 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 }
 
 // mixEnded runs when a mix loop exits. A loop that ended on its own goes from
-// running to idle. A loop stopped by mixStopWait stays in the stopping state,
-// which the stopping caller clears once mixWG has drained, so no other caller
-// starts a mix and adds to mixWG while that caller is still waiting.
+// running to idle, and its readers may still be reading the dialogs until the
+// next join or leave stops them. A loop stopped by mixStopWait stays in the
+// stopping state, which the stopping caller clears once mixWG has drained, so
+// no other caller starts a mix and adds to mixWG while that caller is still
+// waiting.
 func (b *BridgeMix) mixEnded() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -429,16 +431,15 @@ func (b *BridgeMix) mixStopWait() error {
 		b.mu.Lock()
 	}
 
-	stopInProgress, stopErr := b.mixStop()
-	if stopInProgress {
-		// This caller set the stopping state, so it clears it once the stopped
-		// mix has drained, even when stopping reported an error.
-		b.mu.Unlock()
-		b.mixWG.Wait()
-		b.mu.Lock()
-		b.stateWriteUnsafe(0)
-		close(b.mixStopped)
-	}
+	// This caller sets the stopping state, so it clears it once the stopped
+	// mix has drained, even when stopping reported an error.
+	stopErr := b.mixStop()
+	b.mu.Unlock()
+	b.mixWG.Wait()
+	b.mu.Lock()
+	b.stateWriteUnsafe(0)
+	close(b.mixStopped)
+
 	// Enable RTP again, on every dialog even when stopping reported an error,
 	// so no dialog is left with its reads stopped.
 	var startErr error
@@ -449,11 +450,9 @@ func (b *BridgeMix) mixStopWait() error {
 	return errors.Join(stopErr, startErr)
 }
 
-func (b *BridgeMix) mixStop() (bool, error) {
-	if state := b.mixState; state != 1 {
-		// Only if state is running this goroutine can stop it
-		return false, nil
-	}
+// mixStop stops reads on every dialog, whether or not a mix loop is running:
+// a loop that ended on its own may have left its readers reading them.
+func (b *BridgeMix) mixStop() error {
 	b.mixState = 2 // Set it stoping in progress
 	b.mixStopped = make(chan struct{})
 	var allErros error
@@ -461,7 +460,7 @@ func (b *BridgeMix) mixStop() (bool, error) {
 		err := d.Media().StopRTP(1, 0) // Stop reading
 		allErros = errors.Join(allErros, bridgeRTPControlErr(err))
 	}
-	return true, allErros
+	return allErros
 }
 
 // bridgeRTPControlErr returns the error of starting or stopping reads on a
