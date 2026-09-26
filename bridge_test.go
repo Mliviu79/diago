@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -350,6 +351,24 @@ func (c *bridgeTestConn) SetReadDeadline(t time.Time) error {
 	return c.deadlineErr
 }
 
+// bridgeTestWriter records every frame the bridge writes to a dialog, and
+// returns at once.
+type bridgeTestWriter struct {
+	frames chan []byte
+}
+
+func newBridgeTestWriter() *bridgeTestWriter {
+	return &bridgeTestWriter{frames: make(chan []byte, 1024)}
+}
+
+func (w *bridgeTestWriter) Write(b []byte) (int, error) {
+	select {
+	case w.frames <- slices.Clone(b):
+	default:
+	}
+	return len(b), nil
+}
+
 // stopBridgeMix stops the bridge's mix and waits, bounded, until it has.
 func stopBridgeMix(t *testing.T, b *BridgeMix) {
 	t.Helper()
@@ -524,6 +543,57 @@ func TestBridgeMixRefusesCodecMismatch(t *testing.T) {
 				"the mix is not reading the dialog")
 			assert.Never(t, func() bool { return a.conn.reading.Load() > 1 }, 100*time.Millisecond, time.Millisecond,
 				"a reader of the refused mix is still reading the dialog")
+		})
+	}
+}
+
+// TestBridgeMixPollDeliversRealtimeAudio checks that a mix in poll mode passes
+// on every frame of a stream arriving in real time. A stream's reader holds the
+// frame it has read until the mix takes it, and the realtime reader drops a
+// frame read more than two frame durations late, so the mix must take each
+// frame within a frame duration, however fast its writers return.
+func TestBridgeMixPollDeliversRealtimeAudio(t *testing.T) {
+	ulaw10ms := media.CodecAudioUlaw
+	ulaw10ms.SampleDur = 10 * time.Millisecond
+
+	for _, codec := range []media.Codec{media.CodecAudioUlaw, ulaw10ms} {
+		t.Run(codec.SampleDur.String(), func(t *testing.T) {
+			b := NewBridgeMix()
+			talker := newBridgeTestDialog(t, "talker", codec)
+			listener := newBridgeTestDialog(t, "listener", codec)
+			talker.media.audioWriter = newBridgeTestWriter()
+			heard := newBridgeTestWriter()
+			listener.media.audioWriter = heard
+			for _, d := range []*bridgeTestDialog{talker, listener} {
+				require.NoError(t, b.AddDialogSession(d))
+			}
+			t.Cleanup(func() { stopBridgeMix(t, b) })
+
+			// Every byte of frame i is 0x20+i, which decodes and encodes back to
+			// itself
+			const frames = 25
+			var sent []byte
+			start := time.Now()
+			for i := range frames {
+				time.Sleep(time.Until(start.Add(time.Duration(i) * codec.SampleDur)))
+				frame := byte(0x20 + i)
+				payload := bytes.Repeat([]byte{frame}, int(codec.SampleTimestamp()))
+				talker.sendRTP(t, uint16(i), uint32(i)*codec.SampleTimestamp(), payload)
+				sent = append(sent, frame)
+			}
+
+			var got []byte
+			timeout := time.After(2 * time.Second)
+			for len(got) < frames {
+				select {
+				case frame := <-heard.frames:
+					got = append(got, frame[0])
+					continue
+				case <-timeout:
+				}
+				break
+			}
+			assert.Equal(t, sent, got, "the listener must hear every frame the talker sent")
 		})
 	}
 }

@@ -496,9 +496,9 @@ func (b *BridgeMix) mixStart() error {
 	ctx, cancelPoll := context.WithCancel(context.Background())
 	// We could decide and optimize here, poll vs deadlines
 	poll := b.Poll
+	firstDialogCodec := media.Codec{}
 	rwStreams, err := func() ([]*bridgePCMStream, error) {
 		rwStreams := make([]*bridgePCMStream, len(b.dialogs))
-		firstDialogCodec := media.Codec{}
 
 		for i, d := range b.dialogs {
 			rwStreams[i] = &bridgePCMStream{}
@@ -560,14 +560,14 @@ func (b *BridgeMix) mixStart() error {
 		defer b.mixWG.Done()
 		defer b.mixEnded()
 		b.log.Debug("Starting mix loop", "streams.len", len(rwStreams))
-		if err := b.mixLoop(rwStreams, poll); err != nil {
+		if err := b.mixLoop(rwStreams, poll, firstDialogCodec.SampleDur); err != nil {
 			b.log.Info("Mix stopped with error", "error", err)
 		}
 	}(rwStreams)
 	return nil
 }
 
-func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool) error {
+func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur time.Duration) error {
 	mixBuf := make([]byte, media.RTPBufSize)
 
 	if len(rwStreams) == 1 {
@@ -590,17 +590,20 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool) error {
 		return nil
 	}
 
-	// Currently we consider that sample clock is done by Audio Writers
-	// The slowest will cause jitter.
-	// TODO fix this with single ticker
-	for {
+	// A round starts every frame duration, on one ticker, so a reader holding a
+	// frame hands it over within a frame duration. That stays inside the two
+	// frame durations the realtime reader allows before it drops a frame as
+	// late. A round that the writers pace past its tick is followed at once by
+	// the next.
+	ticker := time.NewTicker(frameDur)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
 		n, err := b.mixAllStreams(rwStreams, mixBuf, poll)
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			bridgeTrace("Nothing read, delaying read")
-			time.Sleep(50 * time.Millisecond)
+			bridgeTrace("Nothing read, waiting for the next round")
 			continue
 		}
 
