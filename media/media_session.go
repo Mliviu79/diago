@@ -2328,8 +2328,8 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 		fingerprints := dtlsSet.fingerprints
 		dtlsSetup := dtlsSet.setup
 
+		// No a=connection: RFC 5763 section 5 forbids it for DTLS-SRTP.
 		s = append(s, "a=setup:"+dtlsSetup)
-		s = append(s, "a=connection:new") // Cane be new or existing. Marks it needs new transport
 		for _, d := range fingerprints {
 			if d.fingerprint == "" {
 				continue

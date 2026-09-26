@@ -669,3 +669,30 @@ func TestDTLSHandshakeTimeout(t *testing.T) {
 		})
 	}
 }
+
+// TestDTLSSDPHasNoConnectionAttribute pins RFC 5763 section 5: "The endpoint
+// MUST NOT use the connection attribute defined in [RFC4145]." DTLS runs over
+// UDP, where a=connection has no meaning, and RFC 8842 section 5.1 leaves it to
+// the TCP and SCTP usages. Whether an association continues is told by the
+// setup role, the fingerprints and the transport instead. It is checked on an
+// offer, an answer and a subsequent offer, each of which still carries a=setup
+// and a=fingerprint.
+func TestDTLSSDPHasNoConnectionAttribute(t *testing.T) {
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	offer, answer := negotiateDTLS(t, offerer, answerer, nil)
+	finalizeBoth(t, offerer, answerer)
+
+	bodies := map[string][]byte{
+		"offer":            offer,
+		"answer":           answer,
+		"subsequent offer": offerer.Fork().LocalSDP(),
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			require.NotContains(t, string(body), "a=connection:")
+			require.Contains(t, string(body), "a=setup:")
+			require.Contains(t, string(body), "a=fingerprint:")
+		})
+	}
+}
