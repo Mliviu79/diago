@@ -272,7 +272,7 @@ type MediaSession struct {
 	// safe.
 	establishedICE *establishedICE
 
-	onFinalize func() error
+	onFinalize func(ctx context.Context) error
 
 	sessionID      uint64
 	sessionVersion uint64
@@ -1180,9 +1180,9 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 		}
 	}
 
-	s.onFinalize = func() error {
+	s.onFinalize = func(ctx context.Context) error {
 		if s.iceEnabled() {
-			if err := s.startICE(); err != nil {
+			if err := s.startICE(ctx); err != nil {
 				return err
 			}
 			if err := dialDTLS(); err != nil {
@@ -1196,7 +1196,7 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 			"laddr", s.dtlsConn.LocalAddr().String(),
 			"raddr", s.dtlsConn.RemoteAddr().String(),
 		)
-		if err := s.dtlsConn.Handshake(); err != nil {
+		if err := s.dtlsConn.HandshakeContext(ctx); err != nil {
 			return fmt.Errorf("dtls conn handshake: %w", err)
 		}
 
@@ -1380,7 +1380,7 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 // The offerer is the controlling agent (RFC 8445 section 6.1). Once a pair is
 // nominated, rtpConn and rtcpConn become views on the one ICE connection, so
 // the rest of MediaSession reads and writes over ICE without further changes.
-func (s *MediaSession) startICE() error {
+func (s *MediaSession) startICE(ctx context.Context) error {
 	// Only the session that created the agent can run checks. A fork reaching
 	// here would be a fault in RemoteSDP, which never arms Finalize for one, so
 	// it is refused rather than dereferenced.
@@ -1388,7 +1388,7 @@ func (s *MediaSession) startICE() error {
 		return fmt.Errorf("media session: ICE connectivity checks need an agent, this session has none")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), ICEConnectTimeout)
+	ctx, cancel := context.WithTimeout(ctx, ICEConnectTimeout)
 	defer cancel()
 
 	controlling := s.dtlsEndpointRole() == DTLSEndpointRoleOfferer
@@ -1443,8 +1443,15 @@ func (s *MediaSession) retireDTLS() error {
 // Finalize finalizes negotiation and does verification
 // Should be called only after exchage of SDP is done
 func (s *MediaSession) Finalize() error {
+	return s.FinalizeContext(context.Background())
+}
+
+// FinalizeContext is Finalize bounded by ctx. The ICE connectivity checks and
+// the DTLS handshake it runs wait for the peer, and end with an error when ctx
+// is done first.
+func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 	if s.onFinalize != nil {
-		err := s.onFinalize()
+		err := s.onFinalize(ctx)
 		s.onFinalize = nil
 		return err
 	}

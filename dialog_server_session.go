@@ -140,6 +140,15 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 	if err := d.DialogServerSession.Respond(183, "Session Progress", body, headers...); err != nil {
 		return err
 	}
+
+	// The 183 carries our answer, and the caller treats it as the answer (RFC
+	// 3261 section 13.2.1), so the negotiation is complete here and the DTLS
+	// handshake, which an answerer providing early media starts at once (RFC
+	// 5763 section 5), runs now. Media sent before it would go out with no SRTP
+	// keys. The wait ends with the dialog, when the caller gives up.
+	if err := rtpSess.Sess.FinalizeContext(d.Context()); err != nil {
+		return err
+	}
 	return rtpSess.MonitorBackground()
 }
 
