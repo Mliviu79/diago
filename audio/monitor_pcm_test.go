@@ -133,7 +133,7 @@ func TestMonitorPCMStereo(t *testing.T) {
 
 		errWrite := make(chan error)
 		go func() {
-			_, err = media.WriteAll(mon, audioAlawBuf, 160)
+			_, err := media.WriteAll(mon, audioAlawBuf, 160)
 			errWrite <- err
 		}()
 
@@ -170,7 +170,7 @@ func TestMonitorPCMStereo(t *testing.T) {
 
 		errWrite := make(chan error)
 		go func() {
-			_, err = media.WriteAll(mon, audioAlawBufBig, 160)
+			_, err := media.WriteAll(mon, audioAlawBufBig, 160)
 			errWrite <- err
 		}()
 
