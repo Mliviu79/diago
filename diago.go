@@ -780,7 +780,7 @@ func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Br
 
 	// Keep things compatible
 	if opts.Originator == nil {
-		opts.Originator = bridge.Originator
+		opts.Originator = bridge.originator()
 	}
 
 	if err := d.Invite(ctx, InviteClientOptions{

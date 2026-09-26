@@ -24,8 +24,11 @@ type Bridger interface {
 	AddDialogSession(d DialogSession) error
 }
 
+// Bridge proxies the audio of two dialogs to each other. It is safe for
+// concurrent use once initialized, and is not copied after that.
 type Bridge struct {
-	// Originator is dialog session that created bridge
+	// Originator is dialog session that created bridge. AddDialogSession sets
+	// it, under the bridge's lock, when the first dialog joins.
 	Originator DialogSession
 	// DTMFpass is also dtmf pipeline and proxy. By default only audio media is proxied
 	// NOTE: this may not work if you are already processing DTMF with AudioReaderDTMF
@@ -36,6 +39,8 @@ type Bridge struct {
 	// This gives high performance but you can not attach any pipeline in media processing
 	// RTPpass bool
 
+	// mu guards dialogs and Originator
+	mu      sync.Mutex
 	dialogs []DialogSession
 
 	// minDialogs is just helper flag when to start proxy
@@ -50,10 +55,10 @@ var bridgeReadPool = sync.Pool{
 }
 
 // NewBridge creates bridge with default settings.
-func NewBridge() Bridge {
-	b := Bridge{}
+func NewBridge() (b Bridge) {
+	// Set up in the result itself: a Bridge holds a lock
 	b.Init(media.DefaultLogger())
-	return b
+	return
 }
 
 func (b *Bridge) Init(log *slog.Logger) {
@@ -68,10 +73,23 @@ func (b *Bridge) Init(log *slog.Logger) {
 }
 
 func (b *Bridge) GetDialogs() []DialogSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.dialogs
 }
 
+// originator returns Originator, read under the lock AddDialogSession sets it
+// under.
+func (b *Bridge) originator() DialogSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Originator
+}
+
 func (b *Bridge) AddDialogSession(d DialogSession) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// The dialog's codec is read from its media session
 	if d.Media().MediaSession() == nil {
 		return fmt.Errorf("dialog session has no media %q", d.Id())
@@ -128,7 +146,7 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 		defer func(start time.Time) {
 			b.log.Debug("Proxy media setup", "dur", time.Since(start).String())
 		}(time.Now())
-		if err := b.proxyMedia(); err != nil {
+		if err := b.proxyMedia(dialogs); err != nil {
 			if errors.Is(err, io.EOF) {
 				return
 			}
@@ -147,15 +165,26 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 //
 // Experimental
 func (b *Bridge) ProxyMedia() error {
+	dialogs, err := b.proxyDialogs()
+	if err != nil {
+		return err
+	}
+	return b.proxyMedia(dialogs)
+}
+
+// proxyDialogs returns the dialogs a proxy started by hand runs on, or why it
+// can not be started.
+func (b *Bridge) proxyDialogs() ([]DialogSession, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if len(b.dialogs) < 2 {
-		return fmt.Errorf("number of dialogs must equal to 2")
+		return nil, fmt.Errorf("number of dialogs must equal to 2")
 	}
 
 	if b.WaitDialogsNum < 3 {
-		return fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
+		return nil, fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
 	}
-
-	return b.proxyMedia()
+	return b.dialogs, nil
 }
 
 // ProxyMediaControl starts proxy in background and allows to stop proxy at any time.
@@ -165,31 +194,28 @@ func (b *Bridge) ProxyMedia() error {
 //
 // Experimental
 func (b *Bridge) ProxyMediaControl() (func() error, error) {
-	if len(b.dialogs) < 2 {
-		return nil, fmt.Errorf("number of dialogs must equal to 2")
-	}
-
-	if b.WaitDialogsNum < 3 {
-		return nil, fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
+	dialogs, err := b.proxyDialogs()
+	if err != nil {
+		return nil, err
 	}
 
 	proxyErr := make(chan error, 1)
 	go func() {
-		proxyErr <- b.proxyMedia()
+		proxyErr <- b.proxyMedia(dialogs)
 	}()
 
 	// The stop ends the proxy's reads, which it waits in while the dialogs are
 	// silent, and then clears their deadline so the dialogs can be read again.
 	stopF := func() error {
 		var stopErr error
-		for _, d := range b.dialogs {
+		for _, d := range dialogs {
 			stopErr = errors.Join(stopErr, bridgeRTPControlErr(d.Media().StopRTP(1, 0)))
 		}
 
 		// Wait goroutine termination
 		err := <-proxyErr
 		var startErr error
-		for _, d := range b.dialogs {
+		for _, d := range dialogs {
 			startErr = errors.Join(startErr, bridgeRTPControlErr(d.Media().StartRTP(1, 0)))
 		}
 		return errors.Join(stopErr, err, startErr)
@@ -200,12 +226,12 @@ func (b *Bridge) ProxyMediaControl() (func() error, error) {
 
 // proxyMedia starts routine to proxy media between
 // Should be called after having 2 or more participants
-func (b *Bridge) proxyMedia() error {
+func (b *Bridge) proxyMedia(dialogs []DialogSession) error {
 	var err error
 	log := b.log
 
-	m1 := b.dialogs[0].Media()
-	m2 := b.dialogs[1].Media()
+	m1 := dialogs[0].Media()
+	m2 := dialogs[1].Media()
 
 	// Lets for now simplify proxy and later optimize
 

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -71,7 +72,7 @@ func TestBridgeProxy(t *testing.T) {
 	err = b.AddDialogSession(outgoing)
 	require.NoError(t, err)
 
-	err = b.proxyMedia()
+	err = b.proxyMedia(b.GetDialogs())
 	require.ErrorIs(t, err, io.EOF)
 
 	// Confirm all data is proxied
@@ -250,6 +251,76 @@ func TestBridgeProxyMediaControl(t *testing.T) {
 		_, err := proxyMediaControl(t, &b)
 		require.Error(t, err)
 	})
+}
+
+// TestBridgeConcurrentUse checks, under the race detector, that a Bridge can be
+// used from several goroutines at once: dialogs joining it while its dialogs
+// and its originator are read, and while its proxy is started by hand.
+func TestBridgeConcurrentUse(t *testing.T) {
+	b := NewBridge()
+	b.WaitDialogsNum = 3 // The proxy is started by hand
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+	// InviteBridge dials from the bridge's originator, with its From. The call
+	// is refused, so it only reads the originator.
+	for _, d := range []*bridgeTestDialog{a, c} {
+		d.sipDialog.InviteRequest.AppendHeader(&sip.FromHeader{Address: sip.Uri{User: d.id, Host: "127.0.0.1"}, Params: sip.NewParams()})
+	}
+	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+		return sip.NewResponseFromRequest(req, sip.StatusBusyHere, "Busy Here", nil)
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	done := make(chan error, 4)
+	go func() {
+		var err error
+		for _, d := range []*bridgeTestDialog{a, c} {
+			err = errors.Join(err, b.AddDialogSession(d))
+		}
+		done <- err
+	}()
+	go func() {
+		for len(b.GetDialogs()) < 2 {
+			if time.Now().After(deadline) {
+				done <- errors.New("the dialogs did not join")
+				return
+			}
+			runtime.Gosched()
+		}
+		done <- nil
+	}()
+	go func() {
+		for {
+			stop, err := b.ProxyMediaControl()
+			if err == nil {
+				done <- stop()
+				return
+			}
+			if time.Now().After(deadline) {
+				done <- err
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	go func() {
+		_, err := dg.InviteBridge(context.Background(), sip.Uri{User: "x", Host: "127.0.0.1", Port: 5070}, &b, InviteOptions{})
+		if err == nil {
+			err = errors.New("a refused call was bridged")
+		} else {
+			err = nil
+		}
+		done <- err
+	}()
+	for range 4 {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the bridge's users did not finish")
+		}
+	}
+	assert.Equal(t, []DialogSession{a, c}, b.GetDialogs())
 }
 
 // TestBridgeRefusedDialogStaysOut checks that a dialog the bridge refuses is
