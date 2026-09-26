@@ -459,7 +459,8 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 		return err
 	}
 
-	if err := sess.Finalize(); err != nil {
+	// The handshake ends with the call.
+	if err := sess.FinalizeContext(d.Context()); err != nil {
 		return err
 	}
 	// fmt.Println("--------SErver finalized")
@@ -559,8 +560,8 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 				return err
 			}
 
-			// Finalize session
-			if err := sess.Finalize(); err != nil {
+			// Finalize session. The handshake ends with the call.
+			if err := sess.FinalizeContext(d.Context()); err != nil {
 				d.ackAnswerErr = err
 				return err
 			}

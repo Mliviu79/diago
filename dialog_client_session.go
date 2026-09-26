@@ -313,7 +313,12 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 			return err
 		}
 
-		if err := sess.Finalize(); err != nil {
+		// The wait for the answer cannot see the caller give up while the
+		// handshake runs, so the handshake ends with ctx, and with the call.
+		fctx, cancel := contextWithDialog(ctx, d.Context())
+		err := sess.FinalizeContext(fctx)
+		cancel()
+		if err != nil {
 			return err
 		}
 
@@ -406,12 +411,27 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 	// NOTE it generally advisable todo this after successfull ACK:
 	// Server may not even listen yet as it is waiting for ACK
 	if msess != nil {
-		if err := msess.Finalize(); err != nil {
+		// The handshake ends with ctx, and with the call.
+		fctx, cancel := contextWithDialog(ctx, d.Context())
+		defer cancel()
+		if err := msess.FinalizeContext(fctx); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// contextWithDialog returns a context done when ctx or dialogCtx is done, for
+// work a caller bounds with a context of its own that belongs to the call as
+// well, and has to end when the call does.
+func contextWithDialog(ctx context.Context, dialogCtx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(dialogCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // AckLate sends ACK with media. Use this in combination with late(delay) offer
@@ -723,7 +743,8 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 	}
 
 	// Another in-dialog offer can swap the session under the lock meanwhile.
-	return d.MediaSession().Finalize()
+	// The handshake ends with the call.
+	return d.MediaSession().FinalizeContext(d.Context())
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {

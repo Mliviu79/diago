@@ -637,3 +637,35 @@ func TestDTLSSessionNeedsCertificate(t *testing.T) {
 		})
 	}
 }
+
+// TestDTLSHandshakeTimeout pins that a DTLS handshake the peer never completes
+// ends after DTLSHandshakeTimeout, whatever context Finalize was given. The
+// DTLS stack retransmits its flights for as long as its context lives, so a
+// peer that never answers parked Finalize, and the socket with it, for good.
+// Both roles are covered: the client sends a ClientHello nobody answers, and
+// the server waits for one that never comes.
+func TestDTLSHandshakeTimeout(t *testing.T) {
+	prev := DTLSHandshakeTimeout
+	DTLSHandshakeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { DTLSHandshakeTimeout = prev })
+
+	for _, setup := range []string{"active", "passive"} {
+		t.Run("answerer "+setup, func(t *testing.T) {
+			offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+			answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+			answerer.DTLSConf.SDPSetupRole = func(bool) string { return setup }
+			_, answer := negotiateDTLS(t, offerer, answerer, nil)
+			require.Contains(t, string(answer), "a=setup:"+setup)
+
+			// Only the answerer runs its side; the offerer never does.
+			done := make(chan error, 1)
+			go func() { done <- answerer.Finalize() }()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case <-time.After(10 * time.Second):
+				t.Fatal("the handshake outlived DTLSHandshakeTimeout")
+			}
+		})
+	}
+}

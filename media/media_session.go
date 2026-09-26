@@ -1271,7 +1271,9 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 			"laddr", s.dtlsConn.LocalAddr().String(),
 			"raddr", s.dtlsConn.RemoteAddr().String(),
 		)
-		if err := s.dtlsConn.HandshakeContext(ctx); err != nil {
+		hctx, cancel := context.WithTimeout(ctx, DTLSHandshakeTimeout)
+		defer cancel()
+		if err := s.dtlsConn.HandshakeContext(hctx); err != nil {
 			return fmt.Errorf("dtls conn handshake: %w", err)
 		}
 
@@ -1519,7 +1521,8 @@ func (s *MediaSession) Finalize() error {
 
 // FinalizeContext is Finalize bounded by ctx. The ICE connectivity checks and
 // the DTLS handshake it runs wait for the peer, and end with an error when ctx
-// is done first.
+// is done first, or at the latest after ICEConnectTimeout and
+// DTLSHandshakeTimeout.
 func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 	if s.onFinalize != nil {
 		err := s.onFinalize(ctx)

@@ -532,9 +532,10 @@ func TestDialogClientInviteFailed(t *testing.T) {
 // TestDialogClientReInviteACKReadsMediaUnderLock asserts the ACK to a peer's
 // re-INVITE reads the media session under the dialog lock. Handling another
 // in-dialog offer swaps the session under that lock, so an unguarded read races
-// it. The race only shows under -race.
+// it. The race only shows under -race. The dialog is a real one, since the
+// ACK's handshake is bounded by its context.
 func TestDialogClientReInviteACKReadsMediaUnderLock(t *testing.T) {
-	d := &DialogClientSession{}
+	d := newTestClientDialog(t, sip.DialogStateConfirmed)
 	d.mediaSession = &media.MediaSession{}
 
 	swapped := make(chan struct{})

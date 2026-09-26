@@ -16,6 +16,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
@@ -24,6 +25,12 @@ import (
 
 var (
 	DTLSDebug bool
+
+	// DTLSHandshakeTimeout caps how long the DTLS handshake Finalize runs may
+	// wait for the peer. The DTLS stack retransmits its flights for as long as
+	// its context lives, so without a cap a peer that never completes the
+	// handshake would hold it, the caller of Finalize and the socket forever.
+	DTLSHandshakeTimeout = 30 * time.Second
 )
 
 // Secure RTP modes for MediaSession.SecureRTP.
