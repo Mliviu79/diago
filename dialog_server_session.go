@@ -644,6 +644,7 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		if err != nil {
 			return errors.Join(err, ackErr, d.hangupNoMedia())
 		}
+		d.runMediaUpdateHooks()
 		d.mu.Lock()
 		onMediaUpdate := d.onMediaUpdate
 		d.mu.Unlock()
@@ -930,6 +931,9 @@ func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 	}()
 	if errors.Is(err, errMediaUpdateAfterAnswer) {
 		return false, errors.Join(err, d.hangupNoMedia())
+	}
+	if err == nil {
+		d.runMediaUpdateHooks()
 	}
 	return false, err
 }

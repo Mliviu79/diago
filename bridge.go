@@ -326,6 +326,12 @@ type BridgeMix struct {
 	// mixCodec is the audio of the last mix started, zero once the bridge is
 	// empty
 	mixCodec media.Codec
+	// streamCodecs is the codec the running mix decodes and encodes each
+	// dialog with, by dialog ID, and nil while no mix runs
+	streamCodecs map[string]media.Codec
+	// unhooks removes, by dialog ID, the media update hook of each dialog in
+	// the bridge
+	unhooks map[string]func()
 
 	// WaitDialogsNum is just helper flag when to start proxy
 	WaitDialogsNum int
@@ -401,6 +407,10 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 	}
 
 	b.dialogs = append(b.dialogs, d)
+	if b.unhooks == nil {
+		b.unhooks = map[string]func(){}
+	}
+	b.unhooks[d.Id()] = d.Media().addMediaUpdateHook(func() { b.mediaUpdated(d) })
 	b.log.Debug("Added dialog", "dialog", d.Id(), "total", len(b.dialogs))
 	if err := b.mixStart()[d.Id()]; err != nil {
 		// The dialog can not be mixed with the others. The join is refused: the
@@ -439,6 +449,7 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 	for i, d := range b.dialogs {
 		if d.Id() == dialogID {
 			b.dialogs = append(b.dialogs[:i], b.dialogs[i+1:]...)
+			b.unhookUnsafe(dialogID)
 			break
 		}
 	}
@@ -446,6 +457,42 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 	b.log.Debug("Removed dialog", "dialog", dialog.Id(), "total", len(b.dialogs))
 	b.mixStart()
 	return stopErr
+}
+
+// unhookUnsafe removes the media update hook of a dialog that has left the
+// bridge.
+func (b *BridgeMix) unhookUnsafe(dialogID string) {
+	if unhook, ok := b.unhooks[dialogID]; ok {
+		unhook()
+		delete(b.unhooks, dialogID)
+	}
+}
+
+// mediaUpdated runs after a media update of a dialog in the bridge. The mix
+// decodes and encodes each dialog with the codec the dialog had when the mix
+// started, so once the dialog's codec has changed the mix is restarted, as a
+// join or leave restarts it: the dialog is mixed with its new codec, or taken
+// out of the bridge when its audio no longer matches the mix.
+func (b *BridgeMix) mediaUpdated(d DialogSession) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	mixedWith, mixed := b.streamCodecs[d.Id()]
+	if !mixed {
+		// No mix runs with this dialog. The next one reads its codec anew.
+		return
+	}
+	p := MediaProps{}
+	d.Media().audioReaderProps(&p)
+	if p.Codec == mixedWith {
+		return
+	}
+
+	b.log.Debug("Dialog codec changed, restarting mix", "dialog", d.Id(), "codec", p.Codec.String())
+	if err := b.mixStopWait(); err != nil {
+		// As at a leave, the mix restarts on every dialog regardless.
+		b.log.Warn("Stopping the mix for a media update failed", "dialog", d.Id(), "error", err)
+	}
+	b.mixStart()
 }
 
 // mixEnded runs when a mix loop exits. A loop that ended on its own goes from
@@ -540,6 +587,7 @@ func (b *BridgeMix) mixStart() (notMixed map[string]error) {
 		// Don't start a new mix to avoid WaitGroup Add/Wait race.
 		return nil
 	}
+	b.streamCodecs = nil
 	if len(b.dialogs) < 1 {
 		b.mixCodec = media.Codec{}
 		return nil
@@ -560,6 +608,7 @@ func (b *BridgeMix) mixStart() (notMixed map[string]error) {
 	}
 
 	notMixed = map[string]error{}
+	streamCodecs := map[string]media.Codec{}
 	var rwStreams []*bridgePCMStream
 	for _, d := range b.dialogs {
 		stream := &bridgePCMStream{}
@@ -568,9 +617,11 @@ func (b *BridgeMix) mixStart() (notMixed map[string]error) {
 			continue
 		}
 		rwStreams = append(rwStreams, stream)
+		streamCodecs[d.Id()] = stream.codec
 	}
 	for id, err := range notMixed {
 		b.log.Warn("Dialog can not be mixed, taking it out of the bridge", "dialog", id, "error", err)
+		b.unhookUnsafe(id)
 	}
 	b.dialogs = slices.DeleteFunc(b.dialogs, func(d DialogSession) bool {
 		_, out := notMixed[d.Id()]
@@ -584,6 +635,7 @@ func (b *BridgeMix) mixStart() (notMixed map[string]error) {
 		return notMixed
 	}
 	b.mixCodec = mixCodec
+	b.streamCodecs = streamCodecs
 
 	ctx, cancelPoll := context.WithCancel(context.Background())
 	// We could decide and optimize here, poll vs deadlines
@@ -722,6 +774,8 @@ type bridgePCMStream struct {
 	id uint32
 	r  io.Reader
 	w  io.Writer
+	// codec is the dialog's codec the stream decodes and encodes
+	codec media.Codec
 	// media is the dialog's media, whose current session a direct read sets its
 	// deadline on
 	media *DialogMedia
@@ -756,8 +810,9 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mi
 	}
 
 	// Attach PCM decoder
+	readCodec := p.Codec
 	pcmReader := audio.PCMDecoderReader{}
-	if err := pcmReader.Init(p.Codec, rtr); err != nil {
+	if err := pcmReader.Init(readCodec, rtr); err != nil {
 		return err
 	}
 
@@ -776,6 +831,7 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mi
 	*stream = bridgePCMStream{
 		r:         &pcmReader,
 		w:         &pcmWriter,
+		codec:     readCodec,
 		media:     m,
 		id:        m.RTPPacketWriter.SSRC,
 		buf:       make([]byte, media.RTPBufSize),

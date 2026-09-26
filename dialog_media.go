@@ -156,6 +156,12 @@ type DialogMedia struct {
 	// tests.
 	ackTimers ackTimers
 
+	// mediaUpdateHooks are told of every media update, as onMediaUpdate is,
+	// for the package's own use: a bridge mixing or proxying the dialog's audio
+	// has to know when its codec changes, and onMediaUpdate belongs to the
+	// application.
+	mediaUpdateHooks []*mediaUpdateHook
+
 	// mediaUpdating is set while a media update waits, with mu released, for
 	// the handshake of a new DTLS association. Another update is kept out
 	// until it is done.
@@ -679,6 +685,58 @@ func (d *DialogMedia) Close() error {
 	return errors.Join(e1, e2, e3, e4, e5)
 }
 
+// mediaUpdateHook is one function addMediaUpdateHook registered.
+type mediaUpdateHook struct {
+	f func()
+}
+
+// addMediaUpdateHook has f called after every update that replaces the media
+// session, once the session is in place and with the dialog's lock released,
+// and before the application's OnMediaUpdate. It returns the function that
+// removes f again. f runs on the goroutine that handled the update, which a
+// re-INVITE may hold until f returns.
+func (d *DialogMedia) addMediaUpdateHook(f func()) (remove func()) {
+	h := &mediaUpdateHook{f: f}
+	d.mu.Lock()
+	d.mediaUpdateHooks = append(d.mediaUpdateHooks, h)
+	d.mu.Unlock()
+	return func() {
+		d.mu.Lock()
+		d.mediaUpdateHooks = slices.DeleteFunc(d.mediaUpdateHooks, func(x *mediaUpdateHook) bool { return x == h })
+		d.mu.Unlock()
+	}
+}
+
+// runMediaUpdateHooks calls the media update hooks. It is called without the
+// dialog's lock, after an update that has replaced the media session.
+func (d *DialogMedia) runMediaUpdateHooks() {
+	d.mu.Lock()
+	hooks := slices.Clone(d.mediaUpdateHooks)
+	d.mu.Unlock()
+	for _, h := range hooks {
+		h.f()
+	}
+}
+
+// mediaUpdatedUnsafe calls the media update hooks and then the application's
+// OnMediaUpdate, with the dialog's lock released while they run. It is called
+// with the lock held, after an update that has replaced the media session.
+func (d *DialogMedia) mediaUpdatedUnsafe() {
+	hooks := slices.Clone(d.mediaUpdateHooks)
+	onMediaUpdate := d.onMediaUpdate
+	if len(hooks) == 0 && onMediaUpdate == nil {
+		return
+	}
+	d.mu.Unlock()
+	defer d.mu.Lock()
+	for _, h := range hooks {
+		h.f()
+	}
+	if onMediaUpdate != nil {
+		onMediaUpdate(d)
+	}
+}
+
 func (d *DialogMedia) OnClose(f func() error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -851,11 +909,7 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 			return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
 		}
 
-		if d.onMediaUpdate != nil {
-			d.mu.Unlock()
-			d.onMediaUpdate(d)
-			d.mu.Lock()
-		}
+		d.mediaUpdatedUnsafe()
 	}
 
 	// A request for an offer can not be answered with an SDP we never built.
@@ -979,6 +1033,7 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 		return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
 	}
 
+	d.runMediaUpdateHooks()
 	if onMediaUpdate != nil {
 		onMediaUpdate(d)
 	}

@@ -439,6 +439,9 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 
 	// Apply SDP on existing (Early) media if it exists
 	if err := med.checkEarlyMedia(remoteSDP); err != errNoRTPSession {
+		if err == nil {
+			med.runMediaUpdateHooks()
+		}
 		return err
 	}
 
@@ -729,6 +732,9 @@ func (d *DialogClientSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 	if errors.Is(err, errMediaUpdateAfterAnswer) {
 		return false, errors.Join(err, d.hangupNoMedia())
 	}
+	if err == nil {
+		d.runMediaUpdateHooks()
+	}
 	return false, err
 }
 
@@ -956,7 +962,9 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 		return nil
 	}
 
-	// The app callback runs without the lock, to avoid deadlocks.
+	// The hooks and the app callback run without the lock, to avoid
+	// deadlocks.
+	d.runMediaUpdateHooks()
 	d.mu.Lock()
 	onMediaUpdate := d.onMediaUpdate
 	d.mu.Unlock()

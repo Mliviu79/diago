@@ -18,6 +18,7 @@ import (
 
 	"github.com/emiago/diago/audio"
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/pion/rtp"
@@ -1300,6 +1301,108 @@ func TestBridgeMixJoinDuringReInvite(t *testing.T) {
 		require.NoError(t, b.AddDialogSession(c))
 		require.NoError(t, b.RemoveDialogSession(c))
 	}
+}
+
+// newAnsweredBridgeTestDialog returns a confirmed dialog whose media answered,
+// over loopback and the way an answer sets it up, an offer of PCMU from peer.
+// The dialog can also take PCMA, and handles a re-INVITE as the dialog does.
+func newAnsweredBridgeTestDialog(t *testing.T, id string) (d *bridgeTestDialog, peer *net.UDPConn) {
+	t.Helper()
+	loopback := net.IPv4(127, 0, 0, 1)
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback})
+	require.NoError(t, err)
+	t.Cleanup(func() { peer.Close() })
+
+	sess := &media.MediaSession{
+		Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+		Laddr:  net.UDPAddr{IP: loopback},
+		Mode:   sdp.ModeSendrecv,
+	}
+	require.NoError(t, sess.Init())
+	offer := sdp.GenerateForAudio(loopback, loopback, peer.LocalAddr().(*net.UDPAddr).Port, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ULAW})
+	require.NoError(t, sess.RemoteSDP(offer))
+
+	rtpSess := media.NewRTPSession(sess)
+	m := &DialogMedia{}
+	m.initRTPSessionUnsafe(sess, rtpSess)
+	m.onCloseUnsafe(rtpSess.Close)
+	require.NoError(t, rtpSess.MonitorBackground())
+	t.Cleanup(func() { _ = m.Close() })
+
+	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: id, Host: "127.0.0.1", Port: 5060})
+	sipDialog := &sipgo.Dialog{ID: id, InviteRequest: invite}
+	sipDialog.InitWithState(sip.DialogStateConfirmed)
+	return &bridgeTestDialog{id: id, media: m, sipDialog: sipDialog}, peer
+}
+
+// sendRTPFrom sends the dialog's media one RTP packet of payload type pt from
+// peer.
+func (d *bridgeTestDialog) sendRTPFrom(t *testing.T, peer *net.UDPConn, pt uint8, seq uint16, ts uint32, payload []byte) {
+	t.Helper()
+	pkt := rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: seq, Timestamp: ts, SSRC: 1},
+		Payload: payload,
+	}
+	data, err := pkt.Marshal()
+	require.NoError(t, err)
+	laddr := d.media.MediaSession().Laddr
+	_, err = peer.WriteTo(data, &laddr)
+	require.NoError(t, err)
+}
+
+// TestBridgeMixFollowsCodecChange checks that a re-INVITE moving a dialog in a
+// running mix from PCMU to PCMA, which has the same sample rate and frame
+// duration, is followed at once: the mix decodes what the dialog sends as PCMA
+// and encodes what it hears as PCMA. A mix left decoding it as PCMU passes the
+// PCMA bytes on to the others as they are, and sends it PCMU, garbling the audio
+// both ways until the next join or leave.
+func TestBridgeMixFollowsCodecChange(t *testing.T) {
+	b := NewBridgeMix()
+	// The peers send their frames as the test goes, not in real time
+	b.RealtimeReader = false
+	moved, movedPeer := newAnsweredBridgeTestDialog(t, "moved")
+	listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
+	movedHeard := newBridgeTestWriter()
+	moved.media.audioWriter = movedHeard
+	listenerHeard := newBridgeTestWriter()
+	listener.media.audioWriter = listenerHeard
+	for _, d := range []*bridgeTestDialog{moved, listener} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	// Every byte of a PCMU frame is its value, which decodes and encodes back
+	// to itself
+	listener.sendRTP(t, 1, 0, bytes.Repeat([]byte{0x20}, 160))
+	waitHeard(t, movedHeard, 0x20)
+
+	// The peer moves the dialog to PCMA
+	offer := sdp.GenerateForAudio(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1),
+		movedPeer.LocalAddr().(*net.UDPAddr).Port, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ALAW})
+	tx := &fakeServerTransaction{}
+	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
+	require.NoError(t, moved.media.handleMediaUpdate(context.Background(), newReInvite(t, offer), tx, contact))
+	require.Equal(t, sip.StatusOK, tx.res.StatusCode)
+	p := MediaProps{}
+	moved.media.audioReaderProps(&p)
+	require.Equal(t, media.CodecAudioAlaw, p.Codec)
+
+	// What the moved dialog says in PCMA the listener hears in PCMU
+	alawFrame := bytes.Repeat([]byte{0x55}, 160)
+	pcm := make([]byte, 2*len(alawFrame))
+	_, err := audio.DecodeAlawTo(pcm, alawFrame)
+	require.NoError(t, err)
+	want := ulawEncode(pcm)[0]
+	require.NotEqual(t, ulawEncode(ulawDecode(alawFrame))[0], want, "the frame must tell PCMA from PCMU")
+	moved.sendRTPFrom(t, movedPeer, media.CodecAudioAlaw.PayloadType, 1, 0, alawFrame)
+	waitHeard(t, listenerHeard, want)
+
+	// What the listener says in PCMU the moved dialog hears in PCMA
+	_, err = audio.EncodeAlawTo(alawFrame, ulawDecode(bytes.Repeat([]byte{0x21}, 160)))
+	require.NoError(t, err)
+	require.NotEqual(t, byte(0x21), alawFrame[0], "the frame must tell PCMA from PCMU")
+	listener.sendRTP(t, 2, 160, bytes.Repeat([]byte{0x21}, 160))
+	waitHeard(t, movedHeard, alawFrame[0])
 }
 
 func TestIntegrationBridgingMix(t *testing.T) {
