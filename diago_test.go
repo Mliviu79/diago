@@ -420,9 +420,11 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 // missing headers, a request without CSeq cannot open a client transaction,
 // and the retransmission and the ACK have to be sent deliberately. A request
 // without CSeq never reaches the handler: the transaction layer answers it
-// before any handler runs. The control row is a complete INVITE for a dialog
-// that does not exist, which is answered 481 as before. Each row gets its own
-// Diago so the handler runs and the logged warnings belong to that row alone.
+// before any handler runs, with a reason phrase sipgo chooses and its own tests
+// pin, so that row asserts the status only. The control row is a complete
+// INVITE for a dialog that does not exist, which is answered 481 as before.
+// Each row gets its own Diago so the handler runs and the logged warnings
+// belong to that row alone.
 func TestDiagoNewInviteMissingHeader(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -438,7 +440,7 @@ func TestDiagoNewInviteMissingHeader(t *testing.T) {
 		{name: "without To", absent: "To", wantStatus: sip.StatusBadRequest, wantReason: "Missing To Header Field", wantRuns: 1, wantWarn: true},
 		{name: "without Call-ID", absent: "Call-ID", wantStatus: sip.StatusBadRequest, wantReason: "Missing Call-ID Header Field", wantRuns: 1, wantWarn: true},
 		{name: "without Contact", absent: "Contact", wantStatus: sip.StatusBadRequest, wantReason: "Missing Contact Header Field", wantRuns: 1, wantWarn: true},
-		{name: "without CSeq", absent: "CSeq", wantStatus: sip.StatusBadRequest, wantReason: "Bad Request", wantRuns: 0},
+		{name: "without CSeq", absent: "CSeq", wantStatus: sip.StatusBadRequest, wantRuns: 0},
 		{name: "unknown dialog", toTag: "unknown", wantStatus: sip.StatusCallTransactionDoesNotExists, wantReason: "Call/Transaction Does Not Exist", wantRuns: 1},
 	}
 	for i, tc := range tests {
@@ -450,7 +452,9 @@ func TestDiagoNewInviteMissingHeader(t *testing.T) {
 			h.send(t, "INVITE", invite)
 			first := readFinalResponse(t, h.client, time.Second)
 			assert.Equal(t, tc.wantStatus, first.StatusCode)
-			assert.Equal(t, tc.wantReason, first.Reason)
+			if tc.wantReason != "" {
+				assert.Equal(t, tc.wantReason, first.Reason)
+			}
 
 			h.send(t, "INVITE", invite)
 			second := readFinalResponse(t, h.client, time.Second)
