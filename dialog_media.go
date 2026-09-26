@@ -1060,12 +1060,17 @@ func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 	}
 }
 
+// StopRTP sets a read or write deadline, as MediaSession.StopRTP does, on the
+// dialog's current media session, which it takes under the dialog's lock since
+// a re-INVITE replaces the session under it.
 func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) error {
-	return d.mediaSession.StopRTP(rw, dur)
+	return d.MediaSession().StopRTP(rw, dur)
 }
 
+// StartRTP clears the deadline StopRTP sets, on the dialog's current media
+// session.
 func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) error {
-	return d.mediaSession.StartRTP(rw)
+	return d.MediaSession().StartRTP(rw)
 }
 
 // dtmfCodec returns the telephone-event codec DTMF is carried on for this

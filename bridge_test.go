@@ -1017,6 +1017,44 @@ func TestBridgeMixTakesOutRenegotiatedDialog(t *testing.T) {
 	}
 }
 
+// TestBridgeMixJoinDuringReInvite checks, under the race detector, that joins
+// and leaves read the media session of a dialog in the bridge under the
+// dialog's lock, as a re-INVITE replaces that session under it.
+func TestBridgeMixJoinDuringReInvite(t *testing.T) {
+	b := NewBridgeMix()
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	require.NoError(t, b.AddDialogSession(a))
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	reinviting := make(chan struct{})
+	reinvited := make(chan struct{})
+	go func() {
+		defer close(reinvited)
+		for {
+			select {
+			case <-reinviting:
+				return
+			default:
+			}
+			a.renegotiate(media.CodecAudioUlaw)
+		}
+	}()
+	defer func() {
+		close(reinviting)
+		select {
+		case <-reinvited:
+		case <-time.After(5 * time.Second):
+			t.Error("the re-INVITEs did not stop")
+		}
+	}()
+
+	for i := range 20 {
+		c := newBridgeTestDialog(t, fmt.Sprintf("c%d", i), media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(c))
+		require.NoError(t, b.RemoveDialogSession(c))
+	}
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
