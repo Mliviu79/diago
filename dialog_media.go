@@ -1121,11 +1121,11 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 	}()
 
 	return func() error {
-		if err := d.mediaSession.StopRTP(1, 0); err != nil {
+		if err := d.StopRTP(1, 0); err != nil {
 			return err
 		}
 		wg.Wait() // This makes sure we have exited reading
-		if err := d.mediaSession.StartRTP(1); err != nil {
+		if err := d.StartRTP(1, 0); err != nil {
 			return err
 		}
 		return readErr
@@ -1141,7 +1141,7 @@ func (d *DialogMedia) ListenContext(pctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		if pctx.Err() != nil {
-			d.mediaSession.StopRTP(1, 0)
+			d.StopRTP(1, 0)
 		}
 	}()
 	audioReader, err := d.AudioReader()
@@ -1162,7 +1162,7 @@ func (d *DialogMedia) ListenContext(pctx context.Context) error {
 func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 	buf := make([]byte, media.RTPBufSize)
 
-	d.mediaSession.StopRTP(1, dur)
+	d.StopRTP(1, dur)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err

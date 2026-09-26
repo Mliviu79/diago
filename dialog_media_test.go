@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -549,4 +550,79 @@ func TestDialogMediaCloseJoinsJitterBuffer(t *testing.T) {
 	default:
 		t.Fatal("Close returned before the read loop stopped")
 	}
+}
+
+// TestDialogMediaRTPControlReadsMediaUnderLock asserts that stopping and
+// starting RTP reads, directly or through the Listen helpers, reads the media
+// session under the dialog lock. A re-INVITE swaps the session for a fork of it
+// under that lock, so an unguarded read races it. The race only shows under
+// -race.
+func TestDialogMediaRTPControlReadsMediaUnderLock(t *testing.T) {
+	// swapWhile runs control while another goroutine swaps d's session for a
+	// fork of it, as a re-INVITE does.
+	swapWhile := func(t *testing.T, d *DialogMedia, control func() error) {
+		t.Helper()
+		d.mu.Lock()
+		fork := d.mediaSession.Fork()
+		d.mu.Unlock()
+
+		swapped := make(chan struct{})
+		go func() {
+			defer close(swapped)
+			d.mu.Lock()
+			d.mediaSession = fork
+			d.mu.Unlock()
+		}()
+		require.NoError(t, control())
+		select {
+		case <-swapped:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the session was never swapped")
+		}
+	}
+	// newAnswered returns dialog media negotiated with a peer that sends
+	// nothing, with its RTP monitor running.
+	newAnswered := func(t *testing.T) *DialogMedia {
+		t.Helper()
+		sess := newMediaSessionForTest(t)
+		require.NoError(t, sess.RemoteSDP(newMediaSessionForTest(t).LocalSDP()))
+		return newICEDialogMedia(t, sess)
+	}
+	// timeoutIsEnd reports a read ended by its deadline as a clean end.
+	timeoutIsEnd := func(err error) error {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+
+	t.Run("StopRTP and StartRTP", func(t *testing.T) {
+		d := newAnswered(t)
+		swapWhile(t, d, func() error {
+			return errors.Join(d.StopRTP(1, 0), d.StartRTP(1, 0))
+		})
+	})
+
+	t.Run("ListenBackground", func(t *testing.T) {
+		d := newAnswered(t)
+		stop, err := d.ListenBackground()
+		require.NoError(t, err)
+		swapWhile(t, d, stop)
+	})
+
+	t.Run("ListenContext", func(t *testing.T) {
+		d := newAnswered(t)
+		swapWhile(t, d, func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			return d.ListenContext(ctx)
+		})
+	})
+
+	t.Run("ListenUntil", func(t *testing.T) {
+		d := newAnswered(t)
+		swapWhile(t, d, func() error {
+			return timeoutIsEnd(d.ListenUntil(20 * time.Millisecond))
+		})
+	})
 }
