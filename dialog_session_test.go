@@ -141,8 +141,8 @@ func TestDialogHandleReferNotifyContentType(t *testing.T) {
 
 			dialogHandleReferNotify(d, req, tx)
 
-			require.Len(t, conn.msgs, 1)
-			res, ok := conn.msgs[0].(*sip.Response)
+			require.Len(t, conn.messages(), 1)
+			res, ok := conn.messages()[0].(*sip.Response)
 			require.True(t, ok)
 			require.Equal(t, tc.expectCode, res.StatusCode)
 
@@ -165,8 +165,8 @@ func TestDialogHandleReferNotifyShortBody(t *testing.T) {
 
 	dialogHandleReferNotify(d, req, tx)
 
-	require.Len(t, conn.msgs, 1)
-	res := conn.msgs[0].(*sip.Response)
+	require.Len(t, conn.messages(), 1)
+	res := conn.messages()[0].(*sip.Response)
 	require.Equal(t, sip.StatusBadRequest, res.StatusCode)
 }
 
@@ -190,8 +190,8 @@ func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
 	}()
 	require.Nil(t, recovered, "dialogHandleReferNotify panicked")
 
-	require.Len(t, conn.msgs, 1)
-	res, ok := conn.msgs[0].(*sip.Response)
+	require.Len(t, conn.messages(), 1)
+	res, ok := conn.messages()[0].(*sip.Response)
 	require.True(t, ok)
 	require.Equal(t, sip.StatusBadRequest, res.StatusCode)
 	require.Equal(t, -1, notified, "OnNotify must not fire on a rejected NOTIFY")
@@ -236,8 +236,8 @@ func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 
 			dialogHandleReferNotify(d, req, tx)
 
-			require.Len(t, conn.msgs, 1)
-			res, ok := conn.msgs[0].(*sip.Response)
+			require.Len(t, conn.messages(), 1)
+			res, ok := conn.messages()[0].(*sip.Response)
 			require.True(t, ok)
 			require.Equal(t, sip.StatusOK, res.StatusCode)
 			require.Zero(t, d.hangups, "a %s NOTIFY ended the dialog", tc.name)
@@ -331,13 +331,14 @@ func sendReferNotify(t *testing.T, d DialogSession, body, event, subscriptionSta
 
 	dialogHandleReferNotify(d, req, tx)
 
-	if len(conn.msgs) != 1 {
-		t.Errorf("a REFER NOTIFY was answered %d times, want once", len(conn.msgs))
+	msgs := conn.messages()
+	if len(msgs) != 1 {
+		t.Errorf("a REFER NOTIFY was answered %d times, want once", len(msgs))
 		return 0
 	}
-	res, ok := conn.msgs[0].(*sip.Response)
+	res, ok := msgs[0].(*sip.Response)
 	if !ok {
-		t.Errorf("a REFER NOTIFY was answered with %T, want a response", conn.msgs[0])
+		t.Errorf("a REFER NOTIFY was answered with %T, want a response", msgs[0])
 		return 0
 	}
 	return res.StatusCode

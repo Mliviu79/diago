@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,7 @@ import (
 func TestIntegrationStreamWAV(t *testing.T) {
 	fh, err := os.Open("testdata/files/demo-echodone.wav")
 	require.NoError(t, err)
+	defer fh.Close()
 	sess, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
 	require.NoError(t, err)
 	defer sess.Close()
@@ -45,6 +47,7 @@ func TestIntegrationStreamWAV(t *testing.T) {
 func TestIntegrationPlaybackStreamWAV(t *testing.T) {
 	fh, err := os.Open("testdata/files/demo-echodone.wav")
 	require.NoError(t, err)
+	defer fh.Close()
 	sess, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
 	require.NoError(t, err)
 	defer sess.Close()
@@ -69,9 +72,19 @@ func TestIntegrationPlaybackStreamWAV(t *testing.T) {
 
 func TestIntegrationPlaybackFile(t *testing.T) {
 	r, w := io.Pipe()
+	readerDone := make(chan struct{})
 	go func() {
-		defer t.Log("Reader stopped")
+		defer close(readerDone)
 		io.ReadAll(r)
+	}()
+	// Closing the writer ends the reader, which the test waits for.
+	defer func() {
+		w.Close()
+		select {
+		case <-readerDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the pipe reader did not stop")
+		}
 	}()
 
 	dialog := &DialogServerSession{

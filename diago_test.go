@@ -1119,7 +1119,7 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 
 	dg := NewDiago(ua, WithTransport(tran))
 
-	err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	newTran, _ := dg.getTransport("udp")

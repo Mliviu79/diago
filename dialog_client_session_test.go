@@ -112,7 +112,7 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 		phone := newDialer(ua)
 		// listening but stil with empheral port
-		err := phone.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+		err := phone.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		ports := phone.server.TransportLayer().ListenPorts("udp")
@@ -130,7 +130,7 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 		phone := newDialer(ua)
 		// Start listener in order to reuse UDP listener
-		err := phone.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+		err := phone.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		phone.server.TransportLayer().ListenPorts("udp")
@@ -191,7 +191,7 @@ func TestIntegrationDialogClientCancel(t *testing.T) {
 		defer ua.Close()
 
 		dg := newDialer(ua)
-		dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+		dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -267,7 +267,7 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.NewDialog(sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, NewDialogOptions{})
@@ -332,7 +332,7 @@ func TestIntegrationDialogClientReinvite(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{})
@@ -374,7 +374,7 @@ func TestIntegrationDialogClientReinviteKeepAlive(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15066}, InviteOptions{})
@@ -699,7 +699,7 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	})
 
 	dg := newDialer(ua)
-	err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
+	err := dg.ServeBackground(t.Context(), func(d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	// Media negotiaton should fail and call should be terminated
