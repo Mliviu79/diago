@@ -39,9 +39,11 @@ type Bridge struct {
 	// This gives high performance but you can not attach any pipeline in media processing
 	// RTPpass bool
 
-	// mu guards dialogs and Originator
+	// mu guards dialogs, Originator and proxy
 	mu      sync.Mutex
 	dialogs []DialogSession
+	// proxy is the proxy AddDialogSession started, nil until it starts
+	proxy *bridgeProxy
 
 	// minDialogs is just helper flag when to start proxy
 	WaitDialogsNum int
@@ -142,23 +144,67 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 		return nil
 	}
 
+	proxy := newBridgeProxy()
+	b.proxy = proxy
 	go func() {
+		defer close(proxy.done)
 		defer func(start time.Time) {
 			b.log.Debug("Proxy media setup", "dur", time.Since(start).String())
 		}(time.Now())
-		if err := b.proxyMedia(dialogs); err != nil {
-			if errors.Is(err, io.EOF) {
-				return
-			}
-
-			b.log.Error("Proxy media stopped", "error", err)
+		proxy.err = b.proxyMedia(dialogs, proxy.stopping)
+		// A hangup closes a dialog's media, which ends the proxy's read of it
+		// and fails a write to it
+		if proxy.err == nil || errors.Is(proxy.err, io.EOF) || errors.Is(proxy.err, net.ErrClosed) {
+			b.log.Debug("Proxy media stopped", "error", proxy.err)
+			return
 		}
+		b.log.Error("Proxy media stopped", "error", proxy.err)
 	}()
 	return nil
 }
 
+// StopProxyMedia stops the proxy AddDialogSession started and waits until it
+// has stopped reading and writing the dialogs. It returns what the proxy ended
+// with, as ProxyMedia does, and nil when no proxy was started.
+//
+// The proxy stops on its own once either dialog ends. Until it has stopped it
+// can take the next frame of the dialog left, so call StopProxyMedia before
+// reading that dialog. It can be called any number of times.
+func (b *Bridge) StopProxyMedia() error {
+	b.mu.Lock()
+	proxy := b.proxy
+	b.mu.Unlock()
+	if proxy == nil {
+		return nil
+	}
+	return proxy.stop()
+}
+
+// bridgeProxy is a proxy running in the background, and its stop.
+type bridgeProxy struct {
+	// stopping is closed to stop the proxy
+	stopping chan struct{}
+	stopOnce sync.Once
+	// done is closed once the proxy has stopped, and err set before
+	done chan struct{}
+	err  error
+}
+
+func newBridgeProxy() *bridgeProxy {
+	return &bridgeProxy{stopping: make(chan struct{}), done: make(chan struct{})}
+}
+
+// stop stops the proxy, waits until it has stopped, and returns what it ended
+// with.
+func (p *bridgeProxy) stop() error {
+	p.stopOnce.Do(func() { close(p.stopping) })
+	<-p.done
+	return p.err
+}
+
 // ProxyMedia is explicit starting proxy media.
 // In some cases you want to control and be signaled when bridge terminates
+// It returns once either dialog, or its media, has ended.
 //
 // NOTE: Should be only called if you want to start manually proxying.
 // It is required to set WaitDialogsNum higher than 2
@@ -169,7 +215,7 @@ func (b *Bridge) ProxyMedia() error {
 	if err != nil {
 		return err
 	}
-	return b.proxyMedia(dialogs)
+	return b.proxyMedia(dialogs, nil)
 }
 
 // proxyDialogs returns the dialogs a proxy started by hand runs on, or why it
@@ -188,7 +234,9 @@ func (b *Bridge) proxyDialogs() ([]DialogSession, error) {
 }
 
 // ProxyMediaControl starts proxy in background and allows to stop proxy at any time.
-// Stop should be called once and it is not needed to be called if call is terminating
+// The proxy stops on its own once either dialog ends. Stop waits until the proxy
+// has stopped and returns what it ended with, and can be called any number of
+// times.
 // Like ProxyMedia, it requires WaitDialogsNum higher than 2, so no other proxy
 // runs on the dialogs.
 //
@@ -199,35 +247,17 @@ func (b *Bridge) ProxyMediaControl() (func() error, error) {
 		return nil, err
 	}
 
-	proxyErr := make(chan error, 1)
+	proxy := newBridgeProxy()
 	go func() {
-		proxyErr <- b.proxyMedia(dialogs)
+		defer close(proxy.done)
+		proxy.err = b.proxyMedia(dialogs, proxy.stopping)
 	}()
-
-	// The stop ends the proxy's reads, which it waits in while the dialogs are
-	// silent, and then clears their deadline so the dialogs can be read again.
-	stopF := func() error {
-		var stopErr error
-		for _, d := range dialogs {
-			stopErr = errors.Join(stopErr, bridgeRTPControlErr(d.Media().StopRTP(1, 0)))
-		}
-
-		// Wait goroutine termination
-		err := <-proxyErr
-		var startErr error
-		for _, d := range dialogs {
-			startErr = errors.Join(startErr, bridgeRTPControlErr(d.Media().StartRTP(1, 0)))
-		}
-		return errors.Join(stopErr, err, startErr)
-	}
-
-	return stopF, nil
+	return proxy.stop, nil
 }
 
-// proxyMedia starts routine to proxy media between
-// Should be called after having 2 or more participants
-func (b *Bridge) proxyMedia(dialogs []DialogSession) error {
-	var err error
+// proxyMedia proxies the audio of two dialogs to each other, one direction
+// each way, until proxyWait ends them.
+func (b *Bridge) proxyMedia(dialogs []DialogSession, stopping <-chan struct{}) error {
 	log := b.log
 
 	m1 := dialogs[0].Media()
@@ -235,8 +265,8 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession) error {
 
 	// Lets for now simplify proxy and later optimize
 
+	errCh := make(chan error, 2)
 	if b.DTMFpass {
-		errCh := make(chan error, 4)
 		go func() {
 			errCh <- b.proxyMediaWithDTMF(m1, m2)
 		}()
@@ -244,14 +274,8 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession) error {
 		go func() {
 			errCh <- b.proxyMediaWithDTMF(m2, m1)
 		}()
-
-		// Wait for all to finish
-		for i := 0; i < 2; i++ {
-			err = errors.Join(err, <-errCh)
-		}
-		return err
+		return proxyWait(dialogs, errCh, stopping)
 	}
-	errCh := make(chan error, 2)
 	func() {
 		p1, p2 := MediaProps{}, MediaProps{}
 		r := m1.audioReaderProps(&p1)
@@ -272,11 +296,39 @@ func (b *Bridge) proxyMedia(dialogs []DialogSession) error {
 		go proxyMediaBackground(log, r, w, errCh)
 	}()
 
-	// Wait for all to finish
-	for i := 0; i < 2; i++ {
+	return proxyWait(dialogs, errCh, stopping)
+}
+
+// proxyWait waits for the two directions of a proxy between dialogs, which
+// send their results to errCh, until either direction ends, either dialog ends
+// or stopping is closed. A direction still reading a dialog would take the
+// next frame from whoever reads that dialog next, so proxyWait then ends both.
+// It returns once both have ended and the dialogs can be read again.
+func proxyWait(dialogs []DialogSession, errCh chan error, stopping <-chan struct{}) error {
+	var err error
+	running := 2
+	select {
+	case err = <-errCh:
+		running--
+	case <-dialogs[0].Context().Done():
+	case <-dialogs[1].Context().Done():
+	case <-stopping:
+	}
+
+	// A read deadline ends a direction without an error, also while its dialog
+	// is silent. It is cleared once both have ended.
+	var stopErr error
+	for _, d := range dialogs {
+		stopErr = errors.Join(stopErr, bridgeRTPControlErr(d.Media().StopRTP(1, 0)))
+	}
+	for ; running > 0; running-- {
 		err = errors.Join(err, <-errCh)
 	}
-	return err
+	var startErr error
+	for _, d := range dialogs {
+		startErr = errors.Join(startErr, bridgeRTPControlErr(d.Media().StartRTP(1, 0)))
+	}
+	return errors.Join(err, stopErr, startErr)
 }
 
 func proxyMediaBackground(log *slog.Logger, reader io.Reader, writer io.Writer, ch chan error) {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
@@ -44,40 +45,26 @@ func TestBridgeProxy(t *testing.T) {
 	b := NewBridge()
 	b.WaitDialogsNum = 99 // Do not start proxy
 
-	incoming := &DialogServerSession{
-		DialogMedia: DialogMedia{
-			mediaSession: &media.MediaSession{
-				Codecs: []media.Codec{media.CodecAudioAlaw},
-			},
-			audioReader:     bytes.NewBuffer(make([]byte, 9999)),
-			audioWriter:     bytes.NewBuffer(make([]byte, 0)),
-			RTPPacketReader: media.NewRTPPacketReader(nil, media.CodecAudioAlaw),
-			RTPPacketWriter: media.NewRTPPacketWriter(nil, media.CodecAudioAlaw),
-		},
-	}
-	outgoing := &DialogClientSession{
-		DialogMedia: DialogMedia{
-			mediaSession: &media.MediaSession{
-				Codecs: []media.Codec{media.CodecAudioAlaw},
-			},
-			audioReader:     bytes.NewBuffer(make([]byte, 9999)),
-			audioWriter:     bytes.NewBuffer(make([]byte, 0)),
-			RTPPacketReader: media.NewRTPPacketReader(nil, media.CodecAudioAlaw),
-			RTPPacketWriter: media.NewRTPPacketWriter(nil, media.CodecAudioAlaw),
-		},
-	}
+	// The dialogs have sockets and contexts, as every answered dialog has: the
+	// proxy watches their contexts and stops their reads with a deadline
+	incoming := newBridgeTestDialog(t, "incoming", media.CodecAudioAlaw)
+	incoming.media.audioReader = bytes.NewBuffer(make([]byte, 9999))
+	incoming.media.audioWriter = bytes.NewBuffer(make([]byte, 0))
+	outgoing := newBridgeTestDialog(t, "outgoing", media.CodecAudioAlaw)
+	outgoing.media.audioReader = bytes.NewBuffer(make([]byte, 9999))
+	outgoing.media.audioWriter = bytes.NewBuffer(make([]byte, 0))
 
 	err := b.AddDialogSession(incoming)
 	require.NoError(t, err)
 	err = b.AddDialogSession(outgoing)
 	require.NoError(t, err)
 
-	err = b.proxyMedia(b.GetDialogs())
+	err = b.proxyMedia(b.GetDialogs(), nil)
 	require.ErrorIs(t, err, io.EOF)
 
 	// Confirm all data is proxied
-	assert.Equal(t, 9999, incoming.audioWriter.(*bytes.Buffer).Len())
-	assert.Equal(t, 9999, outgoing.audioWriter.(*bytes.Buffer).Len())
+	assert.Equal(t, 9999, incoming.media.audioWriter.(*bytes.Buffer).Len())
+	assert.Equal(t, 9999, outgoing.media.audioWriter.(*bytes.Buffer).Len())
 }
 
 func TestBridgeNoTranscodingAllowed(t *testing.T) {
@@ -321,6 +308,128 @@ func TestBridgeConcurrentUse(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []DialogSession{a, c}, b.GetDialogs())
+}
+
+// bridgeErrorLog is a log handler that keeps the message of every record at
+// Error or above.
+type bridgeErrorLog struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (h *bridgeErrorLog) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelError
+}
+
+func (h *bridgeErrorLog) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages = append(h.messages, r.Message)
+	return nil
+}
+
+func (h *bridgeErrorLog) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *bridgeErrorLog) WithGroup(string) slog.Handler      { return h }
+
+func (h *bridgeErrorLog) logged() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.messages)
+}
+
+// stopProxyMedia calls StopProxyMedia and waits, bounded, for it to return.
+func stopProxyMedia(t *testing.T, b *Bridge) error {
+	t.Helper()
+	stopped := make(chan error, 1)
+	go func() { stopped <- b.StopProxyMedia() }()
+	select {
+	case err := <-stopped:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopProxyMedia did not return")
+		return nil
+	}
+}
+
+// readFrame reads the dialog's next frame through its audio reader and fails
+// the test unless it is frame.
+func (d *bridgeTestDialog) readFrame(t *testing.T, frame []byte) {
+	t.Helper()
+	r, err := d.media.AudioReader()
+	require.NoError(t, err)
+	require.NoError(t, d.conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, media.RTPBufSize)
+	n, err := r.Read(buf)
+	require.NoError(t, err, "%s did not get its frame", d.id)
+	assert.Equal(t, frame, buf[:n])
+}
+
+// TestBridgeProxyStopsWhenADialogEnds checks that the proxy AddDialogSession
+// starts stops once either dialog ends, as a BYE ends it and then closes its
+// media, and hands the other dialog back: nothing of the proxy is left reading
+// it, StopProxyMedia returns once the proxy has stopped, and the dialog's next
+// frame reaches its own reader. A proxy left reading the other dialog took that
+// frame and failed to write it to the dialog that ended. A hangup is not an
+// error, so nothing is logged at Error.
+func TestBridgeProxyStopsWhenADialogEnds(t *testing.T) {
+	for _, dtmfPass := range []bool{false, true} {
+		for _, ending := range []string{"a", "c"} {
+			t.Run(fmt.Sprintf("DTMFpass=%t/%sEnds", dtmfPass, ending), func(t *testing.T) {
+				errorLog := &bridgeErrorLog{}
+				b := Bridge{DTMFpass: dtmfPass}
+				b.Init(slog.New(errorLog))
+				a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+				c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+				require.NoError(t, b.AddDialogSession(a))
+				require.NoError(t, b.AddDialogSession(c))
+				frame := bytes.Repeat([]byte{0x20}, 160)
+				a.sendRTP(t, 1, 0, frame)
+				require.Equal(t, frame, c.recvRTP(t), "the proxy does not run")
+
+				ended, left := a, c
+				if ending == "c" {
+					ended, left = c, a
+				}
+				require.Eventually(t, func() bool { return left.conn.reading.Load() == 1 }, 2*time.Second, time.Millisecond,
+					"the proxy is not reading the dialog")
+				ended.hangUp(t)
+				require.Eventually(t, func() bool { return left.conn.reading.Load() == 0 }, 2*time.Second, time.Millisecond,
+					"the proxy is still reading the dialog left")
+
+				err := stopProxyMedia(t, &b)
+				assert.True(t, err == nil || errors.Is(err, io.EOF), "a hangup ended the proxy with %v", err)
+				next := bytes.Repeat([]byte{0x21}, 160)
+				left.sendRTP(t, 2, 160, next)
+				left.readFrame(t, next)
+				assert.Empty(t, errorLog.logged(), "a hangup was logged as an error")
+			})
+		}
+	}
+
+	t.Run("StopWhileBothGoOn", func(t *testing.T) {
+		b := NewBridge()
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(a))
+		require.NoError(t, b.AddDialogSession(c))
+		frame := bytes.Repeat([]byte{0x20}, 160)
+		a.sendRTP(t, 1, 0, frame)
+		require.Equal(t, frame, c.recvRTP(t), "the proxy does not run")
+
+		// Both dialogs are silent
+		require.NoError(t, stopProxyMedia(t, &b))
+		next := bytes.Repeat([]byte{0x21}, 160)
+		for _, d := range []*bridgeTestDialog{a, c} {
+			d.sendRTP(t, 2, 160, next)
+			d.readFrame(t, next)
+		}
+	})
+
+	t.Run("NoProxy", func(t *testing.T) {
+		b := NewBridge()
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "a", media.CodecAudioUlaw)))
+		require.NoError(t, stopProxyMedia(t, &b))
+	})
 }
 
 // TestBridgeRefusedDialogStaysOut checks that a dialog the bridge refuses is
@@ -609,6 +718,9 @@ type bridgeTestDialog struct {
 	sipDialog *sipgo.Dialog
 	conn      *bridgeTestConn
 	peer      *net.UDPConn
+	// ctx is the dialog's context, which end ends
+	ctx context.Context
+	end context.CancelFunc
 }
 
 var _ DialogSession = (*bridgeTestDialog)(nil)
@@ -632,6 +744,8 @@ func newBridgeTestDialog(t *testing.T, id string, codec media.Codec) *bridgeTest
 	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: id, Host: "127.0.0.1", Port: 5060})
 	sipDialog := &sipgo.Dialog{ID: id, InviteRequest: invite}
 	sipDialog.InitWithState(sip.DialogStateConfirmed)
+	ctx, end := context.WithCancel(context.Background())
+	t.Cleanup(end)
 
 	return &bridgeTestDialog{
 		id: id,
@@ -643,11 +757,21 @@ func newBridgeTestDialog(t *testing.T, id string, codec media.Codec) *bridgeTest
 		sipDialog: sipDialog,
 		conn:      conn,
 		peer:      peer,
+		ctx:       ctx,
+		end:       end,
 	}
 }
 
+// hangUp ends the dialog as a BYE from its peer does: its context ends, and
+// then its media is closed.
+func (d *bridgeTestDialog) hangUp(t *testing.T) {
+	t.Helper()
+	d.end()
+	require.NoError(t, d.conn.Close())
+}
+
 func (d *bridgeTestDialog) Id() string                       { return d.id }
-func (d *bridgeTestDialog) Context() context.Context         { return context.Background() }
+func (d *bridgeTestDialog) Context() context.Context         { return d.ctx }
 func (d *bridgeTestDialog) Hangup(ctx context.Context) error { return nil }
 func (d *bridgeTestDialog) Media() *DialogMedia              { return d.media }
 func (d *bridgeTestDialog) DialogSIP() *sipgo.Dialog         { return d.sipDialog }
@@ -1405,7 +1529,9 @@ func newAnsweredBridgeTestDialog(t *testing.T, id string) (d *bridgeTestDialog, 
 	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: id, Host: "127.0.0.1", Port: 5060})
 	sipDialog := &sipgo.Dialog{ID: id, InviteRequest: invite}
 	sipDialog.InitWithState(sip.DialogStateConfirmed)
-	return &bridgeTestDialog{id: id, media: m, sipDialog: sipDialog}, peer
+	ctx, end := context.WithCancel(context.Background())
+	t.Cleanup(end)
+	return &bridgeTestDialog{id: id, media: m, sipDialog: sipDialog, ctx: ctx, end: end}, peer
 }
 
 // sendRTPFrom sends the dialog's media one RTP packet of payload type pt from
