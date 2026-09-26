@@ -315,13 +315,13 @@ const (
 // accepts it; RFC 5763 section 5 maps those onto DTLS as the client that sends
 // the ClientHello and the server that answers it.
 //
-// This is deliberately the only place the role is decided. LocalSDP used to
-// choose what to advertise from whether a remote address happened to be known,
-// while RemoteSDP separately chose what to do from the peer's a=setup -- and the
-// two disagreed. Against an actpass offer we advertised passive, telling the
-// peer to initiate, and then initiated anyway: both endpoints sent a
-// ClientHello, and the peer failed the handshake with UnexpectedMessage having
-// expected a ServerHello to its own.
+// This is the only place the role is decided. LocalSDP advertises what it
+// returns and armDTLSHandshake plays the role that implies, both from the
+// peer's a=setup RemoteSDP recorded, so the role we advertise and the role we
+// play cannot disagree. Were they to, against an actpass offer we could
+// advertise passive, telling the peer to initiate, and initiate as well: both
+// endpoints would send a ClientHello, and the peer would fail the handshake
+// with UnexpectedMessage, having expected a ServerHello to its own.
 func (s *MediaSession) localDTLSSetup() string {
 	answering := s.dtlsEndpointRole() == DTLSEndpointRoleAnswerer
 
@@ -575,10 +575,10 @@ func (s *MediaSession) Fork() *MediaSession {
 		// ICE restart.
 		iceMux: s.iceMux,
 		// ExternalIP is what LocalSDP publishes as the c= address, and LocalSDP
-		// regenerates on every call for a negotiated session. Dropping it here
-		// made the 200 OK answering any re-INVITE advertise the internal bind
-		// address, so the peer sent RTP somewhere it could not route and the call
-		// went one way from the first re-INVITE on, with a clean SIP trace.
+		// regenerates on every call for a negotiated session, so the fork keeps
+		// it. Without it the 200 OK answering a re-INVITE would advertise the
+		// internal bind address, the peer would send RTP somewhere it cannot
+		// route, and the call would go one way with a clean SIP trace.
 		ExternalIP: slices.Clone(s.ExternalIP),
 		// The role carries over so the caller can set it once on the session it
 		// owns. Fork is called inside the re-negotiation path, where the fork
@@ -1113,9 +1113,6 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		// Record the peer's role rather than acting on it directly. Our own role
 		// is what governs the handshake, and localDTLSSetup derives that from this
 		// value -- so the role we advertise and the role we play are one decision.
-		// Reading the remote value independently here is what let them contradict
-		// each other: against an actpass offer LocalSDP advertised passive while
-		// this switch made us the client, so both endpoints sent a ClientHello.
 		s.dtlsRemoteSetup = setup
 
 		if err := s.negotiateDTLSAssociation(setup, fingerprints, tlsID); err != nil {

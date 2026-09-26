@@ -55,7 +55,14 @@ const (
 )
 
 const (
-	ServerClientAuthNoCert      = int(dtls.NoClientCert)
+	// ServerClientAuthNoCert is pion's NoClientCert: the DTLS server sends no
+	// CertificateRequest. It is the DTLSConfig.ServerClientAuth default, which
+	// DTLSConfig raises to requiring a certificate.
+	ServerClientAuthNoCert = int(dtls.NoClientCert)
+	// ServerClientAuthRequireCert is pion's RequestClientCert: the DTLS server
+	// asks the client for a certificate but lets it leave one out, so it
+	// requests a certificate and does not require one. DTLSConfig raises it to
+	// requiring one, as DTLSConfig.ServerClientAuth says.
 	ServerClientAuthRequireCert = int(dtls.RequestClientCert)
 
 	EllipticCurveP256   uint16 = uint16(elliptic.P256)
