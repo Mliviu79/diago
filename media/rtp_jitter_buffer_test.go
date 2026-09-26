@@ -180,23 +180,21 @@ func TestRTPJitterBuffer(t *testing.T) {
 			MaxPackets:   4,
 		})
 
-		done := make(chan uint16, 1)
-		go func() {
-			done <- readJitterSeq(t, jb)
-		}()
-		reader.packets <- rtpPacket(1234, 0)
-		require.Equal(t, uint16(0), <-done)
+		read := readJitterAsync(jb, make([]byte, RTPBufSize))
+		sendJitterPacket(t, reader, rtpPacket(1234, 0))
+		require.Equal(t, uint16(0), awaitJitterSeq(t, jb, read))
 
-		go func() {
-			done <- readJitterSeq(t, jb)
-		}()
-		reader.packets <- rtpPacket(1234, 2)
-		require.Equal(t, uint16(2), <-done)
+		// Packet 2 overtakes 1. Whether it arrives before the next playout tick
+		// or after it, playout skips 1 as lost and releases 2.
+		read = readJitterAsync(jb, make([]byte, RTPBufSize))
+		sendJitterPacket(t, reader, rtpPacket(1234, 2))
+		require.Equal(t, uint16(2), awaitJitterSeq(t, jb, read))
 
-		reader.packets <- rtpPacket(1234, 1)
+		sendJitterPacket(t, reader, rtpPacket(1234, 1))
 		close(reader.packets)
 		requireJitterEOF(t, jb)
 		require.Equal(t, uint64(1), jb.Statistics().PacketsLate)
+		require.Equal(t, uint64(1), jb.Statistics().PacketsLost)
 	})
 
 	t.Run("ssrcReset", func(t *testing.T) {
@@ -206,18 +204,13 @@ func TestRTPJitterBuffer(t *testing.T) {
 			MaxPackets:   4,
 		})
 
-		done := make(chan uint16, 1)
-		go func() {
-			done <- readJitterSeq(t, jb)
-		}()
-		reader.packets <- rtpPacket(1111, 0)
-		require.Equal(t, uint16(0), <-done)
+		read := readJitterAsync(jb, make([]byte, RTPBufSize))
+		sendJitterPacket(t, reader, rtpPacket(1111, 0))
+		require.Equal(t, uint16(0), awaitJitterSeq(t, jb, read))
 
-		go func() {
-			done <- readJitterSeq(t, jb)
-		}()
-		reader.packets <- rtpPacket(2222, 10)
-		require.Equal(t, uint16(10), <-done)
+		read = readJitterAsync(jb, make([]byte, RTPBufSize))
+		sendJitterPacket(t, reader, rtpPacket(2222, 10))
+		require.Equal(t, uint16(10), awaitJitterSeq(t, jb, read))
 
 		require.Equal(t, uint64(1), jb.Statistics().SSRCResets)
 	})
@@ -232,7 +225,7 @@ func TestRTPJitterBuffer(t *testing.T) {
 	})
 
 	t.Run("forwardWindowDrop", func(t *testing.T) {
-		jb := NewRTPJitterBuffer(&sliceRTPReader{packets: rtpPackets(1234, 0, 4, 1)}, time.Millisecond, RTPJitterBufferOptions{
+		jb := newDeliveredRTPJitterBuffer(t, rtpPackets(1234, 0, 4, 1), RTPJitterBufferOptions{
 			DelayPackets: 2,
 			MaxPackets:   4,
 		})
@@ -244,14 +237,13 @@ func TestRTPJitterBuffer(t *testing.T) {
 	})
 
 	t.Run("shortBufferRetry", func(t *testing.T) {
-		jb := NewRTPJitterBuffer(&sliceRTPReader{packets: rtpPackets(1234, 7)}, time.Millisecond, RTPJitterBufferOptions{
+		jb := newDeliveredRTPJitterBuffer(t, rtpPackets(1234, 7), RTPJitterBufferOptions{
 			DelayPackets: 1,
 			MaxPackets:   2,
 		})
 
-		var pkt rtp.Packet
-		_, err := jb.ReadRTP(make([]byte, 1), &pkt)
-		require.ErrorIs(t, err, io.ErrShortBuffer)
+		r := awaitJitterRead(t, jb, readJitterAsync(jb, make([]byte, 1)))
+		require.ErrorIs(t, r.err, io.ErrShortBuffer)
 		require.Equal(t, uint16(7), readJitterSeq(t, jb))
 	})
 
@@ -262,12 +254,12 @@ func TestRTPJitterBuffer(t *testing.T) {
 			MaxPackets:   4,
 		})
 
-		reader.packets <- rtpPacket(1234, 0)
-		reader.packets <- rtpPacket(1234, 1)
-		reader.packets <- rtpPacket(1234, 2)
+		sendJitterPacket(t, reader, rtpPacket(1234, 0))
+		sendJitterPacket(t, reader, rtpPacket(1234, 1))
+		sendJitterPacket(t, reader, rtpPacket(1234, 2))
 		require.Equal(t, uint16(0), readJitterSeq(t, jb))
 		for seq := uint16(3); seq < 100; seq++ {
-			reader.packets <- rtpPacket(1234, seq)
+			sendJitterPacket(t, reader, rtpPacket(1234, seq))
 			require.Equal(t, seq-2, readJitterSeq(t, jb))
 		}
 		require.Equal(t, uint16(98), readJitterSeq(t, jb))
@@ -279,17 +271,13 @@ func TestRTPJitterBuffer(t *testing.T) {
 	t.Run("close", func(t *testing.T) {
 		reader := newChanRTPReader()
 		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{})
-		result := make(chan error, 1)
-		go func() {
-			var pkt rtp.Packet
-			_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
-			result <- err
-		}()
+		read := readJitterAsync(jb, make([]byte, RTPBufSize))
 
 		require.NoError(t, jb.Close())
 		require.NoError(t, jb.Close())
-		require.ErrorIs(t, <-result, io.ErrClosedPipe)
+		require.ErrorIs(t, awaitJitterRead(t, jb, read).err, io.ErrClosedPipe)
 		close(reader.packets)
+		requireJitterDone(t, jb)
 	})
 
 	t.Run("closeAfterReadLoopStopped", func(t *testing.T) {
@@ -313,7 +301,10 @@ func TestRTPJitterBuffer(t *testing.T) {
 
 func TestRTPJitterBufferDone(t *testing.T) {
 	t.Run("afterUpstreamEnd", func(t *testing.T) {
-		jb := newTestRTPJitterBuffer(t, rtpPackets(1234, 0, 1))
+		jb := NewRTPJitterBuffer(&sliceRTPReader{packets: rtpPackets(1234, 0, 1)}, time.Millisecond, RTPJitterBufferOptions{
+			DelayPackets: 2,
+			MaxPackets:   8,
+		})
 
 		require.Equal(t, uint16(0), readJitterSeq(t, jb))
 		require.Equal(t, uint16(1), readJitterSeq(t, jb))
@@ -820,29 +811,76 @@ func BenchmarkRTPJitterBuffer(b *testing.B) {
 func newTestRTPJitterBuffer(t *testing.T, packets []rtp.Packet) *RTPJitterBuffer {
 	t.Helper()
 
-	return NewRTPJitterBuffer(&sliceRTPReader{packets: packets}, time.Millisecond, RTPJitterBufferOptions{
+	return newDeliveredRTPJitterBuffer(t, packets, RTPJitterBufferOptions{
 		DelayPackets: 2,
 		MaxPackets:   8,
 	})
 }
 
+// newDeliveredRTPJitterBuffer returns a buffer over packets whose read loop has
+// already handed all of them to the buffer and ended. Playout ticks on its own
+// clock, and a read loop the scheduler holds back past a tick would turn a test
+// of ordering within the window into a test of scheduling.
+func newDeliveredRTPJitterBuffer(t *testing.T, packets []rtp.Packet, opts RTPJitterBufferOptions) *RTPJitterBuffer {
+	t.Helper()
+
+	jb := NewRTPJitterBuffer(&sliceRTPReader{packets: packets}, time.Millisecond, opts)
+	jb.start()
+	requireJitterDone(t, jb)
+	return jb
+}
+
+type jitterRead struct {
+	seq uint16
+	err error
+}
+
+// readJitterAsync starts one ReadRTP into buf and returns where its result
+// arrives, so the caller can feed the source meanwhile and bound the wait.
+func readJitterAsync(jb *RTPJitterBuffer, buf []byte) <-chan jitterRead {
+	result := make(chan jitterRead, 1)
+	go func() {
+		var pkt rtp.Packet
+		_, err := jb.ReadRTP(buf, &pkt)
+		result <- jitterRead{seq: pkt.SequenceNumber, err: err}
+	}()
+	return result
+}
+
+// awaitJitterRead waits for a read started by readJitterAsync. A read that
+// does not return in time fails the test, and the buffer is closed to end it.
+func awaitJitterRead(t *testing.T, jb *RTPJitterBuffer, result <-chan jitterRead) jitterRead {
+	t.Helper()
+
+	select {
+	case r := <-result:
+		return r
+	case <-time.After(5 * time.Second):
+		_ = jb.Close()
+		t.Fatal("ReadRTP did not return")
+		return jitterRead{}
+	}
+}
+
+func awaitJitterSeq(t *testing.T, jb *RTPJitterBuffer, result <-chan jitterRead) uint16 {
+	t.Helper()
+
+	r := awaitJitterRead(t, jb, result)
+	require.NoError(t, r.err)
+	return r.seq
+}
+
 func readJitterSeq(t *testing.T, jb *RTPJitterBuffer) uint16 {
 	t.Helper()
 
-	buf := make([]byte, RTPBufSize)
-	var pkt rtp.Packet
-	_, err := jb.ReadRTP(buf, &pkt)
-	require.NoError(t, err)
-	return pkt.SequenceNumber
+	return awaitJitterSeq(t, jb, readJitterAsync(jb, make([]byte, RTPBufSize)))
 }
 
 func requireJitterEOF(t *testing.T, jb *RTPJitterBuffer) {
 	t.Helper()
 
-	buf := make([]byte, RTPBufSize)
-	var pkt rtp.Packet
-	_, err := jb.ReadRTP(buf, &pkt)
-	require.ErrorIs(t, err, io.EOF)
+	r := awaitJitterRead(t, jb, readJitterAsync(jb, make([]byte, RTPBufSize)))
+	require.ErrorIs(t, r.err, io.EOF)
 }
 
 func requireJitterDone(t *testing.T, jb *RTPJitterBuffer) {
