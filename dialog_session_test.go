@@ -69,13 +69,26 @@ func newReferNotifyRequest(t *testing.T, contentType string, body string) *sip.R
 func newReferNotifyTx(t *testing.T, req *sip.Request) (*sip.ServerTx, *connRecorder) {
 	t.Helper()
 
-	key, err := sip.ServerTxKeyMake(req)
+	tx, conn, err := buildReferNotifyTx(req)
 	require.NoError(t, err)
+	return tx, conn
+}
+
+// buildReferNotifyTx builds the server transaction newReferNotifyTx does and
+// returns its error instead of asserting it, for helpers that also run off
+// the test goroutine, where FailNow must not be called.
+func buildReferNotifyTx(req *sip.Request) (*sip.ServerTx, *connRecorder, error) {
+	key, err := sip.ServerTxKeyMake(req)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	conn := NewConnRecorder()
 	tx := sip.NewServerTx(key, req, conn, slog.Default())
-	require.NoError(t, tx.Init())
-	return tx, conn
+	if err := tx.Init(); err != nil {
+		return nil, nil, err
+	}
+	return tx, conn, nil
 }
 
 // TestDialogHandleReferNotifyContentType checks the Content-Type gate on REFER
@@ -297,7 +310,13 @@ func sendReferNotify(t *testing.T, d DialogSession, body, event, subscriptionSta
 	if subscriptionState != "" {
 		req.AppendHeader(sip.NewHeader("Subscription-State", subscriptionState))
 	}
-	tx, conn := newReferNotifyTx(t, req)
+	// Tests also send NOTIFYs from their own goroutines, so an error is
+	// reported with Errorf rather than asserted.
+	tx, conn, err := buildReferNotifyTx(req)
+	if err != nil {
+		t.Errorf("building a REFER NOTIFY transaction: %v", err)
+		return 0
+	}
 
 	dialogHandleReferNotify(d, req, tx)
 

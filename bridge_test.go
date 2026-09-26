@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"slices"
@@ -159,6 +160,9 @@ func TestIntegrationBridging(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
+	// The bridged leg's handler runs on a server goroutine, so its errors are
+	// handed to the test rather than asserted there.
+	echoed := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA()
 		defer ua.Close()
@@ -173,18 +177,26 @@ func TestIntegrationBridging(t *testing.T) {
 
 		err := dg.ServeBackground(context.Background(), func(d *DialogServerSession) {
 			ctx := d.Context()
-			err = d.Answer()
-			require.NoError(t, err)
+			if err := d.Answer(); err != nil {
+				echoed <- fmt.Errorf("answer: %w", err)
+				return
+			}
 
 			// ms := d.mediaSession
 			buf := make([]byte, media.RTPBufSize)
 			r, _ := d.AudioReader()
 			n, err := r.Read(buf)
-			require.NoError(t, err)
+			if err != nil {
+				echoed <- fmt.Errorf("read: %w", err)
+				return
+			}
 
 			w, _ := d.AudioWriter()
-			w.Write(buf[:n])
-			require.NoError(t, err)
+			if _, err := w.Write(buf[:n]); err != nil {
+				echoed <- fmt.Errorf("write: %w", err)
+				return
+			}
+			echoed <- nil
 
 			<-ctx.Done()
 		})
@@ -211,6 +223,13 @@ func TestIntegrationBridging(t *testing.T) {
 
 		t.Log("Hanguping")
 		dialog.Hangup(ctx)
+	}
+
+	select {
+	case err := <-echoed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bridged leg did not echo the audio")
 	}
 }
 

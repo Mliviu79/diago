@@ -914,7 +914,13 @@ func TestReferObservationCarriesNoRoutingInternals(t *testing.T) {
 		req.AppendHeader(&sip.ContactHeader{Address: secret})
 		req.AppendHeader(sip.NewHeader("Event", event))
 		req.AppendHeader(sip.NewHeader("Subscription-State", state))
-		tx, _ := newReferNotifyTx(t, req)
+		// This also runs off the test goroutine, so an error is reported with
+		// Errorf rather than asserted.
+		tx, _, err := buildReferNotifyTx(req)
+		if err != nil {
+			t.Errorf("building a REFER NOTIFY transaction: %v", err)
+			return
+		}
 		dialogHandleReferNotify(d, req, tx)
 	}
 	banned := []string{"10.9.8.7", "sip:", "@", "Via", "Contact", "secret"}

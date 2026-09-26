@@ -392,6 +392,9 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 
 	t.Log("Size beep", len(beep), numPkts)
 	audioReceived := make(chan []byte)
+	// The handler runs on a server goroutine, so the result of its re-INVITE
+	// is handed to the test rather than asserted there.
+	reinvited := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
 		defer ua.Close()
@@ -431,10 +434,16 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 			ms := d.MediaSession().Fork()
 			ms.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 39999}
 			err = ms.Init() // This will start new listener
-			require.NoError(t, err)
+			if err != nil {
+				reinvited <- fmt.Errorf("new media session: %w", err)
+				return
+			}
 
 			err = d.reInviteMediaSession(ctx, ms)
-			require.NoError(t, err)
+			reinvited <- err
+			if err != nil {
+				return
+			}
 
 			// beepEncoded, _ := media.ReadAll(ar, 160)
 			// audioReceived <- beepEncoded
@@ -467,6 +476,14 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 	_, err = pb.Play(bytes.NewBuffer(beep), "audio/pcm")
 	require.NoError(t, err)
 
+	// The server's re-INVITE completes before the hangup, which it would
+	// otherwise race on a loaded machine.
+	select {
+	case err := <-reinvited:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server's re-INVITE did not complete")
+	}
 	err = dialog.Hangup(ctx)
 	require.NoError(t, err)
 	var remoteAudio []byte

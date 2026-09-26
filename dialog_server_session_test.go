@@ -6,6 +6,7 @@ package diago
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -248,8 +249,10 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// The calling side logs from its own goroutine once the hangup ends its
-	// dialog, so the test waits for that before it returns.
+	// The calling side runs on its own goroutine. Its Invite error is handed
+	// to the test, and since it logs once the hangup ends its dialog, the test
+	// waits for it to end before it returns.
+	inviteErr := make(chan error, 1)
 	dialogDone := make(chan struct{})
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
@@ -270,7 +273,10 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		go func() {
 			defer close(dialogDone)
 			dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{})
-			require.NoError(t, err)
+			inviteErr <- err
+			if err != nil {
+				return
+			}
 			<-dialog.Context().Done()
 			t.Log("Dialog done")
 		}()
@@ -294,10 +300,21 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		<-d.Context().Done()
 	})
 	require.NoError(t, err)
-	d := <-waitDialog
+	var d *DialogServerSession
+	select {
+	case d = <-waitDialog:
+	case err := <-inviteErr:
+		t.Fatalf("the calling side's Invite returned before the call arrived: %v", err)
+	}
 
 	err = d.Answer()
 	require.NoError(t, err)
+	select {
+	case err := <-inviteErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the calling side's Invite did not return after the answer")
+	}
 	err = d.ReInvite(d.Context())
 	require.NoError(t, err)
 
@@ -322,6 +339,9 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 		BindPort:        15080,
 		MediaExternalIP: net.IPv4(203, 0, 113, 10),
 	}))
+	// The handler runs on a server goroutine, so its errors are handed to the
+	// test rather than asserted there.
+	answered := make(chan error, 1)
 	err := uas.ServeBackground(ctx, func(d *DialogServerSession) {
 		// This is the reported role: the peer sends the initial INVITE and
 		// Diago answers it as the UAS. RTP NAT must not change the SIP flow.
@@ -329,9 +349,16 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 			RTPNAT:        media.RTPNATSymetric,
 			OnMediaUpdate: func(*DialogMedia) {},
 		})
-		require.NoError(t, err)
+		if err != nil {
+			answered <- fmt.Errorf("answer: %w", err)
+			return
+		}
 		reader, err := d.AudioReader()
-		require.NoError(t, err)
+		if err != nil {
+			answered <- fmt.Errorf("audio reader: %w", err)
+			return
+		}
+		answered <- nil
 		go func() {
 			_, _ = reader.Read(make([]byte, 160))
 		}()
@@ -348,6 +375,12 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 	dialog, err := peer.Invite(ctx, sip.Uri{User: "service", Host: "127.0.0.1", Port: 15080}, InviteOptions{})
 	require.NoError(t, err)
 	defer dialog.Close()
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer did not complete after the call was set up")
+	}
 	require.Contains(t, string(dialog.InviteRequest.Body()), " 0 8 101")
 
 	// The initial peer offer contains PCMU, PCMA and telephone-event. The
@@ -408,11 +441,24 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 		dialer = dg
 	}
 
-	dialCall := func() {
+	// dialCall calls from its own goroutine. The Invite error is handed to the
+	// test, and since the goroutine logs once its dialog ends, the test waits
+	// for it before it ends.
+	dialCall := func(t *testing.T) <-chan error {
 		dialog, err := dialer.NewDialog(sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15070}, NewDialogOptions{})
 		require.NoError(t, err)
 
+		invited := make(chan error, 1)
+		done := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("the calling side's dialog did not end")
+			}
+		})
 		go func() {
+			defer close(done)
 			err := dialog.Invite(ctx, InviteClientOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					// referDialog.
@@ -426,12 +472,16 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 					return referDialog.Hangup(ctx)
 				},
 			})
-			require.NoError(t, err)
+			invited <- err
+			if err != nil {
+				return
+			}
 
 			dialog.Ack(ctx)
 			<-dialog.Context().Done()
 			t.Log("Dialog done")
 		}()
+		return invited
 	}
 
 	// UAS that accepts REFER
@@ -486,13 +536,29 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	t.Run("Successfull", func(t *testing.T) {
-		dialCall()
-		d := <-waitDialog
-		defer d.Hangup(ctx)
+	// answerCall answers the call dialCall placed and checks its Invite.
+	answerCall := func(t *testing.T, invited <-chan error) *DialogServerSession {
+		t.Helper()
+		var d *DialogServerSession
+		select {
+		case d = <-waitDialog:
+		case err := <-invited:
+			t.Fatalf("the calling side's Invite returned before the call arrived: %v", err)
+		}
+		t.Cleanup(func() { d.Hangup(ctx) })
 
-		err = d.Answer()
-		require.NoError(t, err)
+		require.NoError(t, d.Answer())
+		select {
+		case err := <-invited:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the calling side's Invite did not return after the answer")
+		}
+		return d
+	}
+
+	t.Run("Successfull", func(t *testing.T) {
+		d := answerCall(t, dialCall(t))
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{Host: "127.0.0.1", Port: 15072}, ReferServerOptions{
@@ -507,12 +573,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 	})
 
 	t.Run("UnreachableRefer", func(t *testing.T) {
-		dialCall()
-		d := <-waitDialog
-		defer d.Hangup(ctx)
-
-		err = d.Answer()
-		require.NoError(t, err)
+		d := answerCall(t, dialCall(t))
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "noanswer", Host: "127.0.0.1", Port: 15072}, ReferServerOptions{
@@ -527,12 +588,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 	})
 
 	t.Run("BusyRefer", func(t *testing.T) {
-		dialCall()
-		d := <-waitDialog
-		defer d.Hangup(ctx)
-
-		err = d.Answer()
-		require.NoError(t, err)
+		d := answerCall(t, dialCall(t))
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "busy", Host: "127.0.0.1", Port: 15072}, ReferServerOptions{
