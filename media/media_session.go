@@ -332,6 +332,13 @@ type MediaSession struct {
 	// them too.
 	dtlsKeyed atomic.Bool
 
+	// deadlineMu guards rtpReadDeadline and rtpWriteDeadline, the deadlines
+	// StopRTP and StartRTP last set on the RTP socket. CarryRTPDeadlines sets
+	// them on the socket of a session replacing this one.
+	deadlineMu       sync.Mutex
+	rtpReadDeadline  time.Time
+	rtpWriteDeadline time.Time
+
 	sessionID      uint64
 	sessionVersion uint64
 }
@@ -574,26 +581,50 @@ func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 }
 
 func (s *MediaSession) StopRTP(rw int8, dur time.Duration) error {
-	t := time.Now().Add(dur)
-	if rw&1 > 0 {
-		//Read stop
-		return s.rtpConn.SetReadDeadline(t)
-	}
-	if rw&2 > 0 {
-		//Write stop
-		return s.rtpConn.SetWriteDeadline(t)
-	}
-	return s.rtpConn.SetDeadline(t)
+	return s.setRTPDeadline(rw, time.Now().Add(dur))
 }
 
 func (s *MediaSession) StartRTP(rw int8) error {
+	return s.setRTPDeadline(rw, time.Time{})
+}
+
+// setRTPDeadline sets t as the RTP socket's read deadline when rw has bit 1
+// set, as its write deadline when it has bit 2 set and not bit 1, and as both
+// when it is 0, and records it.
+func (s *MediaSession) setRTPDeadline(rw int8, t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
 	if rw&1 > 0 {
-		return s.rtpConn.SetReadDeadline(time.Time{})
+		s.rtpReadDeadline = t
+		return s.rtpConn.SetReadDeadline(t)
 	}
 	if rw&2 > 0 {
-		return s.rtpConn.SetWriteDeadline(time.Time{})
+		s.rtpWriteDeadline = t
+		return s.rtpConn.SetWriteDeadline(t)
 	}
-	return s.rtpConn.SetDeadline(time.Time{})
+	s.rtpReadDeadline, s.rtpWriteDeadline = t, t
+	return s.rtpConn.SetDeadline(t)
+}
+
+// CarryRTPDeadlines takes over the RTP read and write deadlines StopRTP and
+// StartRTP last set on from, a session this one replaces, and sets them on
+// this session's RTP socket when the two run on different sockets. A deadline
+// set to end a read or a write then also ends the one that carries on over
+// the new socket, as RTPPacketReader.Read carries a read over when the socket
+// it waits on is closed.
+func (s *MediaSession) CarryRTPDeadlines(from *MediaSession) error {
+	from.deadlineMu.Lock()
+	read, write := from.rtpReadDeadline, from.rtpWriteDeadline
+	sameSocket := from.rtpConn == s.rtpConn
+	from.deadlineMu.Unlock()
+
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
+	s.rtpReadDeadline, s.rtpWriteDeadline = read, write
+	if sameSocket {
+		return nil
+	}
+	return errors.Join(s.rtpConn.SetReadDeadline(read), s.rtpConn.SetWriteDeadline(write))
 }
 
 // Fork is special call to be used in case when there is session update

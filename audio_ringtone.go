@@ -5,6 +5,7 @@ package diago
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -15,14 +16,18 @@ import (
 
 // AudioRingtone is playback for ringtone
 type AudioRingtone struct {
-	writer       *audio.PCMEncoderWriter
-	ringtone     []byte
-	sampleSize   int
-	mediaSession *media.MediaSession
+	writer     *audio.PCMEncoderWriter
+	ringtone   []byte
+	sampleSize int
+	// dialog is the dialog the ringtone plays on. Its write deadline, which
+	// stops the ringtone, is set on its current media session.
+	dialog *DialogMedia
 }
 
+// PlayBackground plays the ringtone until the returned stop is called. The
+// stop ends a write in progress with a write deadline, and clears it again.
 func (a *AudioRingtone) PlayBackground() (func() error, error) {
-	if err := a.mediaSession.StartRTP(1); err != nil {
+	if err := a.dialog.StartRTP(2, 0); err != nil {
 		return nil, err
 	}
 
@@ -39,16 +44,19 @@ func (a *AudioRingtone) PlayBackground() (func() error, error) {
 	return func() error {
 		cancel()
 
-		if err := a.mediaSession.StopRTP(2, 0); err != nil {
-			return err
-		}
+		stopErr := a.dialog.StopRTP(2, 0)
 		wg.Wait()
 
 		// enable RTP again
-		if err := a.mediaSession.StartRTP(2); err != nil {
+		if err := errors.Join(stopErr, a.dialog.StartRTP(2, 0)); err != nil {
 			return err
 		}
 
+		// The stop ends the ringtone between two rings, through the context,
+		// or during one, through the write deadline.
+		if errors.Is(playErr, context.Canceled) {
+			return nil
+		}
 		if e, ok := playErr.(net.Error); ok && e.Timeout() {
 			return nil
 		}

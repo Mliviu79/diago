@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -566,4 +567,56 @@ func TestMediaSessionInitWithListenersLaddr(t *testing.T) {
 	md, err := sd.MediaDescription("audio")
 	require.NoError(t, err)
 	require.Equal(t, rtpPort, md.Port, "the SDP must advertise the RTP socket")
+}
+
+// TestMediaSessionCarryRTPDeadlines pins that a session replacing another
+// takes over the RTP read and write deadlines StopRTP and StartRTP last set on
+// it, and sets them on its own socket when it has one of its own, so a
+// deadline that was to end a read or a write ends the one carried over to the
+// new socket. A fork on the same socket takes them over as its own, for the
+// session that later replaces it.
+func TestMediaSessionCarryRTPDeadlines(t *testing.T) {
+	// Sockets from the OS rather than Init, whose port range another test in
+	// this package narrows for good.
+	newSession := func(t *testing.T) *MediaSession {
+		t.Helper()
+		rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		require.NoError(t, err)
+		rtcpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		require.NoError(t, err)
+		s := &MediaSession{Codecs: []Codec{CodecAudioUlaw}}
+		s.InitWithListeners(rtpConn, rtcpConn, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000})
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	requireDeadlinesPassed := func(t *testing.T, s *MediaSession) {
+		t.Helper()
+		_, _, err := s.rtpConn.ReadFrom(make([]byte, RTPBufSize))
+		require.True(t, os.IsTimeout(err), "the read deadline was not carried: %v", err)
+		_, err = s.rtpConn.WriteTo([]byte{0}, &s.Laddr)
+		require.True(t, os.IsTimeout(err), "the write deadline was not carried: %v", err)
+	}
+
+	old := newSession(t)
+	require.NoError(t, old.StopRTP(1, 0))
+	require.NoError(t, old.StopRTP(2, 0))
+
+	moved := newSession(t)
+	require.NoError(t, moved.CarryRTPDeadlines(old))
+	requireDeadlinesPassed(t, moved)
+
+	// A re-INVITE that keeps the socket, and then one that moves it.
+	fork := old.Fork()
+	require.NoError(t, fork.CarryRTPDeadlines(old))
+	next := newSession(t)
+	require.NoError(t, next.CarryRTPDeadlines(fork))
+	requireDeadlinesPassed(t, next)
+
+	// Cleared deadlines are carried as cleared.
+	require.NoError(t, fork.StartRTP(0))
+	cleared := newSession(t)
+	require.NoError(t, cleared.StopRTP(0, 0))
+	require.NoError(t, cleared.CarryRTPDeadlines(fork))
+	_, err := cleared.rtpConn.WriteTo([]byte{0}, &cleared.Laddr)
+	require.NoError(t, err, "the cleared write deadline was not carried")
 }

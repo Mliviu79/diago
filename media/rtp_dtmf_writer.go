@@ -42,6 +42,14 @@ func (w *RTPDtmfWriter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
+// UpdateCodec sets the telephone-event codec DTMF is written on, as a media
+// update renegotiates it.
+func (w *RTPDtmfWriter) UpdateCodec(codec Codec) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.codec = codec
+}
+
 func (w *RTPDtmfWriter) WriteDTMF(dtmf rune) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

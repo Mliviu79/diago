@@ -1197,6 +1197,16 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	d.mediaSession = msess
 	d.rtpSession = rtpSess
 
+	// A read or write deadline set to end a read or write on the replaced
+	// session ends the one the packet reader or writer carries on over the new
+	// socket. It is taken over before the old socket is closed below, which is
+	// what moves a waiting read.
+	if old != nil && old != msess {
+		if err := msess.CarryRTPDeadlines(old); err != nil {
+			return fmt.Errorf("carrying RTP deadlines to the new media session: %w", err)
+		}
+	}
+
 	// A fork rebound to a new local address runs on sockets of its own, and the
 	// reader and writer were moved off the replaced session above, so its
 	// sockets carry nothing any more. Closing them releases the ports and fails
@@ -1265,25 +1275,48 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 	}
 }
 
-// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
+// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader.
+// The statistics are those of the dialog's current RTP session, which a media
+// update replaces with one that carries them on.
 func WithAudioReaderRTPStats(hook media.OnRTPReadStats) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		r := &media.RTPStatsReader{
-			Reader:         d.getAudioReader(),
-			RTPSession:     d.rtpSession,
-			OnRTPReadStats: hook,
+		if d.rtpSession == nil {
+			return ErrNoMediaSetup
 		}
-		d.audioReader = r
+		d.audioReader = &rtpStatsReader{
+			reader: d.getAudioReader(),
+			dialog: d,
+			hook:   hook,
+		}
 		return nil
 	}
+}
+
+// rtpStatsReader passes the read statistics of the dialog's current RTP
+// session to hook after each read.
+type rtpStatsReader struct {
+	reader io.Reader
+	dialog *DialogMedia
+	hook   media.OnRTPReadStats
+}
+
+func (r *rtpStatsReader) Read(b []byte) (int, error) {
+	n, err := r.reader.Read(b)
+	if err != nil {
+		return n, err
+	}
+	if sess := r.dialog.RTPSession(); sess != nil {
+		r.hook(sess.ReadStats())
+	}
+	return n, nil
 }
 
 // WithAudioReaderDTMF creates DTMF interceptor
 func WithAudioReaderDTMF(r *DTMFReader) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		r.dtmfReader = media.NewRTPDTMFReader(dtmfCodec(d.mediaSession), d.RTPPacketReader, d.getAudioReader())
-		r.mediaSession = d.mediaSession
-
+		if err := d.initDTMFReaderUnsafe(r); err != nil {
+			return err
+		}
 		d.audioReader = r
 		return nil
 	}
@@ -1373,24 +1406,48 @@ func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	}
 }
 
-// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
+// WithAudioWriterRTPStats creates RTP Statistics interceptor on audio writer.
+// The statistics are those of the dialog's current RTP session, which a media
+// update replaces with one that carries them on.
 func WithAudioWriterRTPStats(hook media.OnRTPWriteStats) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		w := media.RTPStatsWriter{
-			Writer:          d.getAudioWriter(),
-			RTPSession:      d.rtpSession,
-			OnRTPWriteStats: hook,
+		if d.rtpSession == nil {
+			return ErrNoMediaSetup
 		}
-		d.audioWriter = &w
+		d.audioWriter = &rtpStatsWriter{
+			writer: d.getAudioWriter(),
+			dialog: d,
+			hook:   hook,
+		}
 		return nil
 	}
+}
+
+// rtpStatsWriter passes the write statistics of the dialog's current RTP
+// session to hook after each write.
+type rtpStatsWriter struct {
+	writer io.Writer
+	dialog *DialogMedia
+	hook   media.OnRTPWriteStats
+}
+
+func (w *rtpStatsWriter) Write(b []byte) (int, error) {
+	n, err := w.writer.Write(b)
+	if err != nil {
+		return n, err
+	}
+	if sess := w.dialog.RTPSession(); sess != nil {
+		w.hook(sess.WriteStats())
+	}
+	return n, nil
 }
 
 // WithAudioWriterDTMF adds DTMF into audio pipeline
 func WithAudioWriterDTMF(r *DTMFWriter) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		r.dtmfWriter = media.NewRTPDTMFWriter(dtmfCodec(d.mediaSession), d.RTPPacketWriter, d.getAudioWriter())
-		r.mediaSession = d.mediaSession
+		if err := d.initDTMFWriterUnsafe(r); err != nil {
+			return err
+		}
 		d.audioWriter = r
 		return nil
 	}
@@ -1547,10 +1604,10 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 	}
 
 	ar := AudioRingtone{
-		writer:       &encoder,
-		ringtone:     ringtone,
-		sampleSize:   mprops.Codec.Samples16(),
-		mediaSession: d.mediaSession,
+		writer:     &encoder,
+		ringtone:   ringtone,
+		sampleSize: mprops.Codec.Samples16(),
+		dialog:     d,
 	}
 	return ar, nil
 }
@@ -1633,21 +1690,29 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 }
 
 // ListenContext listens until context is canceled.
-func (d *DialogMedia) ListenContext(pctx context.Context) error {
+//
+// The context's end stops the read with a read deadline, which is cleared
+// again before ListenContext returns.
+func (d *DialogMedia) ListenContext(ctx context.Context) (err error) {
 	buf := make([]byte, media.RTPBufSize)
-	ctx, cancel := context.WithCancel(pctx)
-	defer cancel()
-
-	go func() {
-		<-ctx.Done()
-		if pctx.Err() != nil {
-			d.StopRTP(1, 0)
-		}
-	}()
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
+
+	stopped := make(chan error, 1)
+	stop := context.AfterFunc(ctx, func() { stopped <- d.StopRTP(1, 0) })
+	defer func() {
+		if stop() {
+			return
+		}
+		stopErr := <-stopped
+		startErr := d.StartRTP(1, 0)
+		if err == nil {
+			err = errors.Join(stopErr, startErr)
+		}
+	}()
+
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -1659,14 +1724,23 @@ func (d *DialogMedia) ListenContext(pctx context.Context) error {
 	}
 }
 
-func (d *DialogMedia) ListenUntil(dur time.Duration) error {
+// ListenUntil listens for dur, and returns the read deadline's error when dur
+// has passed. The read deadline is cleared again before it returns.
+func (d *DialogMedia) ListenUntil(dur time.Duration) (err error) {
 	buf := make([]byte, media.RTPBufSize)
 
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-	d.StopRTP(1, dur)
+	if err := d.StopRTP(1, dur); err != nil {
+		return err
+	}
+	defer func() {
+		if startErr := d.StartRTP(1, 0); startErr != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+			err = errors.Join(err, startErr)
+		}
+	}()
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -1676,25 +1750,28 @@ func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 }
 
 // StopRTP sets a read or write deadline, as MediaSession.StopRTP does, on the
-// dialog's current media session, which it takes under the dialog's lock since
-// a re-INVITE replaces the session under it. Without a media session it
-// returns ErrNoMediaSetup.
+// dialog's current media session. It holds the dialog's lock while it does,
+// since a re-INVITE replaces the session under it, so the deadline is set
+// either on the session replaced, which hands it to its replacement, or on the
+// replacement. Without a media session it returns ErrNoMediaSetup.
 func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) error {
-	sess := d.MediaSession()
-	if sess == nil {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.mediaSession == nil {
 		return ErrNoMediaSetup
 	}
-	return sess.StopRTP(rw, dur)
+	return d.mediaSession.StopRTP(rw, dur)
 }
 
 // StartRTP clears the deadline StopRTP sets, on the dialog's current media
 // session.
 func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) error {
-	sess := d.MediaSession()
-	if sess == nil {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.mediaSession == nil {
 		return ErrNoMediaSetup
 	}
-	return sess.StartRTP(rw)
+	return d.mediaSession.StartRTP(rw)
 }
 
 // dtmfCodec returns the telephone-event codec DTMF is carried on for this
@@ -1711,23 +1788,52 @@ func dtmfCodec(s *media.MediaSession) media.Codec {
 	return media.CodecTelephoneEvent8000
 }
 
+// DTMFReader reads a dialog's audio and the DTMF carried with it. It follows
+// the dialog's media: it reads DTMF on the telephone-event payload type of the
+// dialog's current media session, and sets its read deadlines there.
 type DTMFReader struct {
+	dialog *DialogMedia
+	// mediaSession is the media session the telephone-event codec was taken
+	// from. Read and Listen use it, one at a time.
 	mediaSession *media.MediaSession
 	dtmfReader   *media.RTPDtmfReader
 	onDTMF       func(dtmf rune) error
 }
 
+// initDTMFReaderUnsafe sets r up over the dialog's audio reader. Must be called
+// with the dialog's lock held.
+func (d *DialogMedia) initDTMFReaderUnsafe(r *DTMFReader) error {
+	ar := d.getAudioReader()
+	if ar == nil || d.mediaSession == nil || d.RTPPacketReader == nil {
+		return ErrNoMediaSetup
+	}
+	r.dialog = d
+	r.mediaSession = d.mediaSession
+	r.dtmfReader = media.NewRTPDTMFReader(dtmfCodec(d.mediaSession), d.RTPPacketReader, ar)
+	return nil
+}
+
 // AudioReaderDTMF is DTMF over RTP. It reads audio and provides hook for dtmf while listening for audio
 // Use Listen or OnDTMF after this call
 func (m *DialogMedia) AudioReaderDTMF() (*DTMFReader, error) {
-	ar, err := m.AudioReader()
-	if err != nil {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := &DTMFReader{}
+	if err := m.initDTMFReaderUnsafe(r); err != nil {
 		return nil, err
 	}
-	return &DTMFReader{
-		dtmfReader:   media.NewRTPDTMFReader(dtmfCodec(m.mediaSession), m.RTPPacketReader, ar),
-		mediaSession: m.mediaSession,
-	}, nil
+	return r, nil
+}
+
+// followMedia takes the telephone-event codec of the dialog's current media
+// session when a media update has replaced the one it was taken from.
+func (d *DTMFReader) followMedia() {
+	sess := d.dialog.MediaSession()
+	if sess == nil || sess == d.mediaSession {
+		return
+	}
+	d.mediaSession = sess
+	d.dtmfReader.UpdateCodec(dtmfCodec(sess))
 }
 
 func (d *DTMFReader) Listen(onDTMF func(dtmf rune) error, dur time.Duration) error {
@@ -1743,13 +1849,18 @@ func (d *DTMFReader) Listen(onDTMF func(dtmf rune) error, dur time.Duration) err
 	}
 }
 
-// readDeadline(reads RTP until
+// readDeadline reads once, with a read deadline dur away on the dialog's
+// media when dur is set, and clears that deadline again.
 func (d *DTMFReader) readDeadline(buf []byte, dur time.Duration) (n int, err error) {
-	mediaSession := d.mediaSession
 	if dur > 0 {
-		// Stop RTP
-		mediaSession.StopRTP(1, dur)
-		defer mediaSession.StartRTP(2)
+		if err := d.dialog.StopRTP(1, dur); err != nil {
+			return 0, err
+		}
+		defer func() {
+			if startErr := d.dialog.StartRTP(1, 0); startErr != nil && err == nil {
+				err = startErr
+			}
+		}()
 	}
 	return d.Read(buf)
 }
@@ -1761,6 +1872,7 @@ func (d *DTMFReader) OnDTMF(onDTMF func(dtmf rune) error) {
 
 // Read exposes io.Reader that can be used as AudioReader
 func (d *DTMFReader) Read(buf []byte) (n int, err error) {
+	d.followMedia()
 	// This is optimal way of reading audio and DTMF
 	dtmfReader := d.dtmfReader
 	n, err = dtmfReader.Read(buf)
@@ -1776,25 +1888,57 @@ func (d *DTMFReader) Read(buf []byte) (n int, err error) {
 	return n, nil
 }
 
+// DTMFWriter writes a dialog's audio and DTMF into it. It follows the dialog's
+// media: it writes DTMF on the telephone-event payload type of the dialog's
+// current media session.
 type DTMFWriter struct {
+	dialog *DialogMedia
+	// mu guards mediaSession, the media session the telephone-event codec was
+	// taken from.
+	mu           sync.Mutex
 	mediaSession *media.MediaSession
 	dtmfWriter   *media.RTPDtmfWriter
 }
 
+// initDTMFWriterUnsafe sets w up over the dialog's audio writer. Must be called
+// with the dialog's lock held.
+func (d *DialogMedia) initDTMFWriterUnsafe(w *DTMFWriter) error {
+	aw := d.getAudioWriter()
+	if aw == nil || d.mediaSession == nil || d.RTPPacketWriter == nil {
+		return ErrNoMediaSetup
+	}
+	w.dialog = d
+	w.mediaSession = d.mediaSession
+	w.dtmfWriter = media.NewRTPDTMFWriter(dtmfCodec(d.mediaSession), d.RTPPacketWriter, aw)
+	return nil
+}
+
 func (m *DialogMedia) AudioWriterDTMF() (*DTMFWriter, error) {
-	aw, err := m.AudioWriter()
-	if err != nil {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w := &DTMFWriter{}
+	if err := m.initDTMFWriterUnsafe(w); err != nil {
 		return nil, err
 	}
-
-	return &DTMFWriter{
-		dtmfWriter:   media.NewRTPDTMFWriter(dtmfCodec(m.mediaSession), m.RTPPacketWriter, aw),
-		mediaSession: m.mediaSession,
-	}, nil
+	return w, nil
 }
 
 func (w *DTMFWriter) WriteDTMF(dtmf rune) error {
+	w.followMedia()
 	return w.dtmfWriter.WriteDTMF(dtmf)
+}
+
+// followMedia takes the telephone-event codec of the dialog's current media
+// session when a media update has replaced the one it was taken from.
+func (w *DTMFWriter) followMedia() {
+	sess := w.dialog.MediaSession()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if sess == nil || sess == w.mediaSession {
+		return
+	}
+	w.mediaSession = sess
+	w.dtmfWriter.UpdateCodec(dtmfCodec(sess))
 }
 
 // AudioReader exposes DTMF audio writer. You should use this for parallel audio processing

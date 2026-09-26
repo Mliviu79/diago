@@ -101,6 +101,12 @@ func (w *RTPDtmfReader) processDTMFEvent(ev DTMFEvent, mbit bool) {
 	w.lastEv = ev
 }
 
+// UpdateCodec sets the telephone-event codec DTMF is read on, as a media
+// update renegotiates it. It must not be called while Read runs.
+func (w *RTPDtmfReader) UpdateCodec(codec Codec) {
+	w.codec = codec
+}
+
 func (w *RTPDtmfReader) ReadDTMF() (rune, bool) {
 	defer func() { w.dtmfEnd = false }()
 	return w.dtmf, w.dtmfEnd
