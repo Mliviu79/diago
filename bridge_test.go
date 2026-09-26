@@ -494,6 +494,40 @@ func TestBridgeMixLeaveStopsReadersOfEndedLoop(t *testing.T) {
 	assert.Zero(t, talker.conn.reading.Load(), "a reader of the ended mix is still reading the dialog that left")
 }
 
+// TestBridgeMixRefusesCodecMismatch checks that a dialog whose audio differs
+// from the bridge's in sample rate or frame duration is refused, since the mix
+// neither resamples nor reframes, and that the dialogs already in the bridge
+// keep being mixed with no reader of the refused mix left behind.
+func TestBridgeMixRefusesCodecMismatch(t *testing.T) {
+	ulaw30ms := media.CodecAudioUlaw
+	ulaw30ms.SampleDur = 30 * time.Millisecond
+
+	for _, tc := range []struct {
+		name  string
+		codec media.Codec
+	}{
+		{"SampleDur", ulaw30ms},
+		{"SampleRate", media.CodecAudioOpus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewBridgeMix()
+			a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+			require.NoError(t, b.AddDialogSession(a))
+			t.Cleanup(func() { stopBridgeMix(t, b) })
+
+			err := b.AddDialogSession(newBridgeTestDialog(t, "mismatch", tc.codec))
+			require.ErrorContains(t, err, "Resampling or transcoding is not supported")
+			assert.Equal(t, []DialogSession{a}, b.DialogSessionsList(), "a refused join must not add the dialog")
+			assert.Equal(t, 1, b.stateRead(), "the dialogs in the bridge must keep being mixed")
+
+			require.Eventually(t, func() bool { return a.conn.reading.Load() >= 1 }, 2*time.Second, time.Millisecond,
+				"the mix is not reading the dialog")
+			assert.Never(t, func() bool { return a.conn.reading.Load() > 1 }, 100*time.Millisecond, time.Millisecond,
+				"a reader of the refused mix is still reading the dialog")
+		})
+	}
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())

@@ -355,7 +355,12 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 
 	b.dialogs = append(b.dialogs, d)
 	b.log.Debug("Added dialog", "dialog", d.Id(), "total", len(b.dialogs))
-	b.mixStart()
+	if err := b.mixStart(); err != nil {
+		// The dialog can not be mixed with the others. The join is refused, and
+		// the dialogs already here keep being mixed.
+		b.dialogs = slices.Delete(b.dialogs, len(b.dialogs)-1, len(b.dialogs))
+		return errors.Join(err, b.mixStart())
+	}
 	return nil
 }
 
@@ -497,7 +502,7 @@ func (b *BridgeMix) mixStart() error {
 
 		for i, d := range b.dialogs {
 			rwStreams[i] = &bridgePCMStream{}
-			if err := b.addDialogStream(ctx, d, rwStreams[i], &firstDialogCodec, poll); err != nil {
+			if err := b.addDialogStream(d, rwStreams[i], &firstDialogCodec); err != nil {
 				return nil, err
 			}
 		}
@@ -506,6 +511,45 @@ func (b *BridgeMix) mixStart() error {
 	if err != nil {
 		cancelPoll()
 		return err
+	}
+
+	// Readers start once every stream is set up, so a stream that can not be
+	// mixed leaves no reader behind.
+	if poll {
+		for _, stream := range rwStreams {
+			// We do buffering because initial packet can be read oner than actual mixing has started
+			b.mixWG.Add(1)
+			bridgeTrace("poll: starting stream", "stream.id", stream.id)
+			go func(s *bridgePCMStream) {
+				defer b.mixWG.Done()
+
+				bufPtr := bridgeReadPool.Get().(*[]byte)
+				defer bridgeReadPool.Put(bufPtr)
+
+				defer close(s.pipeWrite)
+
+				buf := *bufPtr
+				for {
+					n, err := s.r.Read(buf)
+					if err != nil {
+						bridgeTrace("poll: stopped with error", "error", err, "stream.id", s.id)
+						return
+					}
+
+					select {
+					case s.pipeWrite <- buf[:n]:
+						nw := <-s.pipeRead
+						if nw != n {
+							// there is no reason this to happen, so lets panic
+							panic("reading from pipe was not full")
+						}
+					case <-ctx.Done():
+						bridgeTrace("poll: stream context canceled", "stream.id", s.id)
+						return
+					}
+				}
+			}(stream)
+		}
 	}
 
 	// Start new mix
@@ -604,7 +648,7 @@ type bridgePCMStream struct {
 	markGone  bool
 }
 
-func (b *BridgeMix) addDialogStream(ctx context.Context, d DialogSession, stream *bridgePCMStream, firstDialogCodec *media.Codec, poll bool) error {
+func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, firstDialogCodec *media.Codec) error {
 	m := d.Media()
 
 	p := MediaProps{}
@@ -614,10 +658,10 @@ func (b *BridgeMix) addDialogStream(ctx context.Context, d DialogSession, stream
 	}
 
 	if firstDialogCodec.SampleRate == 0 {
-		firstDialogCodec = &p.Codec
+		*firstDialogCodec = p.Codec
 	}
 
-	if firstDialogCodec.SampleRate != p.Codec.SampleRate && firstDialogCodec.SampleDur != p.Codec.SampleDur {
+	if firstDialogCodec.SampleRate != p.Codec.SampleRate || firstDialogCodec.SampleDur != p.Codec.SampleDur {
 		return fmt.Errorf("Codec missmatch. Resampling or transcoding is not supported")
 	}
 
@@ -661,42 +705,6 @@ func (b *BridgeMix) addDialogStream(ctx context.Context, d DialogSession, stream
 		buf:          make([]byte, media.RTPBufSize),
 		pipeRead:     make(chan int),
 		pipeWrite:    make(chan []byte),
-	}
-
-	if poll {
-		// We do buffering because initial packet can be read oner than actual mixing has started
-		b.mixWG.Add(1)
-		bridgeTrace("poll: starting stream", "stream.id", stream.id)
-		go func(s *bridgePCMStream) {
-			defer b.mixWG.Done()
-
-			bufPtr := bridgeReadPool.Get().(*[]byte)
-			defer bridgeReadPool.Put(bufPtr)
-
-			defer close(s.pipeWrite)
-
-			buf := *bufPtr
-			for {
-				n, err := s.r.Read(buf)
-				if err != nil {
-					bridgeTrace("poll: stopped with error", "error", err, "stream.id", stream.id)
-					return
-				}
-
-				select {
-				case s.pipeWrite <- buf[:n]:
-					nw := <-s.pipeRead
-					if nw != n {
-						// there is no reason this to happen, so lets panic
-						panic("reading from pipe was not full")
-					}
-				case <-ctx.Done():
-					bridgeTrace("poll: stream context canceled", "stream.id", stream.id)
-					return
-				}
-			}
-		}(stream)
-		return nil
 	}
 	return nil
 }
