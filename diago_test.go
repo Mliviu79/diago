@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -103,18 +104,36 @@ func TestDiagoInviteCallerID(t *testing.T) {
 
 func TestDiagoTransportConfs(t *testing.T) {
 	type testCase = struct {
-		tran                    Transport
+		tran Transport
+		// serve starts the transport's listener first, so its ready callback has
+		// run before the INVITE is built.
+		serve                   bool
 		expectedContactHostPort string
-		expectedMediaHost       string
+		// expectedContactHost, set instead of expectedContactHostPort, expects
+		// the Contact at this host and at the port the listener bound.
+		expectedContactHost string
+		expectedMediaHost   string
 	}
 
-	doTest := func(tc testCase) {
+	doTest := func(t *testing.T, tc testCase) {
 		tran := tc.tran
 		reqCh := make(chan *sip.Request)
 		dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
 			reqCh <- req
 			return sip.NewResponseFromRequest(req, 200, "OK", nil)
 		}, WithTransport(tran))
+
+		expectedContactHostPort := tc.expectedContactHostPort
+		if tc.serve {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			require.NoError(t, dg.ServeBackground(ctx, func(d *DialogServerSession) {}))
+			if tc.expectedContactHost != "" {
+				listenPort := dg.transports[0].BindPort
+				require.NotZero(t, listenPort)
+				expectedContactHostPort = net.JoinHostPort(tc.expectedContactHost, strconv.Itoa(listenPort))
+			}
+		}
 
 		go dg.Invite(context.TODO(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
 
@@ -127,7 +146,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 		connInfo, err := sd.ConnectionInformation()
 		require.NoError(t, err)
 
-		assert.Equal(t, tc.expectedContactHostPort, req.Contact().Address.HostPort())
+		assert.Equal(t, expectedContactHostPort, req.Contact().Address.HostPort())
 		assert.Equal(t, tc.expectedMediaHost, connInfo.IP.String())
 	}
 
@@ -143,7 +162,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 			expectedMediaHost:       "1.2.3.4",
 		}
 
-		doTest(tc)
+		doTest(t, tc)
 	})
 
 	t.Run("ExternalHostFQDN", func(t *testing.T) {
@@ -158,7 +177,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 			expectedMediaHost:       "127.0.0.111", // Hosts are not resolved so it goes with bind
 		}
 
-		doTest(tc)
+		doTest(t, tc)
 	})
 
 	t.Run("ExternalHostFQDNExternalMedia", func(t *testing.T) {
@@ -174,7 +193,58 @@ func TestDiagoTransportConfs(t *testing.T) {
 			expectedMediaHost:       "1.2.3.4", // Hosts are not resolved so it goes with bind
 		}
 
-		doTest(tc)
+		doTest(t, tc)
+	})
+
+	t.Run("ExternalPort", func(t *testing.T) {
+		tc := testCase{
+			tran: Transport{
+				Transport:    "udp",
+				BindHost:     "127.0.0.111",
+				BindPort:     15060,
+				ExternalHost: "1.2.3.4",
+				ExternalPort: 5070,
+			},
+			expectedContactHostPort: "1.2.3.4:5070",
+			expectedMediaHost:       "1.2.3.4",
+		}
+
+		doTest(t, tc)
+	})
+
+	t.Run("ExternalPortEphemeralBind", func(t *testing.T) {
+		// Port forwarding onto an ephemeral local port: the Contact keeps the
+		// forwarded port once the listener has bound.
+		tc := testCase{
+			tran: Transport{
+				Transport:    "udp",
+				BindHost:     "127.0.0.111",
+				BindPort:     0,
+				ExternalHost: "1.2.3.4",
+				ExternalPort: 5070,
+			},
+			serve:                   true,
+			expectedContactHostPort: "1.2.3.4:5070",
+			expectedMediaHost:       "1.2.3.4",
+		}
+
+		doTest(t, tc)
+	})
+
+	t.Run("ExternalHostEphemeralBind", func(t *testing.T) {
+		tc := testCase{
+			tran: Transport{
+				Transport:    "udp",
+				BindHost:     "127.0.0.111",
+				BindPort:     0,
+				ExternalHost: "1.2.3.4",
+			},
+			serve:               true,
+			expectedContactHost: "1.2.3.4",
+			expectedMediaHost:   "1.2.3.4",
+		}
+
+		doTest(t, tc)
 	})
 }
 

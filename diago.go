@@ -651,7 +651,12 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 				_, port, _ := sip.ParseAddr(addr)
 				if tran.BindPort == 0 {
 					tran.BindPort = port
-					tran.ExternalPort = port
+					// WithTransport defaults ExternalPort to BindPort, which is
+					// 0 here, so a non-zero ExternalPort was set by the caller,
+					// for example a forwarded port, and is kept.
+					if tran.ExternalPort == 0 {
+						tran.ExternalPort = port
+					}
 					dg.transports[i] = tran
 				}
 				// This callback is itself the proof that the listener holds
