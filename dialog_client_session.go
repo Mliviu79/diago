@@ -780,7 +780,7 @@ func (d *DialogClientSession) awaitAck(tx sip.ServerTransaction) bool {
 	}
 }
 
-func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) (err error) {
 	if !d.awaitAck(tx) {
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
@@ -794,7 +794,18 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
 		return err
 	}
-	defer d.endPeerReInvite(tx)
+	// Once a 2xx has been sent, its ACK is waited for, and only then is the
+	// re-INVITE no longer in progress. A 2xx whose ACK does not come ends the
+	// call (RFC 3261 section 13.3.1.4).
+	var endUpdate func()
+	defer func() {
+		if ackErr := d.endPeerReInvite(tx); ackErr != nil {
+			err = errors.Join(err, ackErr, d.hangupNoMedia())
+		}
+		if endUpdate != nil {
+			endUpdate()
+		}
+	}()
 
 	if err := d.ReadRequest(req, tx); err != nil {
 		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
@@ -803,12 +814,12 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 
 	// RFC 3261 section 14.2: a re-INVITE arriving while one of ours is in
 	// progress is answered 491.
-	endUpdate, ok := d.beginPeerMediaUpdate()
+	var ok bool
+	endUpdate, ok = d.beginPeerMediaUpdate()
 	if !ok {
 		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
 	}
-	defer endUpdate()
 
 	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteRequest.Contact()); err != nil {
 		if errors.Is(err, errMediaUpdateAfterAnswer) {
@@ -837,6 +848,7 @@ func (d *DialogClientSession) hangupNoMedia() error {
 // applied or keyed ends the call, since an ACK cannot be refused.
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
 	reInvite, err := d.applyAckAnswer(d.Context(), req)
+	d.ackPeerReInvite(req)
 	if err != nil {
 		return errors.Join(err, d.hangupNoMedia())
 	}

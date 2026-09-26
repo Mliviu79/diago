@@ -747,6 +747,7 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 		// passive end of the association, and keep that role (RFC 8842
 		// section 5.3).
 		require.Equal(t, "a=setup:passive", iceSDPLine(t, res.Body(), "a=setup:"), "the answer did not continue the association")
+		require.NoError(t, d.handleReInviteACK(newReInviteAck(req, nil), newByeServerTx()))
 		select {
 		case err := <-handled:
 			require.NoError(t, err)

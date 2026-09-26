@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -755,7 +756,8 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 			}
 
 			tx := newRespondedServerTx()
-			require.NoError(t, handleReInvite(reInvite, tx))
+			handled := make(chan error, 1)
+			go func() { handled <- handleReInvite(reInvite, tx) }()
 			var res *sip.Response
 			select {
 			case res = <-tx.responded:
@@ -767,13 +769,15 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 
 			answerer := newMediaSessionForTest(t)
 			require.NoError(t, answerer.RemoteSDP(res.Body()))
-			ack := sip.NewRequest(sip.ACK, reInvite.Recipient)
-			ack.AppendHeader(&sip.CSeqHeader{SeqNo: reInvite.CSeq().SeqNo, MethodName: sip.ACK})
-			ack.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-			ack.SetBody(answerer.LocalSDP())
-			err := readAck(ack)
+			err := readAck(newReInviteAck(reInvite, answerer.LocalSDP()))
 			stopWriter()
 			require.NoError(t, err)
+			select {
+			case err := <-handled:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the re-INVITE handler did not return")
+			}
 
 			cur := m.MediaSession()
 			require.False(t, orig == cur, "the answer was not applied to a fork")
@@ -967,6 +971,173 @@ func TestDialogReInviteOffersNegotiatedCodecs(t *testing.T) {
 			cur := m.MediaSession()
 			assert.Equal(t, []media.Codec{media.CodecAudioAlaw}, cur.CommonCodecs())
 			assert.Equal(t, []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw}, cur.Codecs, "the session lost codecs it was set up with")
+		})
+	}
+}
+
+// transmissionsTx is a server transaction that records the status of each
+// response it is asked to send, as the peer never receives them.
+type transmissionsTx struct {
+	*byeServerTx
+	sent chan int
+}
+
+func newTransmissionsTx() *transmissionsTx {
+	return &transmissionsTx{byeServerTx: newByeServerTx(), sent: make(chan int, 256)}
+}
+
+func (tx *transmissionsTx) Respond(res *sip.Response) error {
+	tx.sent <- res.StatusCode
+	return nil
+}
+
+// reInviteAckSides builds, for each side of a call, a confirmed dialog with
+// media, a re-INVITE of the peer's carrying an offer, and the handling of it,
+// of the ACK to our 2xx and of the peer's BYE. sentBye reports whether the
+// dialog has sent a BYE.
+var reInviteAckSides = []struct {
+	name  string
+	setup func(t *testing.T) (m *DialogMedia, req *sip.Request, handleReInvite func(sip.ServerTransaction) error, readAck func(*sip.Request) error, readBye func(sip.ServerTransaction) error, sentBye func() bool)
+}{
+	{
+		name: "inbound",
+		setup: func(t *testing.T) (*DialogMedia, *sip.Request, func(sip.ServerTransaction) error, func(*sip.Request) error, func(sip.ServerTransaction) error, func() bool) {
+			d, sent := newRecordingServerDialog(t, newByeServerTx(), nil, MediaConfig{})
+			res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+			res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+			d.InviteResponse = res
+			confirm(t, d)
+			sess := newMediaSessionForTest(t)
+			require.NoError(t, sess.RemoteSDP(peerSDP()))
+			installTestMedia(t, &d.DialogMedia, sess)
+
+			req := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
+			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			req.SetBody(peerSDP())
+			sentBye := func() bool {
+				for {
+					select {
+					case r := <-sent:
+						if r.Method == sip.BYE {
+							return true
+						}
+					default:
+						return false
+					}
+				}
+			}
+			return &d.DialogMedia, req,
+				func(tx sip.ServerTransaction) error { return d.handleReInvite(req, tx) },
+				func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
+				func(tx sip.ServerTransaction) error {
+					return d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), tx)
+				},
+				sentBye
+		},
+	},
+	{
+		name: "outbound",
+		setup: func(t *testing.T) (*DialogMedia, *sip.Request, func(sip.ServerTransaction) error, func(*sip.Request) error, func(sip.ServerTransaction) error, func() bool) {
+			d, sent := newAnsweredTestClientDialog(t)
+			req := newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1)
+			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			req.SetBody(peerSDP())
+			sentBye := func() bool {
+				return slices.Contains(sent.sent(), sip.BYE)
+			}
+			return &d.DialogMedia, req,
+				func(tx sip.ServerTransaction) error { return d.handleReInvite(req, tx) },
+				func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
+				func(tx sip.ServerTransaction) error {
+					return d.ReadBye(newPeerInDialogRequest(sip.BYE, req.CSeq().SeqNo+1), tx)
+				},
+				sentBye
+		},
+	},
+}
+
+// nextTransmission returns the status of the next response tx sends, and
+// fails the test when none comes within wait.
+func nextTransmission(t *testing.T, tx *transmissionsTx, wait time.Duration) int {
+	t.Helper()
+	select {
+	case status := <-tx.sent:
+		return status
+	case <-time.After(wait):
+		t.Fatal("no response was sent")
+		return 0
+	}
+}
+
+// TestDialogReInvite2xxRetransmission pins that our 2xx to a re-INVITE of the
+// peer's is passed to its transaction again until the ACK is read, on either
+// side. The server transaction does not retransmit a 2xx; the UAS core does,
+// at T1, doubling up to T2, for 64*T1, and then ends the call with a BYE (RFC
+// 3261 section 13.3.1.4, RFC 6026 section 7.1). Before, the 2xx was sent once,
+// so a lost 2xx left the peer's re-INVITE unanswered.
+func TestDialogReInvite2xxRetransmission(t *testing.T) {
+	for _, side := range reInviteAckSides {
+		t.Run(side.name, func(t *testing.T) {
+			t.Run("first 2xx lost", func(t *testing.T) {
+				_, req, handleReInvite, readAck, _, sentBye := side.setup(t)
+				tx := newTransmissionsTx()
+				handled := make(chan error, 1)
+				go func() { handled <- handleReInvite(tx) }()
+
+				require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
+				// The peer never got it: the 2xx must go out again.
+				require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 4*sip.T1), "the 2xx was not retransmitted")
+				select {
+				case err := <-handled:
+					t.Fatalf("the re-INVITE ended before its ACK: %v", err)
+				default:
+				}
+
+				require.NoError(t, readAck(newReInviteAck(req, nil)))
+				select {
+				case err := <-handled:
+					require.NoError(t, err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the ACK did not end the retransmission")
+				}
+				assert.False(t, sentBye(), "an acknowledged re-INVITE ended the call")
+			})
+
+			t.Run("no ACK", func(t *testing.T) {
+				m, _, handleReInvite, _, _, sentBye := side.setup(t)
+				m.ackTimers = ackTimers{t1: 10 * time.Millisecond, t2: 40 * time.Millisecond, timeout: 400 * time.Millisecond}
+				tx := newTransmissionsTx()
+				handled := make(chan error, 1)
+				go func() { handled <- handleReInvite(tx) }()
+				select {
+				case err := <-handled:
+					require.ErrorIs(t, err, errReInviteAckTimeout)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the retransmission did not give up")
+				}
+				// 0, 10, 30, 70, then every 40 ms up to 400 ms.
+				assert.GreaterOrEqual(t, len(tx.sent), 3)
+				assert.LessOrEqual(t, len(tx.sent), 13)
+				assert.True(t, sentBye(), "the call was not ended with a BYE")
+			})
+
+			t.Run("BYE", func(t *testing.T) {
+				_, _, handleReInvite, _, readBye, _ := side.setup(t)
+				log := &answerLog{}
+				tx := newLoggedServerTx("re-INVITE", log)
+				handled := make(chan error, 1)
+				go func() { handled <- handleReInvite(tx) }()
+				require.Eventually(t, func() bool { return len(log.list()) == 1 }, 5*time.Second, time.Millisecond)
+
+				require.NoError(t, readBye(newLoggedServerTx("BYE", log)))
+				select {
+				case err := <-handled:
+					require.NoError(t, err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the end of the dialog did not end the retransmission")
+				}
+				assert.Equal(t, []string{"re-INVITE 200", "BYE 200"}, log.list(), "a 2xx went out after the BYE")
+			})
 		})
 	}
 }

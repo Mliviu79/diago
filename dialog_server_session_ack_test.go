@@ -33,6 +33,46 @@ func (tx *respondedServerTx) Respond(res *sip.Response) error {
 	return nil
 }
 
+// ackedServerTx is a server transaction whose 2xx the peer acknowledges: once
+// a 2xx is sent, ack runs on a goroutine of its own, as the peer's ACK is
+// read. A 2xx to a re-INVITE is retransmitted, and its handler waits, until
+// the ACK is read (RFC 3261 section 13.3.1.4).
+type ackedServerTx struct {
+	sip.ServerTransaction
+	ack   func()
+	once  sync.Once
+	acked chan struct{}
+}
+
+func newAckedServerTx(tx sip.ServerTransaction, ack func()) *ackedServerTx {
+	return &ackedServerTx{ServerTransaction: tx, ack: ack, acked: make(chan struct{})}
+}
+
+func (tx *ackedServerTx) Respond(res *sip.Response) error {
+	err := tx.ServerTransaction.Respond(res)
+	if res.IsSuccess() {
+		tx.once.Do(func() {
+			go func() {
+				defer close(tx.acked)
+				tx.ack()
+			}()
+		})
+	}
+	return err
+}
+
+// newReInviteAck builds the ACK to the 2xx to req, a re-INVITE of the peer's,
+// carrying body when it is not nil.
+func newReInviteAck(req *sip.Request, body []byte) *sip.Request {
+	ack := sip.NewRequest(sip.ACK, req.Recipient)
+	ack.AppendHeader(&sip.CSeqHeader{SeqNo: req.CSeq().SeqNo, MethodName: sip.ACK})
+	if body != nil {
+		ack.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		ack.SetBody(body)
+	}
+	return ack
+}
+
 // sentServerTx is a byeServerTx that closes sent when its first response goes
 // out, so a test knows the INVITE's 2xx has been sent.
 type sentServerTx struct {
@@ -157,7 +197,11 @@ var inDialogRequests = []struct {
 		newRequest: func(t *testing.T, d *DialogServerSession) *sip.Request {
 			return newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
 		},
-		handle:    (*DialogServerSession).handleReInvite,
+		handle: func(d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error {
+			return d.handleReInvite(req, newAckedServerTx(tx, func() {
+				_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+			}))
+		},
 		wantState: sip.DialogStateConfirmed,
 	},
 }

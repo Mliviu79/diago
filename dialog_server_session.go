@@ -619,6 +619,7 @@ func (d *DialogServerSession) AnswerLate() error {
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	if reInvite, err := d.applyAckAnswer(d.Context(), req); reInvite {
 		ackErr := d.DialogServerSession.ReadAck(req, tx)
+		d.ackPeerReInvite(req)
 		if err != nil {
 			return errors.Join(err, ackErr, d.hangupNoMedia())
 		}
@@ -630,6 +631,9 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		}
 		return ackErr
 	}
+	// The ACK to the 2xx to a re-INVITE of the peer's that carried an offer
+	// ends the retransmission of that 2xx.
+	d.ackPeerReInvite(req)
 
 	// Check do we have some session
 	answerWaiting := false
@@ -1055,7 +1059,7 @@ func (d *DialogServerSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 	dialogHandleRefer(d, dg, req, tx, onRefDialog)
 }
 
-func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) (err error) {
 	// A re-INVITE that arrives after our 2xx but before its ACK is handled once
 	// the answer is complete, as RFC 5407 section 3.1.4 recommends. It cannot be
 	// read ahead of the ACK: ReadRequest below moves the remote CSeq past the
@@ -1076,7 +1080,18 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
 		return err
 	}
-	defer d.endPeerReInvite(tx)
+	// Once a 2xx has been sent, its ACK is waited for, and only then is the
+	// re-INVITE no longer in progress. A 2xx whose ACK does not come ends the
+	// call (RFC 3261 section 13.3.1.4).
+	var endUpdate func()
+	defer func() {
+		if ackErr := d.endPeerReInvite(tx); ackErr != nil {
+			err = errors.Join(err, ackErr, d.hangupNoMedia())
+		}
+		if endUpdate != nil {
+			endUpdate()
+		}
+	}()
 
 	// NOTE: Calling ReadRequest increases remote CSEQ.
 	// We should not call this until dialog is confirmed, otherwise any intermidiate response
@@ -1101,12 +1116,12 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 
 	// RFC 3261 section 14.2: a re-INVITE arriving while one of ours is in
 	// progress is answered 491.
-	endUpdate, ok := d.beginPeerMediaUpdate()
+	var ok bool
+	endUpdate, ok = d.beginPeerMediaUpdate()
 	if !ok {
 		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
 	}
-	defer endUpdate()
 
 	// RFC 4028: an inbound refresh re-INVITE resets the active timer. When the
 	// peer is the refresher its watchdog is rearmed. When we refresh, the loop's

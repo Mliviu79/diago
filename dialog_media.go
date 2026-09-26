@@ -146,6 +146,11 @@ type DialogMedia struct {
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
 
+	// ackTimers are the timers of the retransmission of a 2xx to a re-INVITE
+	// of the peer's. They are set before the dialog is used, and zero outside
+	// tests.
+	ackTimers ackTimers
+
 	// mediaUpdating is set while a media update waits, with mu released, for
 	// the handshake of a new DTLS association. Another update is kept out
 	// until it is done.
@@ -175,15 +180,52 @@ type ackOffer struct {
 }
 
 // pendingReInvite is a re-INVITE of the peer's being handled. Every field is
-// guarded by DialogMedia.answerMu.
+// guarded by DialogMedia.answerMu, but for ackErr, which retransmitted
+// publishes.
 type pendingReInvite struct {
 	req *sip.Request
 	tx  sip.ServerTransaction
+	// cseq is the CSeq of the re-INVITE, which the ACK to its 2xx carries.
+	cseq uint32
 	// dialog is the dialog the re-INVITE belongs to. Once it has ended the
 	// re-INVITE is answered 487.
 	dialog *sipgo.Dialog
 	// answered is set once the re-INVITE has its final response.
 	answered bool
+	// acked is made when a 2xx is sent, and closed once its ACK is read.
+	acked chan struct{}
+	// retransmitted is made when a 2xx is sent, and closed once its
+	// retransmission has ended; ackErr then says why, nil for an ACK or the
+	// end of the dialog.
+	retransmitted chan struct{}
+	ackErr        error
+}
+
+// errReInviteAckTimeout is why a re-INVITE of the peer's ended when the ACK to
+// our 2xx did not come within 64*T1. RFC 3261 section 13.3.1.4 has the dialog
+// confirmed, and the session ended with a BYE.
+var errReInviteAckTimeout = errors.New("no ACK received for the 2xx to a re-INVITE")
+
+// ackTimers are the timers of the retransmission of a 2xx to a re-INVITE of
+// the peer's: the first interval, the interval it doubles up to, and how long
+// it waits for the ACK. Zero values take T1, T2 and 64*T1 (RFC 3261 section
+// 13.3.1.4).
+type ackTimers struct {
+	t1, t2, timeout time.Duration
+}
+
+func (t ackTimers) values() (t1, t2, timeout time.Duration) {
+	t1, t2, timeout = t.t1, t.t2, t.timeout
+	if t1 <= 0 {
+		t1 = sip.T1
+	}
+	if t2 <= 0 {
+		t2 = sip.T2
+	}
+	if timeout <= 0 {
+		timeout = 64 * sip.T1
+	}
+	return t1, t2, timeout
 }
 
 // beginPeerReInvite answers req 481 when dialog has ended, and otherwise
@@ -199,17 +241,108 @@ func (d *DialogMedia) beginPeerReInvite(dialog *sipgo.Dialog, req *sip.Request, 
 		res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
 		return true, tx.Respond(res)
 	}
-	d.peerReInvite = &pendingReInvite{req: req, tx: tx, dialog: dialog}
+	p := &pendingReInvite{req: req, tx: tx, dialog: dialog}
+	if cseq := req.CSeq(); cseq != nil {
+		p.cseq = cseq.SeqNo
+	}
+	d.peerReInvite = p
 	return false, nil
 }
 
-// endPeerReInvite forgets the re-INVITE beginPeerReInvite recorded for tx.
-func (d *DialogMedia) endPeerReInvite(tx sip.ServerTransaction) {
+// endPeerReInvite waits until the retransmission of a 2xx sent to the
+// re-INVITE beginPeerReInvite recorded for tx has ended, and then forgets the
+// re-INVITE. It returns errReInviteAckTimeout when the ACK did not come, for
+// the caller to end the call.
+func (d *DialogMedia) endPeerReInvite(tx sip.ServerTransaction) error {
 	d.answerMu.Lock()
-	if p := d.peerReInvite; p != nil && p.tx == tx {
+	p := d.peerReInvite
+	if p == nil || p.tx != tx {
+		d.answerMu.Unlock()
+		return nil
+	}
+	retransmitted := p.retransmitted
+	d.answerMu.Unlock()
+
+	var err error
+	if retransmitted != nil {
+		<-retransmitted
+		err = p.ackErr
+	}
+
+	d.answerMu.Lock()
+	if d.peerReInvite == p {
 		d.peerReInvite = nil
 	}
 	d.answerMu.Unlock()
+	return err
+}
+
+// ackPeerReInvite tells the re-INVITE of the peer's being handled that ack,
+// the ACK to our 2xx, has been read, which ends the retransmission of the 2xx.
+func (d *DialogMedia) ackPeerReInvite(ack *sip.Request) {
+	cseq := ack.CSeq()
+	if cseq == nil {
+		return
+	}
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
+	p := d.peerReInvite
+	if p == nil || p.acked == nil || p.cseq != cseq.SeqNo {
+		return
+	}
+	select {
+	case <-p.acked:
+	default:
+		close(p.acked)
+	}
+}
+
+// retransmitReInvite2xx passes res, the 2xx sent to the re-INVITE p, to the
+// transaction again until its ACK is read: the server transaction does not
+// retransmit a 2xx, the UAS core does (RFC 3261 section 13.3.1.4, RFC 6026
+// section 7.1). The interval starts at T1 and doubles up to T2. It gives up
+// with errReInviteAckTimeout after 64*T1, and stops once the dialog has ended:
+// a retransmission is sent under answerMu while the dialog is live, so none
+// follows the 200 to a BYE.
+func (d *DialogMedia) retransmitReInvite2xx(p *pendingReInvite, res *sip.Response) {
+	defer close(p.retransmitted)
+	t1, t2, timeout := d.ackTimers.values()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	interval := t1
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-p.acked:
+			return
+		case <-p.dialog.Context().Done():
+			return
+		case <-deadline.C:
+			p.ackErr = errReInviteAckTimeout
+			return
+		case <-timer.C:
+			d.answerMu.Lock()
+			ended := p.dialog.LoadState() == sip.DialogStateEnded
+			var err error
+			if !ended {
+				err = p.tx.Respond(res)
+			}
+			d.answerMu.Unlock()
+			if ended {
+				return
+			}
+			if err != nil {
+				// Timer L ends the transaction 64*T1 after the 2xx, when
+				// the wait is over too.
+				p.ackErr = errors.Join(errReInviteAckTimeout, err)
+				return
+			}
+			interval = min(2*interval, t2)
+			timer.Reset(interval)
+		}
+	}
 }
 
 // respondPeerReInvite sends res as the final response to the peer's re-INVITE
@@ -231,7 +364,17 @@ func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Res
 	if p.dialog.LoadState() == sip.DialogStateEnded {
 		return false, tx.Respond(sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
 	}
-	return true, tx.Respond(res)
+	if !res.IsSuccess() {
+		return true, tx.Respond(res)
+	}
+	// Made before the 2xx goes out, which its ACK can follow at once.
+	p.acked = make(chan struct{})
+	if err := tx.Respond(res); err != nil {
+		return true, err
+	}
+	p.retransmitted = make(chan struct{})
+	go d.retransmitReInvite2xx(p, res)
+	return true, nil
 }
 
 // terminatePeerReInviteLocked answers the peer's re-INVITE 487 when it is
