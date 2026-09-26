@@ -863,6 +863,13 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 
+	// An ended dialog stays in the cache until the call handler returns, so a
+	// re-INVITE can still find it. It matches no live dialog and is answered 481
+	// (RFC 3261 section 12.2.2), without reaching the media.
+	if d.LoadState() == sip.DialogStateEnded {
+		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+	}
+
 	// NOTE: Calling ReadRequest increases remote CSEQ.
 	// We should not call this until dialog is confirmed, otherwise any intermidiate response
 	// will have wrong CSEQ

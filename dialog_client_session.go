@@ -659,6 +659,13 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 }
 
 func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
+	// After our BYE an ended dialog stays in the cache until it is closed, so a
+	// re-INVITE can still find it. It matches no live dialog and is answered 481
+	// (RFC 3261 section 12.2.2), without reaching the media.
+	if d.LoadState() == sip.DialogStateEnded {
+		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+	}
+
 	if err := d.ReadRequest(req, tx); err != nil {
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
 	}

@@ -631,3 +631,58 @@ func TestIntegrationDialogServerPlayback(t *testing.T) {
 	// Timestamp should be offset more than previous diff by Sleep
 	assert.Greater(t, diffTS2, diffTS+5*media.CodecAudioUlaw.SampleTimestamp())
 }
+
+// newTestMediaSession installs a media session on d, so a body-less re-INVITE
+// has an SDP to be answered with.
+func newTestMediaSession(t *testing.T, d *DialogMedia) {
+	t.Helper()
+	sess, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { sess.Close() })
+	d.mu.Lock()
+	d.mediaSession = sess
+	d.mu.Unlock()
+}
+
+// newReInviteTestDialog builds a confirmed inbound dialog, without a transport,
+// whose 2xx carries our Contact and whose media session is set up.
+func newReInviteTestDialog(t *testing.T) *DialogServerSession {
+	t.Helper()
+	d, _ := newByeTestDialog(t)
+	res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+	res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+	d.InviteResponse = res
+	confirm(t, d)
+	newTestMediaSession(t, &d.DialogMedia)
+	return d
+}
+
+// TestDialogServerReInviteEndedDialog pins how a re-INVITE for a dialog that is
+// no longer live is answered. An ended dialog stays in the cache until the call
+// handler returns, so the request still finds it. It matches no live dialog,
+// and is answered 481 (RFC 3261 section 12.2.2) without reaching the media. A
+// re-INVITE still pending when a BYE tears the media down gets 487 (RFC 3261
+// section 15.1.2) instead of an answer built on closed media.
+func TestDialogServerReInviteEndedDialog(t *testing.T) {
+	t.Run("ended", func(t *testing.T) {
+		d := newReInviteTestDialog(t)
+		require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+		require.Equal(t, sip.DialogStateEnded, d.LoadState())
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+2), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
+		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
+	})
+
+	t.Run("media closed", func(t *testing.T) {
+		d := newReInviteTestDialog(t)
+		require.NoError(t, d.DialogMedia.Close())
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
+	})
+}

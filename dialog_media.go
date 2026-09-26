@@ -481,6 +481,12 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// A BYE handled while this request was pending has closed the media. The
+	// request is still answered, with the 487 RFC 3261 section 15.1.2
+	// recommends, and nothing is negotiated on the closed session.
+	if d.closed {
+		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
+	}
 	d.remoteContactTarget = req.Contact().Clone()
 
 	// When body is not present this can mean client is doing keep alive

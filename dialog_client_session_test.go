@@ -550,6 +550,75 @@ func TestDialogClientReInviteACKReadsMediaUnderLock(t *testing.T) {
 	<-swapped
 }
 
+// newTestClientDialog builds an outgoing dialog in the given state, without a
+// transport.
+func newTestClientDialog(t *testing.T, state sip.DialogState) *DialogClientSession {
+	t.Helper()
+
+	us := sip.Uri{User: "bob", Host: "127.0.0.2", Port: 5060}
+	peer := sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}
+
+	invite := sip.NewRequest(sip.INVITE, peer)
+	invite.AppendHeader(&sip.ContactHeader{Address: us})
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", "caller-tag")
+	invite.AppendHeader(&sip.FromHeader{Address: us, Params: fromParams})
+	invite.AppendHeader(&sip.ToHeader{Address: peer, Params: sip.NewParams()})
+	invite.AppendHeader(sip.NewHeader("Call-ID", "client-reinvite-test-call-id"))
+	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
+
+	d := &DialogClientSession{DialogClientSession: &sipgo.DialogClientSession{
+		Dialog: sipgo.Dialog{InviteRequest: invite},
+	}}
+	d.InitWithState(state)
+	return d
+}
+
+// newPeerReInvite builds a body-less re-INVITE the peer sends inside d.
+func newPeerReInvite(d *DialogClientSession, seq uint32) *sip.Request {
+	inv := d.InviteRequest
+	toParams := sip.NewParams()
+	toParams.Add("tag", "callee-tag")
+	req := sip.NewRequest(sip.INVITE, inv.Contact().Address)
+	req.AppendHeader(&sip.FromHeader{Address: inv.To().Address, Params: toParams})
+	req.AppendHeader(&sip.ToHeader{Address: inv.From().Address, Params: inv.From().Params.Clone()})
+	req.AppendHeader(sip.HeaderClone(inv.CallID()))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.INVITE})
+	req.AppendHeader(&sip.ContactHeader{Address: inv.To().Address})
+	return req
+}
+
+// TestDialogClientReInviteEndedDialog pins how a peer's re-INVITE for an
+// outgoing dialog that is no longer live is answered. After our BYE the dialog
+// stays in the cache until it is closed, so the request still finds it. It
+// matches no live dialog, and is answered 481 (RFC 3261 section 12.2.2)
+// without reaching the media. A re-INVITE still pending when a BYE tears the
+// media down gets 487 (RFC 3261 section 15.1.2) instead of an answer built on
+// closed media.
+func TestDialogClientReInviteEndedDialog(t *testing.T) {
+	t.Run("ended", func(t *testing.T) {
+		d := newTestClientDialog(t, sip.DialogStateEnded)
+		newTestMediaSession(t, &d.DialogMedia)
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(newPeerReInvite(d, 5), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
+		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
+	})
+
+	t.Run("media closed", func(t *testing.T) {
+		d := newTestClientDialog(t, sip.DialogStateConfirmed)
+		newTestMediaSession(t, &d.DialogMedia)
+		require.NoError(t, d.DialogMedia.Close())
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(newPeerReInvite(d, 5), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
+	})
+}
+
 func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
