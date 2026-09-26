@@ -766,8 +766,7 @@ func (dg *Diago) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		closeErr := d.Close()
-		return nil, errors.Join(err, closeErr)
+		return nil, errors.Join(err, d.ackAndBye(), d.Close())
 	}
 	return d, nil
 }
@@ -797,15 +796,14 @@ func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Br
 		return nil, errors.Join(err, d.Hangup(d.Context()), d.Close())
 	}
 
-	// Do bridging now
+	// Do bridging now. The call is answered already, so a call that fails
+	// from here on is acknowledged and ended with a BYE.
 	if err := bridge.AddDialogSession(d); err != nil {
-		d.Close()
-		return nil, err
+		return nil, errors.Join(err, d.ackAndBye(), d.Close())
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		d.Close()
-		return nil, err
+		return nil, errors.Join(err, d.ackAndBye(), d.Close())
 	}
 	return d, nil
 }

@@ -1256,3 +1256,89 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 	r.Read(recv)
 	assert.Equal(t, ulaw, recv)
 }
+
+// newAnsweredCallPeer builds a diago whose calls go over a fake transaction
+// layer, which also carries the ACK, to a peer that answers the INVITE 200 with
+// what answer makes of the offer, and every other request 200. It returns the
+// methods of the requests the calls sent.
+func newAnsweredCallPeer(t *testing.T, answer func(offer []byte) []byte, opts ...DiagoOption) (*Diago, *sentRequests) {
+	t.Helper()
+	sent := &sentRequests{}
+	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+		res := sent.record(req)
+		if req.IsInvite() {
+			res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5099}})
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.SetBody(answer(req.Body()))
+		}
+		return res
+	}, opts...)
+	return dg, sent
+}
+
+// TestDiagoAnsweredCallRefusedAfter2xx pins what becomes of a call whose 2xx
+// arrived when it is then given up: InviteBridge whose bridge refuses the
+// call, and InviteBridge or Invite whose Ack fails on a DTLS handshake the
+// callee never completes. RFC 3261 section 13.2.2.4 has the UAC acknowledge
+// every 2xx and end a dialog it does not want with a BYE. The dialog was only
+// closed, so the callee kept the call up, and a refused call went
+// unacknowledged, its 2xx retransmitted until the callee gave up.
+func TestDiagoAnsweredCallRefusedAfter2xx(t *testing.T) {
+	plainAnswer := func([]byte) []byte { return peerSDP() }
+	silentDTLS := func(t *testing.T) (func([]byte) []byte, DiagoOption) {
+		peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+		return func(offer []byte) []byte {
+				if err := peer.RemoteSDP(offer); err != nil {
+					return nil
+				}
+				// Passive, so our side starts the handshake the callee ignores.
+				return withSetup(peer.LocalSDP(), "passive")
+			}, WithTransport(Transport{
+				Transport: "udp",
+				BindHost:  "127.0.0.1",
+				MediaSRTP: media.SecureRTPModeDTLS,
+				MediaDTLSConf: media.DTLSConfig{
+					Certificates: []tls.Certificate{testdata.ClientCertificate()},
+				},
+			})
+	}
+	recipient := sip.Uri{User: "callee", Host: "127.0.0.1", Port: 5099}
+
+	t.Run("InviteBridge refused by the bridge", func(t *testing.T) {
+		dg, sent := newAnsweredCallPeer(t, plainAnswer)
+		b := NewBridge()
+		b.WaitDialogsNum = 3
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "a", media.CodecAudioUlaw)))
+		require.NoError(t, b.AddDialogSession(newBridgeTestDialog(t, "c", media.CodecAudioUlaw)))
+		b.Originator = nil
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := dg.InviteBridge(ctx, recipient, &b, InviteOptions{})
+		require.Error(t, err)
+		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
+	})
+
+	t.Run("InviteBridge whose Ack fails", func(t *testing.T) {
+		answer, transport := silentDTLS(t)
+		dg, sent := newAnsweredCallPeer(t, answer, transport)
+		b := NewBridge()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := dg.InviteBridge(ctx, recipient, &b, InviteOptions{})
+		require.Error(t, err)
+		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
+	})
+
+	t.Run("Invite whose Ack fails", func(t *testing.T) {
+		answer, transport := silentDTLS(t)
+		dg, sent := newAnsweredCallPeer(t, answer, transport)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := dg.Invite(ctx, recipient, InviteOptions{})
+		require.Error(t, err)
+		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
+	})
+}
