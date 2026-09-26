@@ -394,14 +394,19 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 		recipient = contact.Address
 	}
 
+	// The session is taken under the lock before the ACK goes out. Once it is
+	// out the peer may re-INVITE, and handling that swaps in a fork of this
+	// session concurrently. The fork has nothing to finalize; this one does.
+	msess := d.MediaSession()
+
 	if err := d.ack(ctx, recipient, nil); err != nil {
 		return err
 	}
 
 	// NOTE it generally advisable todo this after successfull ACK:
 	// Server may not even listen yet as it is waiting for ACK
-	if d.mediaSession != nil {
-		if err := d.mediaSession.Finalize(); err != nil {
+	if msess != nil {
+		if err := msess.Finalize(); err != nil {
 			return err
 		}
 	}
