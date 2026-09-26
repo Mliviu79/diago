@@ -4,11 +4,13 @@
 package media
 
 import (
+	"crypto/tls"
 	"net"
 	"strings"
 	"testing"
 
 	"github.com/emiago/diago/media/sdp"
+	"github.com/emiago/diago/testdata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -92,15 +94,42 @@ func TestICEDisabledWithoutDTLS(t *testing.T) {
 	}
 }
 
+// TestDTLSEndpointRole pins the offer/answer role that startICE takes the ICE
+// role from: RFC 8445 section 6.1.1 makes the offerer the controlling agent.
+// Without an explicit DTLSRole the role follows the SDP applied so far. A known
+// remote address says nothing about it: an offerer that has read the answer
+// knows the answerer's address, and that is when startICE asks.
 func TestDTLSEndpointRole(t *testing.T) {
-	t.Run("inferred from remote addr", func(t *testing.T) {
-		s := &MediaSession{}
-		assert.Equal(t, DTLSEndpointRoleOfferer, s.dtlsEndpointRole(),
-			"no remote address yet means we are offering")
+	t.Run("follows the offer/answer exchange", func(t *testing.T) {
+		newSess := func(cert tls.Certificate) *MediaSession {
+			t.Helper()
+			s := &MediaSession{
+				Codecs:    []Codec{CodecAudioUlaw},
+				Mode:      sdp.ModeSendrecv,
+				SecureRTP: SecureRTPModeDTLS,
+				DTLSConf:  DTLSConfig{Certificates: []tls.Certificate{cert}},
+			}
+			s.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+			require.NoError(t, s.Init())
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		}
+		offerer := newSess(testdata.ClientCertificate())
+		answerer := newSess(testdata.ServerCertificate())
 
-		s.Raddr = net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 5000}
-		assert.Equal(t, DTLSEndpointRoleAnswerer, s.dtlsEndpointRole(),
-			"knowing the remote means we are answering")
+		assert.Equal(t, DTLSEndpointRoleOfferer, offerer.dtlsEndpointRole(),
+			"no SDP applied yet means we are offering")
+
+		require.NoError(t, answerer.RemoteSDP(offerer.LocalSDP()))
+		assert.Equal(t, DTLSEndpointRoleAnswerer, answerer.dtlsEndpointRole(),
+			"an applied offer makes us the answerer")
+
+		// As applyRemoteSDP does for the answer to our own INVITE.
+		offerer.RemoteSDPIsAnswer = true
+		require.NoError(t, offerer.RemoteSDP(answerer.LocalSDP()))
+		require.NotNil(t, offerer.Raddr.IP)
+		assert.Equal(t, DTLSEndpointRoleOfferer, offerer.dtlsEndpointRole(),
+			"the answer to our offer leaves us the offerer, although the remote address is now known")
 	})
 
 	t.Run("explicit role wins", func(t *testing.T) {

@@ -37,8 +37,8 @@ const (
 //
 // It decides two things that RFC 5763 and RFC 8445 tie to the same signalling
 // role: the default a=setup value, and which side is the controlling ICE agent.
-// DTLSEndpointRoleUnknown lets MediaSession infer the role from whether a
-// remote address is already known.
+// DTLSEndpointRoleUnknown lets MediaSession infer the role from the SDP it has
+// applied: an offer makes it the answerer, and otherwise it is the offerer.
 type DTLSEndpointRole int
 
 const (

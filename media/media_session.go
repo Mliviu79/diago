@@ -201,8 +201,8 @@ type MediaSession struct {
 	// rtcp-mux, because ICE nominates a single candidate pair.
 	ICEConf *ICEConfig
 
-	// DTLSRole forces the offer/answer role instead of inferring it from
-	// whether a remote address is known. Check DTLSEndpointRole.
+	// DTLSRole forces the offer/answer role instead of inferring it from the
+	// SDP applied so far. Check DTLSEndpointRole.
 	DTLSRole DTLSEndpointRole
 
 	// mode set after negotiation
@@ -314,14 +314,7 @@ const (
 // ClientHello, and the peer failed the handshake with UnexpectedMessage having
 // expected a ServerHello to its own.
 func (s *MediaSession) localDTLSSetup() string {
-	// Which of offerer and answerer we are comes from whether an offer was
-	// applied, never from whether the remote address is known. Knowing the
-	// address means we dialled someone -- an offerer knows exactly who it is
-	// calling -- so it cannot be read as "we are answering".
-	answering := s.answeringOffer()
-	if s.DTLSRole != DTLSEndpointRoleUnknown {
-		answering = s.DTLSRole == DTLSEndpointRoleAnswerer
-	}
+	answering := s.dtlsEndpointRole() == DTLSEndpointRoleAnswerer
 
 	// An explicit override wins: the caller has said what it wants to be.
 	if s.DTLSConf.SDPSetupRole != nil {
@@ -366,14 +359,19 @@ func (s *MediaSession) dtlsActsAsClient() bool {
 	return s.localDTLSSetup() == dtlsSetupActive
 }
 
-// dtlsEndpointRole resolves the signalling role. Without an explicit
-// DTLSRole it is inferred the same way LocalSDP picks a=setup: knowing the
-// remote address already means we are answering.
+// dtlsEndpointRole resolves the signalling role, which decides both the
+// default a=setup value and the ICE role. Without an explicit DTLSRole it
+// comes from whether an offer was applied: an applied offer makes us the
+// answerer, and no SDP yet, or the answer to our own offer, leaves us the
+// offerer. It never comes from whether the remote address is known. Knowing
+// the address means we dialled someone -- an offerer knows exactly who it is
+// calling, and has read the answerer's address once the answer is applied --
+// so it cannot be read as "we are answering".
 func (s *MediaSession) dtlsEndpointRole() DTLSEndpointRole {
 	if s.DTLSRole != DTLSEndpointRoleUnknown {
 		return s.DTLSRole
 	}
-	if s.Raddr.IP != nil {
+	if s.answeringOffer() {
 		return DTLSEndpointRoleAnswerer
 	}
 	return DTLSEndpointRoleOfferer
