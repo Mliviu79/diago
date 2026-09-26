@@ -607,8 +607,11 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur ti
 			continue
 		}
 
-		// broadcast to all
+		// broadcast to all, except the streams dropped from the mix
 		for i, w := range rwStreams {
+			if w.markGone {
+				continue
+			}
 			streamBuf := mixBuf[:n]
 			if w.n > 0 {
 				readBuf := w.buf
@@ -618,20 +621,16 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur ti
 			n, err := w.w.Write(streamBuf)
 			bridgeTrace("Writing stream", "i", i, "stream", w.id, "n", n, "err", err)
 			if err != nil {
-				// Detect is this Deadline or EOF error caused by stream exiting
-				if errors.Is(err, os.ErrDeadlineExceeded) {
-					state := b.stateRead()
-					if state != 1 {
-						// We are stopped
-						return err
-					}
-
-					// Mixing has been stopped or network problem
+				// A dialog whose media is closed, as a BYE closes it before its
+				// handler leaves the bridge, is dropped from the mix. Any other
+				// failure loses this frame for this dialog alone. Either way the
+				// others keep being mixed.
+				if errors.Is(err, net.ErrClosed) {
+					b.log.Debug("Dropping stream with closed media from mix", "stream.id", w.id, "error", err)
 					w.markGone = true
 					continue
-
 				}
-				return err
+				b.log.Debug("Writing stream failed", "stream.id", w.id, "error", err)
 			}
 		}
 	}

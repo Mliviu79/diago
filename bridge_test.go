@@ -509,19 +509,22 @@ func TestBridgeMixWaitsForStopInProgress(t *testing.T) {
 
 // TestBridgeMixLeaveStopsReadersOfEndedLoop checks that a leave stops the
 // readers of a mix whose loop ended on its own before it returns. The loop ends
-// on its own when a write to a dialog fails, as it does once a BYE has closed
-// that dialog's media, and its readers are then still reading the others.
+// on its own once every dialog is dropped from the mix for its closed media, and
+// a reader can then still be reading a dialog whose writes failed first.
 func TestBridgeMixLeaveStopsReadersOfEndedLoop(t *testing.T) {
 	b := NewBridgeMix()
 	talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
 	hungUp := newBridgeTestDialog(t, "hungup", media.CodecAudioUlaw)
+	// The talker's writes report its media closed while its reads go on
+	talker.media.audioWriter = bridgeFailingWriter{err: net.ErrClosed}
 	for _, d := range []*bridgeTestDialog{talker, hungUp} {
 		require.NoError(t, b.AddDialogSession(d))
 	}
 	t.Cleanup(func() { stopBridgeMix(t, b) })
 
-	// The talker's frame is mixed and written to the hung-up dialog, whose
-	// closed connection fails the write and ends the loop
+	// The talker's frame is mixed and written to both dialogs. Both writes fail
+	// for closed media, the hung-up dialog's on its closed connection, so both
+	// are dropped and the loop ends.
 	require.NoError(t, hungUp.conn.Close())
 	talker.sendRTP(t, 1, 160, make([]byte, 160))
 	require.Eventually(t, func() bool { return b.stateRead() == 0 }, 2*time.Second, time.Millisecond, "mix loop did not end")
@@ -701,6 +704,62 @@ func TestBridgeMixRealtimeReaderPerMix(t *testing.T) {
 
 	talker.sendRTP(t, 2, 160, bytes.Repeat([]byte{0x21}, 160))
 	waitHeard(t, heard, 0x21)
+}
+
+// bridgeFailingWriter fails every write with err.
+type bridgeFailingWriter struct {
+	err error
+}
+
+func (w bridgeFailingWriter) Write(b []byte) (int, error) {
+	return 0, w.err
+}
+
+// TestBridgeMixKeepsMixingPastAFailedDialog checks that a dialog the mix can no
+// longer write to does not stop the mix for the others. A dialog whose media a
+// BYE has closed, before its handler leaves the bridge, is dropped from the mix;
+// any other failed write loses that frame for that dialog alone.
+func TestBridgeMixKeepsMixingPastAFailedDialog(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// joined sets the dialog up to fail once it has joined
+		joined func(t *testing.T, d *bridgeTestDialog)
+		// writer, when set, is the dialog's audio writer from the start
+		writer io.Writer
+	}{
+		{name: "MediaClosed", joined: func(t *testing.T, d *bridgeTestDialog) { require.NoError(t, d.conn.Close()) }},
+		{name: "WriteError", writer: bridgeFailingWriter{err: errors.New("write refused")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewBridgeMix()
+			talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
+			failed := newBridgeTestDialog(t, "failed", media.CodecAudioUlaw)
+			listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
+			talker.media.audioWriter = newBridgeTestWriter()
+			failed.media.audioWriter = tc.writer
+			heard := newBridgeTestWriter()
+			listener.media.audioWriter = heard
+			// The failed dialog is written to before the listener in every round
+			for _, d := range []*bridgeTestDialog{talker, failed, listener} {
+				require.NoError(t, b.AddDialogSession(d))
+			}
+			t.Cleanup(func() { stopBridgeMix(t, b) })
+
+			if tc.joined != nil {
+				tc.joined(t, failed)
+			}
+			const frames = 5
+			start := time.Now()
+			for i := range frames {
+				time.Sleep(time.Until(start.Add(time.Duration(i) * 20 * time.Millisecond)))
+				talker.sendRTP(t, uint16(i), uint32(i)*160, bytes.Repeat([]byte{byte(0x20 + i)}, 160))
+			}
+			for i := range frames {
+				waitHeard(t, heard, byte(0x20+i))
+			}
+			assert.Equal(t, 1, b.stateRead(), "the mix must keep running")
+		})
+	}
 }
 
 func TestIntegrationBridgingMix(t *testing.T) {
