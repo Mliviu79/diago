@@ -801,8 +801,11 @@ func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	defer d.answerMu.Unlock()
 	d.terminatingBye.Store(req)
 	if err := readByeOnce(req, tx, d.DialogServerSession.ReadBye); err != nil {
-		// Not this dialog's ending: leave no cause planted on it.
-		d.terminatingBye.CompareAndSwap(req, nil)
+		// Not this dialog's ending: leave no cause planted on it. A BYE
+		// taken whose 200 could not be sent may still have ended it.
+		if errors.Is(err, sipgo.ErrDialogInvalidCseq) || d.LoadState() != sip.DialogStateEnded {
+			d.terminatingBye.CompareAndSwap(req, nil)
+		}
 		return err
 	}
 	return d.terminatePeerReInviteLocked()

@@ -18,6 +18,9 @@ type byeServerTx struct {
 	responses   []*sip.Response
 	done        chan struct{}
 	onTerminate sip.FnTxTerminate
+	// respondErr, when set, is what Respond returns, as a transaction that
+	// cannot send the response.
+	respondErr error
 }
 
 func newByeServerTx() *byeServerTx {
@@ -26,7 +29,7 @@ func newByeServerTx() *byeServerTx {
 
 func (tx *byeServerTx) Respond(res *sip.Response) error {
 	tx.responses = append(tx.responses, res)
-	return nil
+	return tx.respondErr
 }
 func (tx *byeServerTx) Acks() <-chan *sip.Request      { return nil }
 func (tx *byeServerTx) OnCancel(f sip.FnTxCancel) bool { return true }
@@ -168,6 +171,24 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 		require.Error(t, d.ReadBye(stale, newByeServerTx()))
 		assert.Nil(t, d.TerminatingBye(), "a rejected BYE must not be stashed")
 		assert.NotEqual(t, sip.DialogStateEnded, d.LoadState(), "a rejected BYE must not end the dialog")
+	})
+
+	t.Run("kept when the 200 cannot be sent", func(t *testing.T) {
+		// The BYE is answered, but the 200 does not go out. Whether that ends
+		// the dialog is sipgo's to decide; when it does, the BYE is what ended
+		// it, and it stays reachable as for any other ending.
+		d, _ := newByeTestDialog(t)
+		confirm(t, d)
+		bye := newBye(t, d, d.InviteRequest.CSeq().SeqNo+1)
+
+		tx := newByeServerTx()
+		tx.respondErr = sip.ErrTransactionTerminated
+		require.ErrorIs(t, d.ReadBye(bye, tx), sip.ErrTransactionTerminated)
+		if d.LoadState() == sip.DialogStateEnded {
+			assert.Same(t, bye, d.TerminatingBye(), "the BYE that ended the dialog must stay stashed")
+		} else {
+			assert.Nil(t, d.TerminatingBye(), "a BYE that did not end the dialog must not be stashed")
+		}
 	})
 
 	t.Run("an out-of-order BYE is answered 500", func(t *testing.T) {
