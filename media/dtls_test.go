@@ -35,6 +35,29 @@ type lentPacketConn struct{ net.PacketConn }
 
 func (lentPacketConn) Close() error { return nil }
 
+// dtlsServer and dtlsClient run a handshake outside SDP negotiation, where the
+// peer has sent no fingerprint to check its certificate against, so they turn
+// the fingerprint check off.
+func dtlsServer(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate) (*dtls.Conn, error) {
+	conf := DTLSConfig{
+		Certificates: certificates,
+	}
+	libConf := conf.ToLibConf(nil)
+	libConf.VerifyConnection = nil
+	return dtls.Server(conn, raddr, libConf)
+}
+
+func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate, serverName string) (*dtls.Conn, error) {
+	// Client DTLS config
+	conf := DTLSConfig{
+		Certificates: certificates,
+		ServerName:   serverName,
+	}
+	libConf := conf.ToLibConf(nil)
+	libConf.VerifyConnection = nil
+	return dtls.Client(conn, raddr, libConf)
+}
+
 // dtlsHandshakeOverTransport runs a real DTLS handshake between transport and a
 // peer socket, and returns the local conn. The teardown paths under test are
 // pion's own, so they have to be reached through a completed handshake rather

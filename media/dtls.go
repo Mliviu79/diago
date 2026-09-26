@@ -241,29 +241,6 @@ func (c *dtlsKeyExchangeConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 // is closed by MediaSession.Close, which is what owns it.
 func (c *dtlsKeyExchangeConn) Close() error { return nil }
 
-// dtlsServer and dtlsClient run a handshake outside SDP negotiation, where the
-// peer has sent no fingerprint to check its certificate against, so they turn
-// the fingerprint check off.
-func dtlsServer(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate) (*dtls.Conn, error) {
-	conf := DTLSConfig{
-		Certificates: certificates,
-	}
-	libConf := conf.ToLibConf(nil)
-	libConf.VerifyConnection = nil
-	return dtls.Server(conn, raddr, libConf)
-}
-
-func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate, serverName string) (*dtls.Conn, error) {
-	// Client DTLS config
-	conf := DTLSConfig{
-		Certificates: certificates,
-		ServerName:   serverName,
-	}
-	libConf := conf.ToLibConf(nil)
-	libConf.VerifyConnection = nil
-	return dtls.Client(conn, raddr, libConf)
-}
-
 // dtlsFingerprintHashes maps the a=fingerprint hash function names of RFC 8122
 // section 5 to their hash, leaving out MD2 and MD5. The names are case
 // insensitive and browsers write them in lower case, so they are looked up in
