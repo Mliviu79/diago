@@ -72,6 +72,11 @@ func (b *Bridge) GetDialogs() []DialogSession {
 }
 
 func (b *Bridge) AddDialogSession(d DialogSession) error {
+	// The dialog's codec is read from its media session
+	if d.Media().MediaSession() == nil {
+		return fmt.Errorf("dialog session has no media %q", d.Id())
+	}
+
 	// Check can this dialog be added to bridge. NO TRANSCODING
 	if b.Originator != nil {
 		// This may look ugly but it is safe way of reading
@@ -396,6 +401,10 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 
 	if state := d.DialogSIP().LoadState(); state != sip.DialogStateConfirmed {
 		return fmt.Errorf("dialog must be answered before adding into bridge")
+	}
+	// The mix reads the dialog's codec from its media session
+	if d.Media().MediaSession() == nil {
+		return fmt.Errorf("dialog session has no media %q", d.Id())
 	}
 
 	// Stop any current mixing

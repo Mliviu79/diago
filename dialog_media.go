@@ -1286,6 +1286,9 @@ type MediaProps struct {
 
 func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 	return func(d *DialogMedia) error {
+		if d.mediaSession == nil {
+			return ErrNoMediaSetup
+		}
 		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()
@@ -1454,6 +1457,9 @@ type AudioWriterOption func(d *DialogMedia) error
 
 func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	return func(d *DialogMedia) error {
+		if d.mediaSession == nil {
+			return ErrNoMediaSetup
+		}
 		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()

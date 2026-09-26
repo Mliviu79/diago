@@ -1554,6 +1554,53 @@ func TestBridgeMixUnmixesShortRead(t *testing.T) {
 	assert.Equal(t, bridgePCM(300, 80), nextHeard("short"), "the stream must hear the talker, and nothing of an earlier round")
 }
 
+// TestBridgeRefusesDialogWithoutMedia checks that both bridges refuse a dialog
+// that has no media session with an error, whether it joins first or after
+// another, and keep the dialogs they have. Each bridge reads a joining
+// dialog's codec from its media session, which dereferenced the missing
+// session and panicked the join, or the next one.
+func TestBridgeRefusesDialogWithoutMedia(t *testing.T) {
+	newNoMedia := func(t *testing.T) *bridgeTestDialog {
+		d := newBridgeTestDialog(t, "nomedia", media.CodecAudioUlaw)
+		d.media.mediaSession = nil
+		return d
+	}
+
+	for _, first := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Bridge/First=%t", first), func(t *testing.T) {
+			b := NewBridge()
+			a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+			var want []DialogSession
+			if !first {
+				require.NoError(t, b.AddDialogSession(a))
+				want = []DialogSession{a}
+			}
+			var err error
+			require.NotPanics(t, func() { err = b.AddDialogSession(newNoMedia(t)) })
+			require.Error(t, err)
+			assert.Equal(t, want, b.GetDialogs())
+		})
+
+		t.Run(fmt.Sprintf("BridgeMix/First=%t", first), func(t *testing.T) {
+			b := NewBridgeMix()
+			a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+			var want []DialogSession
+			if !first {
+				require.NoError(t, b.AddDialogSession(a))
+				want = []DialogSession{a}
+			}
+			t.Cleanup(func() { stopBridgeMix(t, b) })
+			var err error
+			require.NotPanics(t, func() { err = b.AddDialogSession(newNoMedia(t)) })
+			require.Error(t, err)
+			assert.Equal(t, want, b.DialogSessionsList())
+			if !first {
+				assert.Equal(t, 1, b.stateRead(), "the dialog in the bridge must keep being mixed")
+			}
+		})
+	}
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
