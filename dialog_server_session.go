@@ -672,9 +672,14 @@ func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return nil
 }
 
+// Hangup ends the call: it declines one not answered yet with 480, and ends an
+// answered one with a BYE. Once our 2xx is sent the INVITE transaction takes no
+// other final response, so a call whose 2xx awaits its ACK is ended with a BYE
+// too, which Bye sends once the ACK is read or the transaction has timed out
+// without one (RFC 3261 section 15). Until then it waits, bounded by ctx.
 func (d *DialogServerSession) Hangup(ctx context.Context) error {
 	state := d.LoadState()
-	if state >= sip.DialogStateConfirmed {
+	if state >= sip.DialogStateEstablished {
 		return d.Bye(ctx)
 	}
 	return d.Respond(sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)
