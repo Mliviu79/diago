@@ -519,11 +519,13 @@ func (s *MediaSession) initICE() error {
 	return nil
 }
 
+// InitWithListeners builds the session over RTP and RTCP sockets the caller
+// bound. The local address, which LocalSDP advertises, is the RTP socket's.
 func (s *MediaSession) InitWithListeners(lRTP net.PacketConn, lRTCP net.PacketConn, raddr *net.UDPAddr) {
 	s.Mode = sdp.ModeSendrecv
 	s.rtpConn = lRTP
 	s.rtcpConn = lRTCP
-	laddr, port, _ := sip.ParseAddr(lRTCP.LocalAddr().String())
+	laddr, port, _ := sip.ParseAddr(lRTP.LocalAddr().String())
 	s.Laddr = net.UDPAddr{IP: net.ParseIP(laddr), Port: port}
 	s.SetRemoteAddr(raddr)
 }

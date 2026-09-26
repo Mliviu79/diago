@@ -978,9 +978,6 @@ func newSentDTLSMediaSession(t *testing.T) (*media.MediaSession, *sentPacketConn
 		DTLSConf:  media.DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}},
 	}
 	sess.InitWithListeners(sent, rtcpConn, &net.UDPAddr{})
-	// InitWithListeners takes the local address from the RTCP socket, and the
-	// SDP has to name the RTP one.
-	sess.Laddr = *rtpConn.LocalAddr().(*net.UDPAddr)
 	t.Cleanup(func() { _ = sess.Close() })
 	return sess, sent
 }
