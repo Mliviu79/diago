@@ -164,6 +164,21 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 		assert.NotEqual(t, sip.DialogStateEnded, d.LoadState(), "a rejected BYE must not end the dialog")
 	})
 
+	t.Run("an out-of-order BYE is answered 500", func(t *testing.T) {
+		// A BYE below the INVITE's CSeq is out of order. RFC 3261 section
+		// 12.2.2 has it rejected with 500, so the peer gets an answer while
+		// the dialog goes on.
+		d, _ := newByeTestDialog(t)
+		confirm(t, d)
+		stale := newBye(t, d, d.InviteRequest.CSeq().SeqNo-1)
+
+		tx := newByeServerTx()
+		assert.ErrorIs(t, d.ReadBye(stale, tx), sipgo.ErrDialogInvalidCseq)
+		require.Len(t, tx.responses, 1, "an out-of-order BYE must be answered")
+		assert.Equal(t, sip.StatusInternalServerError, tx.responses[0].StatusCode)
+		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+	})
+
 	t.Run("an ending with no BYE stays nil", func(t *testing.T) {
 		// The dialog dies with its invite transaction, so the peer stated no cause
 		// and nil is the truthful answer.

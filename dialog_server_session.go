@@ -631,10 +631,10 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 }
 
 // ReadBye stashes the terminating BYE and then hands it to the embedded session,
-// which owns every part of BYE handling: validation, the 200, and the move to
-// DialogStateEnded. Nothing about that changes here — the request is recorded,
-// never acted upon differently — so BYE semantics are identical for every
-// caller.
+// which owns BYE handling: validation, the 200, and the move to
+// DialogStateEnded. The request is recorded here, not acted upon differently,
+// but for the answer the embedded session leaves to its caller when it refuses
+// a BYE, described below.
 //
 // A BYE that arrives before our answer is complete is read once it is. The ACK
 // the peer sent ahead of it is then not read on a dialog that has already
@@ -648,12 +648,21 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // here and letting the copies drift. Such a BYE is briefly visible, but it is
 // one no observer can be looking at: only a BYE the delegate accepts ends the
 // dialog, and until the dialog ends nothing has cause to read the stash.
+//
+// The delegate refuses a BYE whose CSeq is below the INVITE's with
+// sipgo.ErrDialogInvalidCseq and leaves the answer to its caller. Such a BYE
+// is out of order, and RFC 3261 section 12.2.2 has it rejected with 500, so it
+// is answered here and the error returned: the dialog goes on.
 func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.awaitAnswer(tx)
 	d.terminatingBye.Store(req)
 	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
 		// Not this dialog's ending: leave no cause planted on it.
 		d.terminatingBye.CompareAndSwap(req, nil)
+		if errors.Is(err, sipgo.ErrDialogInvalidCseq) {
+			res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
+			return errors.Join(err, tx.Respond(res))
+		}
 		return err
 	}
 	return nil

@@ -502,6 +502,82 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 	}
 }
 
+// TestDiagoOutOfOrderBye sends the BYE handler, over a loopback socket, a BYE
+// whose CSeq is below the INVITE's and then one in order. The first is out of
+// order: RFC 3261 section 12.2.2 has it answered 500, and the call goes on, so
+// its media must stay open. The second ends the dialog, and closing the media
+// then unblocks whoever is still reading or writing it.
+func TestDiagoOutOfOrderBye(t *testing.T) {
+	handled := make(chan struct{}, 1)
+	signalHandled := func(next sipgo.RequestHandler) sipgo.RequestHandler {
+		return func(req *sip.Request, tx sip.ServerTransaction) {
+			defer func() {
+				select {
+				case handled <- struct{}{}:
+				default:
+				}
+			}()
+			next(req, tx)
+		}
+	}
+
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua, WithServerRequestMiddleware(signalHandled))
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	d, _ := newByeTestDialog(t)
+	confirm(t, d)
+	newTestMediaSession(t, &d.DialogMedia)
+	require.NoError(t, dg.cache.server.DialogStore(context.Background(), d.ID, d))
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	mediaClosed := func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.DialogMedia.closed
+	}
+	// sendBye returns the BYE's final response, nil when none came, once the
+	// handler has returned.
+	sendBye := func(t *testing.T, seq uint32) *sip.Response {
+		t.Helper()
+		bye := newBye(t, d, seq)
+		bye.SetDestination(conn.LocalAddr().String())
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		res, err := client.Do(ctx, bye, sipgo.ClientRequestAddVia)
+		select {
+		case <-handled:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the BYE handler did not return")
+		}
+		assert.NoError(t, err, "the BYE was never answered")
+		return res
+	}
+
+	res := sendBye(t, d.InviteRequest.CSeq().SeqNo-1)
+	if assert.NotNil(t, res) {
+		assert.Equal(t, sip.StatusInternalServerError, res.StatusCode)
+	}
+	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+	assert.False(t, mediaClosed(), "an out-of-order BYE closed the media of a call that goes on")
+
+	res = sendBye(t, d.InviteRequest.CSeq().SeqNo+1)
+	if assert.NotNil(t, res) {
+		assert.Equal(t, sip.StatusOK, res.StatusCode)
+	}
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	assert.True(t, mediaClosed(), "the BYE that ended the call left its media open")
+}
+
 // TestDiagoNewInviteMissingHeader sends new INVITEs that each lack one header
 // dialog setup needs, and checks that each is answered once through its
 // transaction: the transaction answers the retransmission and absorbs the ACK,
