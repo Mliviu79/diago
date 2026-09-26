@@ -668,19 +668,13 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, fi
 		return fmt.Errorf("Codec missmatch. Resampling or transcoding is not supported")
 	}
 
-	rtr := func() io.Reader {
-		if !b.RealtimeReader {
-			return r
-		}
-
-		if rtr, ok := r.(*media.RTPRealTimeReader); ok {
-			return rtr
-		}
-
-		rtr := media.NewRTPRealTimeReader(r, m.RTPPacketReader, p.Codec)
-		m.SetAudioReader(rtr)
-		return rtr
-	}()
+	// The realtime reader belongs to this mix and is never set on the dialog. It
+	// judges frames late against the first frame this mix reads, and the dialog
+	// leaves the bridge with the reader it joined with.
+	rtr := r
+	if _, ok := r.(*media.RTPRealTimeReader); b.RealtimeReader && !ok {
+		rtr = media.NewRTPRealTimeReader(r, m.RTPPacketReader, p.Codec)
+	}
 
 	// Attach PCM decoder
 	pcmReader := audio.PCMDecoderReader{}

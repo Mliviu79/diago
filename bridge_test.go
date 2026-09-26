@@ -617,6 +617,92 @@ func TestBridgeMixPollDeliversRealtimeAudio(t *testing.T) {
 	}
 }
 
+// waitHeard waits, bounded, until the writer records a frame whose first byte
+// is frame, and fails the test if it does not.
+func waitHeard(t *testing.T, w *bridgeTestWriter, frame byte) {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case got := <-w.frames:
+			if got[0] == frame {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("frame %#x was not heard", frame)
+		}
+	}
+}
+
+// TestBridgeMixLeaveKeepsDialogReader checks that a dialog leaves the bridge
+// with the audio reader it joined with. The mix reads a dialog through a
+// realtime reader, which drops a frame read more than two frame durations after
+// its place in the stream the reader first read. Left on the dialog, it drops
+// the frames of an application that reads at its own pace after the leave.
+func TestBridgeMixLeaveKeepsDialogReader(t *testing.T) {
+	b := NewBridgeMix()
+	talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
+	listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
+	talker.media.audioWriter = newBridgeTestWriter()
+	heard := newBridgeTestWriter()
+	listener.media.audioWriter = heard
+	joinedWith, err := talker.media.AudioReader()
+	require.NoError(t, err)
+	for _, d := range []*bridgeTestDialog{talker, listener} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	// Every byte of a frame is its value, which decodes and encodes back to
+	// itself
+	talker.sendRTP(t, 1, 0, bytes.Repeat([]byte{0x20}, 160))
+	waitHeard(t, heard, 0x20)
+	require.NoError(t, b.RemoveDialogSession(talker))
+
+	leftWith, err := talker.media.AudioReader()
+	require.NoError(t, err)
+	assert.Same(t, joinedWith, leftWith, "the dialog must leave with the reader it joined with")
+
+	// The application reads the next frame of the stream well over two frame
+	// durations after the mix read the one before it
+	time.Sleep(100 * time.Millisecond)
+	talker.sendRTP(t, 2, 160, bytes.Repeat([]byte{0x21}, 160))
+	require.NoError(t, talker.conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, media.RTPBufSize)
+	n, err := leftWith.Read(buf)
+	require.NoError(t, err, "the application must read the frame the peer sent")
+	assert.Equal(t, bytes.Repeat([]byte{0x21}, 160), buf[:n])
+}
+
+// TestBridgeMixRealtimeReaderPerMix checks that a mix judges a dialog's frames
+// late only against the frames it has read itself. A frame that the previous
+// mix would have dropped as late, because the peer paused and resumed its RTP
+// clock where it left off, is heard in the mix that replaced it.
+func TestBridgeMixRealtimeReaderPerMix(t *testing.T) {
+	b := NewBridgeMix()
+	talker := newBridgeTestDialog(t, "talker", media.CodecAudioUlaw)
+	listener := newBridgeTestDialog(t, "listener", media.CodecAudioUlaw)
+	talker.media.audioWriter = newBridgeTestWriter()
+	heard := newBridgeTestWriter()
+	listener.media.audioWriter = heard
+	for _, d := range []*bridgeTestDialog{talker, listener} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	talker.sendRTP(t, 1, 0, bytes.Repeat([]byte{0x20}, 160))
+	waitHeard(t, heard, 0x20)
+
+	// A join replaces the mix while the talker pauses
+	joining := newBridgeTestDialog(t, "joining", media.CodecAudioUlaw)
+	joining.media.audioWriter = newBridgeTestWriter()
+	require.NoError(t, b.AddDialogSession(joining))
+	time.Sleep(100 * time.Millisecond)
+
+	talker.sendRTP(t, 2, 160, bytes.Repeat([]byte{0x21}, 160))
+	waitHeard(t, heard, 0x21)
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
