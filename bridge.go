@@ -94,24 +94,29 @@ func (b *Bridge) AddDialogSession(d DialogSession) error {
 		}
 	}
 
-	b.dialogs = append(b.dialogs, d)
+	// The dialog joins once the checks below pass, so a refused dialog is not
+	// left in the bridge.
+	dialogs := append(slices.Clone(b.dialogs), d)
+	if len(dialogs) >= b.WaitDialogsNum {
+		if len(dialogs) > 2 {
+			return fmt.Errorf("currently bridge only support 2 party")
+		}
+		// Check are both answered
+		for _, d := range dialogs {
+			// TODO remove this double locking. Read once
+			if d.Media().RTPPacketReader == nil || d.Media().RTPPacketWriter == nil {
+				return fmt.Errorf("dialog session not answered %q", d.Id())
+			}
+		}
+	}
+
+	b.dialogs = dialogs
 	if len(b.dialogs) == 1 {
 		b.Originator = d
 	}
 
 	if len(b.dialogs) < b.WaitDialogsNum {
 		return nil
-	}
-
-	if len(b.dialogs) > 2 {
-		return fmt.Errorf("currently bridge only support 2 party")
-	}
-	// Check are both answered
-	for _, d := range b.dialogs {
-		// TODO remove this double locking. Read once
-		if d.Media().RTPPacketReader == nil || d.Media().RTPPacketWriter == nil {
-			return fmt.Errorf("dialog session not answered %q", d.Id())
-		}
 	}
 
 	go func() {

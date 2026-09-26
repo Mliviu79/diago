@@ -249,6 +249,33 @@ func TestBridgeProxyMediaControl(t *testing.T) {
 	})
 }
 
+// TestBridgeRefusedDialogStaysOut checks that a dialog the bridge refuses is
+// not left in it: a third party, and a dialog with no media set up yet.
+func TestBridgeRefusedDialogStaysOut(t *testing.T) {
+	t.Run("ThirdParty", func(t *testing.T) {
+		b := NewBridge()
+		b.WaitDialogsNum = 3 // The proxy is started by hand
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(a))
+		require.NoError(t, b.AddDialogSession(c))
+
+		require.Error(t, b.AddDialogSession(newBridgeTestDialog(t, "x", media.CodecAudioUlaw)))
+		assert.Equal(t, []DialogSession{a, c}, b.GetDialogs())
+	})
+
+	t.Run("NotAnswered", func(t *testing.T) {
+		b := NewBridge()
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		require.NoError(t, b.AddDialogSession(a))
+
+		unanswered := newBridgeTestDialog(t, "unanswered", media.CodecAudioUlaw)
+		unanswered.media.RTPPacketReader = nil
+		require.Error(t, b.AddDialogSession(unanswered))
+		assert.Equal(t, []DialogSession{a}, b.GetDialogs())
+	})
+}
+
 func TestIntegrationBridging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
