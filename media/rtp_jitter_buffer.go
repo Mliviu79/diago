@@ -132,6 +132,9 @@ type RTPJitterBuffer struct {
 	playout bool
 	// releaseNow reports that the next expected sequence may be processed now.
 	releaseNow bool
+	// startNow reports that the initial timer expired, so playout starts at the
+	// next decision.
+	startNow bool
 	// resync reports that playout stopped with nothing queued. Until it starts
 	// again, expectedSeq is the first sequence number not yet played, and
 	// packets behind it are late.
@@ -222,6 +225,20 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 		default:
 		}
 
+		// A due timer and arrived input are ready together, and a select picks
+		// among them at random. Taking what has arrived first means no playout
+		// decision misses a packet still waiting in input.
+		j.drainInput()
+
+		if !j.playout && (j.startNow || j.queued >= j.delayPackets) {
+			if j.startNow {
+				j.debugPlayoutStarted("initial_timer")
+			} else {
+				j.debugPlayoutStarted("delay_packets")
+			}
+			j.startPlayout()
+		}
+
 		if j.playout && j.releaseNow {
 			position := int(j.expectedSeq) % j.maxPackets
 			slotIndex := j.sequence[position]
@@ -290,30 +307,42 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 			return 0, io.ErrClosedPipe
 
 		case input, ok := <-inputC:
-			if !ok {
-				j.inputClosed = true
-				continue
-			}
-			if input.err != nil {
-				j.readErr = input.err
-				j.inputClosed = true
-				continue
-			}
-
-			j.handleSlot(input.slot)
-			if !j.playout && j.queued >= j.delayPackets {
-				j.debugPlayoutStarted("delay_packets")
-				j.startPlayout()
-			}
+			j.handleInput(input, ok)
 
 		case <-initialC:
-			j.debugPlayoutStarted("initial_timer")
-			j.startPlayout()
+			j.startNow = true
 
 		case <-playoutC:
 			j.releaseNow = true
 		}
 	}
+}
+
+// drainInput takes the input that has already arrived. It takes at most as
+// many as input holds, so a source whose packets are all dropped cannot keep
+// ReadRTP from its playout decisions.
+func (j *RTPJitterBuffer) drainInput() {
+	for i := 0; i < cap(j.input) && !j.inputClosed; i++ {
+		select {
+		case input, ok := <-j.input:
+			j.handleInput(input, ok)
+		default:
+			return
+		}
+	}
+}
+
+func (j *RTPJitterBuffer) handleInput(input rtpJitterInput, ok bool) {
+	if !ok {
+		j.inputClosed = true
+		return
+	}
+	if input.err != nil {
+		j.readErr = input.err
+		j.inputClosed = true
+		return
+	}
+	j.handleSlot(input.slot)
 }
 
 func (j *RTPJitterBuffer) start() {
@@ -458,6 +487,7 @@ func (j *RTPJitterBuffer) resetStream(ssrc uint32, seq uint16) {
 	j.expectedSet = true
 	j.playout = false
 	j.releaseNow = false
+	j.startNow = false
 	j.resync = false
 	j.stopAndDrainTimer(j.playoutTimer)
 	j.resetTimer(j.initialTimer, time.Duration(j.delayPackets)*j.packetDuration)
@@ -484,6 +514,7 @@ func (j *RTPJitterBuffer) startPlayout() {
 		j.expectedSeq++
 	}
 	j.resync = false
+	j.startNow = false
 	j.playout = true
 	j.releaseNow = true
 }

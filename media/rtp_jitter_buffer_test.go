@@ -546,6 +546,38 @@ func jitterSeqRange(first uint16, n int) []uint16 {
 	return seqs
 }
 
+func TestRTPJitterBufferDecidesOnArrivedPackets(t *testing.T) {
+	// The consumer calls ReadRTP late: the playout tick is due, and packet 1
+	// arrived after packet 2 and both wait in input, unread. The tick and input
+	// are ready together and a select picks among them at random, so one trial
+	// proves nothing. Playout must decide on every packet that has arrived.
+	for trial := 0; trial < 32; trial++ {
+		reader := newChanRTPReader()
+		jb := NewRTPJitterBuffer(reader, time.Millisecond, RTPJitterBufferOptions{
+			DelayPackets: 1,
+			MaxPackets:   8,
+		})
+		jb.start()
+		sendJitterPacket(t, reader, rtpPacket(1234, 0))
+		require.Equal(t, uint16(0), readJitterSeq(t, jb), "trial %d", trial)
+
+		// The read loop takes each packet only after handing the one before to
+		// input, so once 3 is taken, 2 and 1 are waiting there.
+		sendJitterPacket(t, reader, rtpPacket(1234, 2))
+		sendJitterPacket(t, reader, rtpPacket(1234, 1))
+		sendJitterPacket(t, reader, rtpPacket(1234, 3))
+		// The consumer comes back after the tick is due.
+		time.Sleep(5 * time.Millisecond)
+
+		require.Equal(t, uint16(1), readJitterSeq(t, jb), "trial %d", trial)
+		require.Equal(t, uint16(2), readJitterSeq(t, jb), "trial %d", trial)
+		require.Zero(t, jb.Statistics().PacketsLost, "trial %d", trial)
+		require.NoError(t, jb.Close())
+		close(reader.packets)
+		requireJitterDone(t, jb)
+	}
+}
+
 func TestRTPJitterBufferEndedUpstreamWaitBlocks(t *testing.T) {
 	// The upstream ends with packets still queued and the next release is an
 	// hour away. ReadRTP has to wait for it blocked. The read loop has closed
