@@ -984,14 +984,13 @@ func (b *BridgeMix) readDirect(s *bridgePCMStream) (int, error) {
 	return n, err
 }
 
+// unmixStream returns what a stream hears of a round's mix: mixedBuf without
+// buf, the frame the stream read that round. A frame shorter than the mix put
+// nothing into the rest of it, so there the stream hears the mix as it is. The
+// result is written over buf's backing array, whose capacity holds the mix.
 func unmixStream(buf []byte, mixedBuf []byte) []byte {
-	n := len(mixedBuf)
-	if len(buf) < len(mixedBuf) {
-		// panic("stream buf is shorter than mixed buf")
-	}
-
-	readBuf := buf[:n]
-	audio.PCMUnmix(readBuf, mixedBuf, readBuf)
-	// NOTE: This can be higher than actual read bytes
-	return readBuf
+	heard := buf[:len(mixedBuf)]
+	audio.PCMUnmix(heard, mixedBuf, buf)
+	copy(heard[len(buf):], mixedBuf[len(buf):])
+	return heard
 }

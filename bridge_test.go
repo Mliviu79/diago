@@ -6,10 +6,12 @@ package diago
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1466,6 +1468,90 @@ func TestBridgeMixStreamTakesOneCodec(t *testing.T) {
 		}
 	}
 	assert.Zero(t, mixed, "%d of %d streams decode and encode their dialog in two codecs", mixed, joins)
+}
+
+// bridgeScriptedReader answers each read with the next of its reads, and a nil
+// read, or any read once they are used up, with the timeout a direct read of a
+// silent dialog ends in.
+type bridgeScriptedReader struct {
+	reads [][]byte
+}
+
+func (r *bridgeScriptedReader) Read(b []byte) (int, error) {
+	if len(r.reads) == 0 {
+		return 0, os.ErrDeadlineExceeded
+	}
+	read := r.reads[0]
+	r.reads = r.reads[1:]
+	if read == nil {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return copy(b, read), nil
+}
+
+// bridgePCM returns samples 16-bit PCM samples of value v.
+func bridgePCM(v int16, samples int) []byte {
+	b := make([]byte, 2*samples)
+	for i := 0; i < len(b); i += 2 {
+		binary.LittleEndian.PutUint16(b[i:], uint16(v))
+	}
+	return b
+}
+
+// TestBridgeMixUnmixesShortRead checks what a stream hears in a round where it
+// read less than the longest read of the round. It hears the round's mix
+// without its own frame, which covers only the bytes it read. Past them it put
+// nothing into the mix, so it hears the mix as it is, and never less what an
+// earlier round left in its buffer: the mix it heard then.
+func TestBridgeMixUnmixesShortRead(t *testing.T) {
+	b := NewBridgeMix()
+	b.Poll = false
+	heard := map[string]*bridgeTestWriter{}
+	newStream := func(id string, reads ...[]byte) *bridgePCMStream {
+		heard[id] = newBridgeTestWriter()
+		return &bridgePCMStream{
+			r:     &bridgeScriptedReader{reads: reads},
+			w:     heard[id],
+			media: newBridgeTestDialog(t, id, media.CodecAudioUlaw).media,
+			buf:   make([]byte, media.RTPBufSize),
+		}
+	}
+	// Both streams read a whole frame in the first round. In the second the
+	// short stream reads one of half that length.
+	streams := []*bridgePCMStream{
+		newStream("short", bridgePCM(1000, 80), bridgePCM(2000, 40)),
+		newStream("talker", bridgePCM(500, 80), bridgePCM(300, 80)),
+		newStream("listener"),
+	}
+	nextHeard := func(id string) []byte {
+		t.Helper()
+		select {
+		case frame := <-heard[id].frames:
+			return frame
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s heard nothing", id)
+			return nil
+		}
+	}
+
+	b.mu.Lock()
+	b.stateWriteUnsafe(1)
+	b.mu.Unlock()
+	mixed := make(chan error, 1)
+	go func() { mixed <- b.mixLoop(streams, false, 20*time.Millisecond) }()
+	defer func() {
+		b.mu.Lock()
+		b.stateWriteUnsafe(2)
+		b.mu.Unlock()
+		select {
+		case <-mixed:
+		case <-time.After(5 * time.Second):
+			t.Error("the mix did not stop")
+		}
+	}()
+
+	assert.Equal(t, bridgePCM(500, 80), nextHeard("short"), "the stream must hear the talker")
+	assert.Equal(t, bridgePCM(300, 80), nextHeard("short"), "the stream must hear the talker, and nothing of an earlier round")
 }
 
 func TestIntegrationBridgingMix(t *testing.T) {
