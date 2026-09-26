@@ -57,9 +57,10 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 		},
 	))
 
-	waitDialog := make(chan *DialogServerSession)
+	log := asyncLog(t)
+	waitDialog := make(chan *DialogServerSession, 1)
 	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-		t.Log("Call received")
+		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
 	})
@@ -72,7 +73,7 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 		defer wg.Done()
 		dialog, err := dialer.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15010}, InviteOptions{
 			OnResponse: func(res *sip.Response) error {
-				t.Log("Received resp", res.StatusCode)
+				log("Received resp", res.StatusCode)
 				// The server transaction sends 100 Trying on its own when the
 				// handler has not answered within 200 ms (RFC 3261 section
 				// 17.2.1), which a loaded machine can take. Only the responses
@@ -85,12 +86,12 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 			},
 		})
 		if err != nil {
-			t.Log("Failed to dial", err)
+			log("Failed to dial", err)
 			return
 		}
 		defer dialog.Close()
 		<-dialog.Context().Done()
-		t.Log("Dialog done")
+		log("Dialog done")
 	}()
 
 	d := <-waitDialog
@@ -254,6 +255,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	// waits for it to end before it returns.
 	inviteErr := make(chan error, 1)
 	dialogDone := make(chan struct{})
+	log := asyncLog(t)
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
 		defer ua.Close()
@@ -278,7 +280,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 				return
 			}
 			<-dialog.Context().Done()
-			t.Log("Dialog done")
+			log("Dialog done")
 		}()
 	}
 
@@ -293,9 +295,9 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		},
 	))
 
-	waitDialog := make(chan *DialogServerSession)
+	waitDialog := make(chan *DialogServerSession, 1)
 	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-		t.Log("Call received")
+		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
 	})
@@ -445,6 +447,9 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 	// test, and since the goroutine logs once its dialog ends, the test waits
 	// for it before it ends.
 	dialCall := func(t *testing.T) <-chan error {
+		// Registered before the wait below, so the goroutine still logs while
+		// the subtest waits for it.
+		log := asyncLog(t)
 		dialog, err := dialer.NewDialog(sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15070}, NewDialogOptions{})
 		require.NoError(t, err)
 
@@ -479,7 +484,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 
 			dialog.Ack(ctx)
 			<-dialog.Context().Done()
-			t.Log("Dialog done")
+			log("Dialog done")
 		}()
 		return invited
 	}
@@ -498,8 +503,9 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 			},
 		))
 
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call INVITE due to REFER received")
+			log("Call INVITE due to REFER received")
 			// waitReferDialog <- d
 			switch d.ToUser() {
 			case "busy":
@@ -528,9 +534,10 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 		},
 	))
 
-	waitDialog := make(chan *DialogServerSession)
+	log := asyncLog(t)
+	waitDialog := make(chan *DialogServerSession, 1)
 	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-		t.Log("Call received")
+		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
 	})

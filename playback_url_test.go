@@ -45,18 +45,19 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 	var errServer error
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	log := asyncLog(t)
 	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
 		defer wg.Done()
 		in.Trying()
 		in.Ringing()
 		in.Answer()
-		t.Log("Playing url ", urlStr)
+		log("Playing url ", urlStr)
 		pb, _ := in.PlaybackCreate()
 		if _, err := pb.PlayURL(urlStr); err != nil {
 			errServer = errors.Join(errServer, err)
 		}
 
-		t.Log("Done playing", urlStr)
+		log("Done playing", urlStr)
 		in.Hangup(in.Context())
 	})
 	require.NoError(t, err)

@@ -226,8 +226,9 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 		))
 
 		authServer := NewDigestServer()
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call received")
+			log("Call received")
 
 			err := authServer.AuthorizeDialog(d, DigestAuth{
 				Username: "test",
@@ -236,25 +237,25 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 				Expire:   10 * time.Second,
 			})
 			if err != nil {
-				t.Log("Failed to authorize", "error", err)
+				log("Failed to authorize", "error", err)
 				return
 			}
 
 			d.Trying()
 			if err := d.ProgressMedia(); err != nil {
-				t.Log("Failed to progress media", err)
+				log("Failed to progress media", err)
 				return
 			}
 
 			// Write frame
 			w, _ := d.AudioWriter()
 			if _, err := w.Write(bytes.Repeat([]byte{0, 100}, 80)); err != nil {
-				t.Log("Failed to write frame", err)
+				log("Failed to write frame", err)
 				return
 			}
 
 			if err := d.Answer(); err != nil {
-				t.Log("Failed to answer", err)
+				log("Failed to answer", err)
 				return
 			}
 			return
@@ -316,8 +317,9 @@ func TestIntegrationDialogClientReinvite(t *testing.T) {
 				BindPort:  15060,
 			},
 		))
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call received")
+			log("Call received")
 			d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
@@ -357,8 +359,9 @@ func TestIntegrationDialogClientReinviteKeepAlive(t *testing.T) {
 				BindPort:  15066,
 			},
 		))
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call received")
+			log("Call received")
 			d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
@@ -391,7 +394,7 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 	numPkts := len(beep) / media.CodecAudioUlaw.Samples16()
 
 	t.Log("Size beep", len(beep), numPkts)
-	audioReceived := make(chan []byte)
+	audioReceived := make(chan []byte, 1)
 	// The handler runs on a server goroutine, so the result of its re-INVITE
 	// is handed to the test rather than asserted there.
 	reinvited := make(chan error, 1)
@@ -407,8 +410,9 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 			},
 		))
 		digServer := NewDigestServer()
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("New INVITE")
+			log("New INVITE")
 			if err := digServer.AuthorizeDialog(d, DigestAuth{
 				Username: "test",
 				Password: "test",
@@ -498,19 +502,44 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 }
 
 func TestDialogClientInviteFailed(t *testing.T) {
-	reqCh := make(chan *sip.Request)
+	reqCh := make(chan *sip.Request, 1)
 	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
 		reqCh <- req
 		return sip.NewResponseFromRequest(req, 500, "", nil)
 	})
 
+	// invite sends the INVITE and returns it once it is out. The call fails on
+	// the 500, which is waited for before the subtest ends.
+	invite := func(t *testing.T, opts InviteClientOptions) *sip.Request {
+		t.Helper()
+		dialog, err := dg.NewDialog(sip.Uri{User: "alice", Host: "localhost"}, NewDialogOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = dialog.Close() })
+
+		invited := make(chan error, 1)
+		go func() { invited <- dialog.Invite(context.Background(), opts) }()
+		t.Cleanup(func() {
+			select {
+			case err := <-invited:
+				assert.Error(t, err, "the INVITE was answered 500")
+			case <-time.After(5 * time.Second):
+				t.Error("the INVITE did not return")
+			}
+		})
+
+		select {
+		case req := <-reqCh:
+			return req
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the INVITE was never sent")
+			return nil
+		}
+	}
+
 	t.Run("WithCallerid", func(t *testing.T) {
 		opts := InviteClientOptions{}
 		opts.WithCaller("Test", "123456", "example.com")
-		dialog, err := dg.NewDialog(sip.Uri{User: "alice", Host: "localhost"}, NewDialogOptions{})
-		require.NoError(t, err)
-		go dialog.Invite(context.Background(), opts)
-		req := <-reqCh
+		req := invite(t, opts)
 		assert.Equal(t, "Test", req.From().DisplayName)
 		assert.Equal(t, "123456", req.From().Address.User)
 		assert.NotEmpty(t, req.From().Params.GetOr("tag", ""))
@@ -519,10 +548,7 @@ func TestDialogClientInviteFailed(t *testing.T) {
 	t.Run("WithAnonymous", func(t *testing.T) {
 		opts := InviteClientOptions{}
 		opts.WithAnonymousCaller()
-		dialog, err := dg.NewDialog(sip.Uri{User: "alice", Host: "localhost"}, NewDialogOptions{})
-		require.NoError(t, err)
-		go dialog.Invite(context.Background(), opts)
-		req := <-reqCh
+		req := invite(t, opts)
 		assert.Equal(t, "Anonymous", req.From().DisplayName)
 		assert.Equal(t, "anonymous", req.From().Address.User)
 		assert.NotEmpty(t, req.From().Params.GetOr("tag", ""))
@@ -646,10 +672,11 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 		),
 		)
 
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call received")
+			log("Call received")
 			if err := d.Answer(); err != nil {
-				t.Log("Error on answer", err)
+				log("Error on answer", err)
 				return
 			}
 			<-d.Context().Done()
@@ -724,8 +751,9 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 			},
 		))
 
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call received")
+			log("Call received")
 			d.AnswerOptions(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
@@ -756,8 +784,9 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 			},
 		))
 
+		log := asyncLog(t)
 		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-			t.Log("Call INVITE due to REFER received")
+			log("Call INVITE due to REFER received")
 			// waitReferDialog <- d
 			switch d.ToUser() {
 			case "busy":

@@ -46,6 +46,30 @@ func testDiagoClient(t *testing.T, onRequest func(req *sip.Request) *sip.Respons
 	return NewDiago(ua, opts...)
 }
 
+// asyncLog returns a function that logs through t from a goroutine that may
+// outlive t, such as a ServeBackground handler or a call it makes. Logging
+// through t panics once t and every test above it have completed, as they have
+// when the run is over, which a test run on its own or the last test reaches
+// at once. The panic ends the test binary, or cuts a request handler short
+// where sipgo recovers it. Once t's cleanups start, the returned function
+// drops what it is given instead.
+func asyncLog(t *testing.T) func(args ...any) {
+	var mu sync.Mutex
+	completed := false
+	t.Cleanup(func() {
+		mu.Lock()
+		completed = true
+		mu.Unlock()
+	})
+	return func(args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !completed {
+			t.Log(args...)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	examples.SetupLogger()
 	m.Run()
@@ -117,7 +141,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 
 	doTest := func(t *testing.T, tc testCase) {
 		tran := tc.tran
-		reqCh := make(chan *sip.Request)
+		reqCh := make(chan *sip.Request, 1)
 		dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
 			reqCh <- req
 			return sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -135,10 +159,28 @@ func TestDiagoTransportConfs(t *testing.T) {
 			}
 		}
 
-		go dg.Invite(context.TODO(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
+		// The answer carries no SDP, so the call fails once its INVITE is out;
+		// only the INVITE is examined, and the call is waited for.
+		invited := make(chan struct{})
+		go func() {
+			defer close(invited)
+			_, _ = dg.Invite(context.TODO(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
+		}()
+		defer func() {
+			select {
+			case <-invited:
+			case <-time.After(5 * time.Second):
+				t.Error("the call did not return")
+			}
+		}()
 
 		// Now check our req passed on client
-		req := <-reqCh
+		var req *sip.Request
+		select {
+		case req = <-reqCh:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the INVITE was never sent")
+		}
 
 		// parse SDP
 		sd := sdp.SessionDescription{}

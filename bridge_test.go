@@ -367,6 +367,7 @@ func TestIntegrationBridging(t *testing.T) {
 		},
 	))
 
+	log := asyncLog(t)
 	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
 		in.Trying()
 		in.Ringing()
@@ -380,13 +381,13 @@ func TestIntegrationBridging(t *testing.T) {
 		bridge := NewBridge()
 		// Add us in bridge
 		if err := bridge.AddDialogSession(in); err != nil {
-			t.Log("Adding dialog in bridge failed", err)
+			log("Adding dialog in bridge failed", err)
 			return
 		}
 
 		out, err := tu.InviteBridge(ctx, sip.Uri{User: "test", Host: "127.0.0.200", Port: 5090}, &bridge, InviteOptions{})
 		if err != nil {
-			t.Log("Dialing failed", err)
+			log("Dialing failed", err)
 			return
 		}
 
@@ -422,7 +423,7 @@ func TestIntegrationBridging(t *testing.T) {
 			},
 		))
 
-		err := dg.ServeBackground(context.Background(), func(d *DialogServerSession) {
+		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
 			ctx := d.Context()
 			if err := d.Answer(); err != nil {
 				echoed <- fmt.Errorf("answer: %w", err)
@@ -1334,6 +1335,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 			t.Fatal("a call handler did not return")
 		}
 	}
+	log := asyncLog(t)
 	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
 		var exitErr error
 		defer func() { dialogExit <- exitErr }()
@@ -1344,7 +1346,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		in.Answer()
 
 		// Add us in bridge
-		t.Log("Adding into bridge", in.ID)
+		log("Adding into bridge", in.ID)
 		if err := bridge.AddDialogSession(in); err != nil {
 			// A subtest hangs its calls up as soon as they are answered, so a
 			// call can end before its handler joins it, which refuses the join
@@ -1354,7 +1356,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 			return
 		}
 		defer func() {
-			t.Log("Removing from bridge", in.ID)
+			log("Removing from bridge", in.ID)
 			if err := bridge.RemoveDialogSession(in); err != nil {
 				exitErr = fmt.Errorf("removing %s from bridge: %w", in.ID, err)
 			}
