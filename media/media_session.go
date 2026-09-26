@@ -185,9 +185,11 @@ type MediaSession struct {
 	// and not of the dialog: a UAC offers on its INVITE and answers an inbound
 	// re-INVITE, so the role changes within one session.
 	//
-	// It only decides who we are for SDPCodecPreferLocalOrder, which applies to
-	// the answerer alone. Default false means the body is an offer and we are the
-	// answerer, which is the common case and the previous behaviour.
+	// It decides whether we are the answerer: for SDPCodecPreferLocalOrder,
+	// which applies to the answerer alone, and for what LocalSDP builds next, an
+	// answer that mirrors the offer or an offer of our own, with the DTLS and
+	// ICE roles that follow. Default false means the body is an offer and we are
+	// the answerer, which is the common case.
 	RemoteSDPIsAnswer bool
 
 	sdp []byte
@@ -867,10 +869,10 @@ func (s *MediaSession) LocalSDP() []byte {
 	// would OFFER; when we are answering, the choice is not ours to make and the
 	// offer's profile wins outright.
 	//
-	// This is last so it governs every branch. Before it, an RTP/SAVPF offer was
-	// answered UDP/TLS/RTP/SAVP and an RTP/AVP offer could be answered RTP/SAVP --
-	// each a different protocol than the one offered, which a strict peer is
-	// entitled to reject outright and a lenient one merely tolerates.
+	// This is last so it governs every branch. The branches above would answer
+	// an RTP/SAVPF offer UDP/TLS/RTP/SAVP and could answer an RTP/AVP offer
+	// RTP/SAVP -- each a different protocol than the one offered, which a strict
+	// peer is entitled to reject outright and a lenient one merely tolerates.
 	if s.answeringOffer() {
 		rtpProfile = s.remoteProto
 	}
