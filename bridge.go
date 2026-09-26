@@ -415,6 +415,13 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 		return fmt.Errorf("failed to stop current mixing: %w", err)
 	}
 
+	// The bridge tells its dialogs apart by ID, so a dialog is in it once. This
+	// is checked after the stop, which lets another join run meanwhile.
+	if slices.ContainsFunc(b.dialogs, func(in DialogSession) bool { return in.Id() == d.Id() }) {
+		b.mixStart()
+		return fmt.Errorf("dialog %q is already in the bridge", d.Id())
+	}
+
 	b.dialogs = append(b.dialogs, d)
 	if b.unhooks == nil {
 		b.unhooks = map[string]func(){}

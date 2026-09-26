@@ -1601,6 +1601,29 @@ func TestBridgeRefusesDialogWithoutMedia(t *testing.T) {
 	}
 }
 
+// TestBridgeMixRefusesDuplicateDialog checks that a dialog already in the bridge
+// is refused a second join with an error, and that the bridge keeps mixing the
+// dialogs it has. The bridge tells its dialogs apart by ID, so a dialog in it
+// twice was read by two streams at once, and an eviction by ID took both
+// entries out together.
+func TestBridgeMixRefusesDuplicateDialog(t *testing.T) {
+	b := NewBridgeMix()
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+	for _, d := range []*bridgeTestDialog{a, c} {
+		require.NoError(t, b.AddDialogSession(d))
+	}
+	t.Cleanup(func() { stopBridgeMix(t, b) })
+
+	require.Error(t, b.AddDialogSession(a), "a dialog in the bridge joined again")
+	require.Error(t, b.AddDialogSession(newBridgeTestDialog(t, "a", media.CodecAudioUlaw)), "a dialog with the ID of one in the bridge joined")
+	assert.Equal(t, []DialogSession{a, c}, b.DialogSessionsList())
+	assert.Equal(t, 1, b.stateRead(), "the dialogs in the bridge must keep being mixed")
+
+	require.NoError(t, b.RemoveDialogSession(a))
+	assert.Equal(t, []DialogSession{c}, b.DialogSessionsList())
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
