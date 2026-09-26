@@ -314,6 +314,13 @@ type MediaSession struct {
 	// although another goroutine set them, and a writer that finds it set
 	// reads none of what that goroutine writes.
 	dtlsUnkeyed atomic.Bool
+	// dtlsKeyed is set once the SRTP contexts of a DTLS association are in
+	// place: by the handshake once it has keyed SRTP, and by Fork for a fork
+	// that continues its association. ReadRTP and ReadRTCP discard every
+	// packet of a DTLS-SRTP session while it is clear. Like dtlsUnkeyed it
+	// changes only after the contexts, so a reader that finds it set finds
+	// them too.
+	dtlsKeyed atomic.Bool
 
 	sessionID      uint64
 	sessionVersion uint64
@@ -398,6 +405,13 @@ func (s *MediaSession) localDTLSSetup() string {
 // the answer says otherwise.
 func (s *MediaSession) dtlsActsAsClient() bool {
 	return s.localDTLSSetup() == dtlsSetupActive
+}
+
+// dtlsSRTP reports whether this session keys SRTP from a DTLS handshake.
+// RemoteSDP negotiates DTLS for such a session and refuses SDP without a
+// fingerprint to check the handshake against.
+func (s *MediaSession) dtlsSRTP() bool {
+	return len(s.DTLSConf.Certificates) > 0 || s.SecureRTP == SecureRTPModeDTLS
 }
 
 // dtlsEndpointRole resolves the signalling role, which decides both the
@@ -644,6 +658,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		cp.dtlsAssoc = s.dtlsAssoc
 		cp.localCtxSRTP = s.localCtxSRTP
 		cp.remoteCtxSRTP = s.remoteCtxSRTP
+		cp.dtlsKeyed.Store(true)
 	}
 	return &cp
 }
@@ -1099,7 +1114,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	}
 
 	// Check for DTLS
-	if len(s.DTLSConf.Certificates) > 0 || s.SecureRTP == 2 {
+	if s.dtlsSRTP() {
 		setup := ""
 		tlsID := ""
 		fingerprints := make([]sdpFingerprints, 0, 1) // at least must be 1
@@ -1229,6 +1244,7 @@ func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []sdp
 	DefaultLogger().Debug("Starting a new DTLS association", "reason", reason, "laddr", s.Laddr.String())
 	// The keys of the current association are not the new one's. The fork
 	// runs on neither until its handshake has keyed it.
+	s.dtlsKeyed.Store(false)
 	s.dtlsAssoc = nil
 	s.localCtxSRTP = nil
 	s.remoteCtxSRTP = nil
@@ -1390,7 +1406,9 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []sdpFingerpr
 			}
 		}
 
-		// Last, once the contexts above are set: see dtlsUnkeyed.
+		// Last, once the contexts above are set: see dtlsKeyed and
+		// dtlsUnkeyed.
+		s.dtlsKeyed.Store(true)
 		s.dtlsUnkeyed.Store(false)
 
 		DefaultLogger().Debug("DTLS SRTP setuped")
@@ -1989,6 +2007,11 @@ func (s *MediaSession) listenRTPandRTCP(laddr *net.UDPAddr) error {
 // that starts sending the instant it answers puts media in flight before its own
 // handshake completes, and anyone at all can send a datagram to a port whose
 // number is in the SDP. Neither is a reason to stop listening to the peer.
+//
+// A DTLS-SRTP session discards every packet until its handshake has keyed it,
+// for the same reason: its media is SRTP, which is not processed before the
+// handshake completes (RFC 5764 section 5.1), so nothing that arrives before
+// can be the peer's media.
 func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	if len(buf) < RTPBufSize {
 		return 0, io.ErrShortBuffer
@@ -2002,6 +2025,14 @@ func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 		if err != nil {
 			// A transport error IS the session's: there is nothing left to read.
 			return 0, err
+		}
+
+		if m.dtlsSRTP() && !m.dtlsKeyed.Load() {
+			DefaultLogger().Debug("DTLS-SRTP: discarding RTP that arrived before the session is keyed",
+				"from", from,
+				"bytes", n,
+			)
+			continue
 		}
 
 		if m.remoteCtxSRTP == nil {
@@ -2113,19 +2144,42 @@ func (m *MediaSession) ReadRTPRawDeadline(buf []byte, t time.Time) (int, error) 
 
 // ReadRTCP is optimized reads and unmarshals RTCP packets. Buffers is only used for unmarshaling.
 // Caller needs to be aware of size this buffer and allign with MTU
+//
+// Like ReadRTP, it discards a packet that fails SRTP authentication, and every
+// packet of a DTLS-SRTP session until its handshake has keyed it, and reads on.
 func (m *MediaSession) ReadRTCP(buf []byte, pkts []rtcp.Packet) (n int, err error) {
-	nn, from, err := m.ReadRTCPRaw(buf)
-	if err != nil {
-		return n, err
-	}
-	data := buf[:nn]
-
-	if m.remoteCtxSRTP != nil {
-		data, err = m.remoteCtxSRTP.DecryptRTCP(data, data, nil)
-		if err != nil && false {
-			// For some unknown cases Decryption could fail
-			return 0, errors.Join(errRTCPFailedToUnmarshal, err)
+	var data []byte
+	var from net.Addr
+	for {
+		nn, addr, err := m.ReadRTCPRaw(buf)
+		if err != nil {
+			return 0, err
 		}
+		data, from = buf[:nn], addr
+
+		if m.dtlsSRTP() && !m.dtlsKeyed.Load() {
+			DefaultLogger().Debug("DTLS-SRTP: discarding RTCP that arrived before the session is keyed",
+				"from", from,
+				"bytes", nn,
+			)
+			continue
+		}
+
+		if m.remoteCtxSRTP == nil {
+			break
+		}
+
+		decrypted, err := m.remoteCtxSRTP.DecryptRTCP(data, data, nil)
+		if err != nil {
+			DefaultLogger().Debug("SRTCP: discarding packet that failed authentication",
+				"from", from,
+				"bytes", nn,
+				"error", err,
+			)
+			continue
+		}
+		data = decrypted
+		break
 	}
 
 	n, err = RTCPUnmarshal(data, pkts)
