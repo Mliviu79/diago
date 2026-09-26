@@ -718,10 +718,13 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 // follows it, but sipgo hands each request to its handler on its own
 // goroutine, so a later request can be handled before the ACK, or before the
 // answer has finalized and started the media that a re-INVITE would replace.
-// Reading the ACK is not enough either: the dialog notifies the ACK to its
-// observers one after another, and a BYE woken by that notification could end
-// the dialog before the notification reaches the answer, which would then
-// report the ACK missing. Waiting restores the order the peer sent them in.
+// Reading the ACK is not enough either with sipgo v1.6.0, which tells the
+// dialog's state observers of each transition on the goroutine that makes it,
+// one observer after another: a BYE woken by the ACK's notification could end
+// the dialog, and have that told to the answer, before the ACK's notification
+// reached it, and the answer would then report the ACK missing. A sipgo that
+// tells the observers of the transitions in the order they happen cannot
+// reorder them so. Waiting restores the order the peer sent them in.
 // The wait ends with tx, or after two T1 intervals, which covers an ACK lost
 // in transit and resent when our 2xx is first retransmitted.
 func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {

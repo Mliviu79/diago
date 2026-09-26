@@ -279,13 +279,17 @@ func TestDialogServerRequestBeforeAnswerMedia(t *testing.T) {
 
 // TestDialogServerAnswerWithByeBehindAck pins that an answer whose 2xx is
 // acknowledged returns without error when a BYE right behind the ACK ends the
-// dialog. The ACK and the BYE are read on goroutines of their own, and the
-// dialog notifies each state change to its observers one after another, so the
-// BYE, woken by the ACK's notification, can end the dialog while that
-// notification is still on its way to the answer. The answer then sees the
-// dialog end before it sees the ACK, and reports "No ACK received". The
-// observer registered here holds the ACK's notification at that point, which
-// makes the window certain instead of rare.
+// dialog. The ACK and the BYE are read on goroutines of their own. sipgo v1.6.0
+// tells the dialog's state observers of each transition on the goroutine that
+// makes it, one observer after another, so the BYE, woken by the ACK's
+// notification, can end the dialog, and have that told to the answer, while
+// the ACK's notification is still on its way to it. The answer then sees the
+// dialog end before it sees the ACK, and reports "No ACK received", unless the
+// BYE waits for the answer. A sipgo that tells the observers of the
+// transitions in the order they happen tells the end only after the ACK, so
+// there the answer sees the ACK first either way. The observer registered here
+// holds the ACK's notification at that point, which with sipgo v1.6.0 makes
+// the window certain instead of rare.
 func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 	answers := []struct {
 		name   string
