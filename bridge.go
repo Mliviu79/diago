@@ -262,15 +262,16 @@ func proxyMediaBackground(log *slog.Logger, reader io.Reader, writer io.Writer, 
 }
 
 func (b *Bridge) proxyMediaWithDTMF(m1 *DialogMedia, m2 *DialogMedia) error {
+	// The proxy reads and writes through DTMF interceptors of its own, which
+	// are not set on the dialogs: once the proxy ends, a dialog must not keep
+	// sending the keys read on it to the other one.
 	dtmfReader := DTMFReader{}
 	p1, p2 := MediaProps{}, MediaProps{}
-	r, err := m1.AudioReader(WithAudioReaderDTMF(&dtmfReader), WithAudioReaderMediaProps(&p1))
-	if err != nil {
+	if _, err := m1.AudioReader(bridgeDTMFReader(&dtmfReader), WithAudioReaderMediaProps(&p1)); err != nil {
 		return err
 	}
 	dtmfWriter := DTMFWriter{}
-	w, err := m2.AudioWriter(WithAudioWriterDTMF(&dtmfWriter), WithAudioWriterMediaProps(&p2))
-	if err != nil {
+	if _, err := m2.AudioWriter(bridgeDTMFWriter(&dtmfWriter), WithAudioWriterMediaProps(&p2)); err != nil {
 		return err
 	}
 	dtmfReader.OnDTMF(func(dtmf rune) error {
@@ -282,13 +283,33 @@ func (b *Bridge) proxyMediaWithDTMF(m1 *DialogMedia, m2 *DialogMedia) error {
 
 	log := b.log.With("from", p1.Raddr+" > "+p1.Laddr, "to", p2.Laddr+" > "+p2.Raddr)
 	log.Debug("Starting proxy media routine")
-	written, err := copyWithBuf(r, w, buf.([]byte))
+	written, err := copyWithBuf(&dtmfReader, &dtmfWriter, buf.([]byte))
 	log.Debug("Bridge proxy stream finished", "bytes", written)
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		// A read deadline is how the proxy is stopped
 		return nil
 	}
 	return err
+}
+
+// bridgeDTMFReader sets r up as WithAudioReaderDTMF does, over the dialog's
+// audio reader, and leaves the dialog that reader.
+func bridgeDTMFReader(r *DTMFReader) AudioReaderOption {
+	return func(d *DialogMedia) error {
+		reader := d.audioReader
+		defer func() { d.audioReader = reader }()
+		return WithAudioReaderDTMF(r)(d)
+	}
+}
+
+// bridgeDTMFWriter sets w up as WithAudioWriterDTMF does, over the dialog's
+// audio writer, and leaves the dialog that writer.
+func bridgeDTMFWriter(w *DTMFWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		writer := d.audioWriter
+		defer func() { d.audioWriter = writer }()
+		return WithAudioWriterDTMF(w)(d)
+	}
 }
 
 // BridgeMix is mixing audio when having 2 or more parties.

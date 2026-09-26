@@ -276,6 +276,81 @@ func TestBridgeRefusedDialogStaysOut(t *testing.T) {
 	})
 }
 
+// sendDTMF sends the dialog one RFC 4733 telephone-event packet from its peer.
+func (d *bridgeTestDialog) sendDTMF(t *testing.T, seq uint16, ts uint32, marker bool, ev media.DTMFEvent) {
+	t.Helper()
+	pkt := rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         marker,
+			PayloadType:    media.CodecTelephoneEvent8000.PayloadType,
+			SequenceNumber: seq,
+			Timestamp:      ts,
+			SSRC:           1,
+		},
+		Payload: media.DTMFEncode(ev),
+	}
+	data, err := pkt.Marshal()
+	require.NoError(t, err)
+	_, err = d.peer.WriteTo(data, d.conn.LocalAddr())
+	require.NoError(t, err)
+}
+
+// TestBridgeDTMFPassKeepsDialogAudio checks that a proxy passing DTMF leaves
+// each dialog the audio reader and writer it had. Its DTMF interceptors, left
+// on a dialog, still send a key read on that dialog to the other one once the
+// proxy has stopped, and a send that fails, as it does once the other dialog has
+// hung up, fails the read.
+func TestBridgeDTMFPassKeepsDialogAudio(t *testing.T) {
+	b := NewBridge()
+	b.WaitDialogsNum = 3 // The proxy is started by hand
+	b.DTMFpass = true
+	a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+	c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+	type dialogAudio struct {
+		r io.Reader
+		w io.Writer
+	}
+	joinedWith := map[*bridgeTestDialog]dialogAudio{}
+	for _, d := range []*bridgeTestDialog{a, c} {
+		r, err := d.media.AudioReader()
+		require.NoError(t, err)
+		w, err := d.media.AudioWriter()
+		require.NoError(t, err)
+		joinedWith[d] = dialogAudio{r, w}
+		require.NoError(t, b.AddDialogSession(d))
+	}
+
+	stop, err := proxyMediaControl(t, &b)
+	require.NoError(t, err)
+	frame := bytes.Repeat([]byte{0x20}, 160)
+	a.sendRTP(t, 1, 0, frame)
+	require.Equal(t, frame, c.recvRTP(t), "the proxy does not run")
+	require.NoError(t, stop())
+
+	for d, want := range joinedWith {
+		r, err := d.media.AudioReader()
+		require.NoError(t, err)
+		w, err := d.media.AudioWriter()
+		require.NoError(t, err)
+		assert.Same(t, want.r, r, "%s must keep its audio reader", d.id)
+		assert.Same(t, want.w, w, "%s must keep its audio writer", d.id)
+	}
+
+	// c hangs up, and a's caller presses a key
+	require.NoError(t, c.conn.Close())
+	r, err := a.media.AudioReader()
+	require.NoError(t, err)
+	a.sendDTMF(t, 2, 160, true, media.DTMFEvent{Event: 1, Volume: 10, Duration: 160})
+	a.sendDTMF(t, 3, 160, false, media.DTMFEvent{Event: 1, EndOfEvent: true, Volume: 10, Duration: 320})
+	require.NoError(t, a.conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, media.RTPBufSize)
+	for range 2 {
+		_, err := r.Read(buf)
+		require.NoError(t, err, "a key pressed on a dialog the proxy has left must not fail its read")
+	}
+}
+
 func TestIntegrationBridging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
