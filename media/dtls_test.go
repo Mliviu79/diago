@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -252,9 +253,7 @@ func TestDTLSRetiresItsGoroutinesAndLeavesTheSocket(t *testing.T) {
 	s.rtpConn = sock
 	s.dtlsTr = s.dtlsTransport()
 
-	s.dtlsConn, err = dtls.Server(s.dtlsTr, peer.LocalAddr(), (&DTLSConfig{
-		Certificates: []tls.Certificate{testdata.ServerCertificate()},
-	}).ToLibConf(nil))
+	s.dtlsConn, err = dtlsServer(s.dtlsTr, peer.LocalAddr(), []tls.Certificate{testdata.ServerCertificate()})
 	require.NoError(t, err)
 
 	client, err := dtlsClient(peer, sock.LocalAddr(), []tls.Certificate{testdata.ClientCertificate()}, "")
@@ -445,4 +444,66 @@ func TestDTLSHandshakeChecksPeerFingerprint(t *testing.T) {
 			require.NoError(t, <-serverErr)
 		})
 	}
+}
+
+// TestDTLSRemoteSDPRequiresFingerprint asserts DTLS media without an
+// a=fingerprint the peer can be checked against is refused while the SDP is
+// negotiated. RFC 5763 section 5 makes the attribute mandatory: it is what
+// binds the self-signed certificate to the signalling, so without one any
+// certificate would complete the handshake.
+func TestDTLSRemoteSDPRequiresFingerprint(t *testing.T) {
+	newSess := func(role DTLSEndpointRole, cert tls.Certificate) *MediaSession {
+		t.Helper()
+		s := &MediaSession{
+			Codecs:    []Codec{CodecAudioUlaw},
+			Mode:      sdp.ModeSendrecv,
+			SecureRTP: SecureRTPModeDTLS,
+			DTLSRole:  role,
+			DTLSConf: DTLSConfig{
+				Certificates:     []tls.Certificate{cert},
+				ServerClientAuth: ServerClientAuthRequireCert,
+			},
+		}
+		s.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+		require.NoError(t, s.Init())
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+
+	offer := string(newSess(DTLSEndpointRoleOfferer, testdata.ClientCertificate()).LocalSDP())
+	fingerprintLine := regexp.MustCompile(`(?m)^a=fingerprint:.*\r\n`)
+	require.Regexp(t, fingerprintLine, offer)
+
+	tests := []struct {
+		name    string
+		offer   string
+		wantErr bool
+	}{
+		{name: "fingerprint present", offer: offer},
+		{name: "fingerprint missing", offer: fingerprintLine.ReplaceAllString(offer, ""), wantErr: true},
+		{name: "only an unsupported hash", offer: fingerprintLine.ReplaceAllString(offer, "a=fingerprint:md5 00:11:22:33\r\n"), wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			answerer := newSess(DTLSEndpointRoleAnswerer, testdata.ServerCertificate())
+			err := answerer.RemoteSDP([]byte(tc.offer))
+			if tc.wantErr {
+				assert.ErrorContains(t, err, "fingerprint")
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// TestDTLSLibConfAlwaysChecksFingerprint asserts the DTLS configuration built
+// for a negotiated session never skips the fingerprint check, not even with no
+// fingerprints to check against. An empty list refuses every certificate.
+func TestDTLSLibConfAlwaysChecksFingerprint(t *testing.T) {
+	conf := DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}}
+	libConf := conf.ToLibConf(nil)
+	require.NotNil(t, libConf.VerifyConnection)
+
+	state := &dtls.State{PeerCertificates: testdata.ClientCertificate().Certificate}
+	assert.Error(t, libConf.VerifyConnection(state))
 }

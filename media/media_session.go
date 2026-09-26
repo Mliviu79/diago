@@ -1078,12 +1078,22 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 				}
 				alg := vals[0]
 				fp := vals[1]
-				// TODO fingerprint validation
 				fingerprints = append(fingerprints, sdpFingerprints{
 					alg:         alg,
 					fingerprint: fp,
 				})
 			}
+		}
+
+		// RFC 5763 section 5 makes a=fingerprint mandatory: the certificates are
+		// self signed, and the fingerprint is the only thing the peer's one can
+		// be checked against. Without one we could check, any certificate would
+		// complete the handshake, so the media is refused here instead.
+		if !slices.ContainsFunc(fingerprints, func(fp sdpFingerprints) bool {
+			_, ok := dtlsFingerprintHashes[strings.ToLower(fp.alg)]
+			return ok
+		}) {
+			return fmt.Errorf("sdp: dtls media has no a=fingerprint with a supported hash function fingerprints=%d", len(fingerprints))
 		}
 
 		if setup == "" {

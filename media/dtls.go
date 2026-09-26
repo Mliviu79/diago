@@ -112,10 +112,9 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []sdpFingerprints) *dtls.Config {
 		ServerName:         conf.ServerName,       // If insecure is false
 
 		// IT IS STILL UNCLEAR WHY WE CAN NOT READ CERTIFICATE HERE
+		// The peer is checked against its SDP fingerprints, and with none there
+		// is nothing it can match, so the handshake fails.
 		VerifyConnection: func(state *dtls.State) error {
-			if len(fingerprints) == 0 {
-				return nil
-			}
 			return dtlsVerifyConnection(state, fingerprints)
 		},
 	}
@@ -193,11 +192,16 @@ func (c *dtlsKeyExchangeConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 // is closed by MediaSession.Close, which is what owns it.
 func (c *dtlsKeyExchangeConn) Close() error { return nil }
 
+// dtlsServer and dtlsClient run a handshake outside SDP negotiation, where the
+// peer has sent no fingerprint to check its certificate against, so they turn
+// the fingerprint check off.
 func dtlsServer(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate) (*dtls.Conn, error) {
 	conf := DTLSConfig{
 		Certificates: certificates,
 	}
-	return dtls.Server(conn, raddr, conf.ToLibConf([]sdpFingerprints{}))
+	libConf := conf.ToLibConf(nil)
+	libConf.VerifyConnection = nil
+	return dtls.Server(conn, raddr, libConf)
 }
 
 func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate, serverName string) (*dtls.Conn, error) {
@@ -206,7 +210,9 @@ func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certific
 		Certificates: certificates,
 		ServerName:   serverName,
 	}
-	return dtls.Client(conn, raddr, conf.ToLibConf([]sdpFingerprints{}))
+	libConf := conf.ToLibConf(nil)
+	libConf.VerifyConnection = nil
+	return dtls.Client(conn, raddr, libConf)
 }
 
 // dtlsFingerprintHashes maps the a=fingerprint hash function names of RFC 8122
