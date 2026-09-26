@@ -15,6 +15,7 @@ import (
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
@@ -778,6 +779,194 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 			require.False(t, orig == cur, "the answer was not applied to a fork")
 			assert.Equal(t, origPort, orig.Raddr.Port, "the answer rewrote the session carrying the media")
 			assert.Equal(t, answerer.Laddr.Port, cur.Raddr.Port, "the answer was not applied")
+		})
+	}
+}
+
+// reInviteSides builds, for each side of a call, a confirmed dialog with media
+// installed whose re-INVITEs the peer answers with onRequest, and its
+// ReInvite.
+var reInviteSides = []struct {
+	name string
+	// setup returns the dialog's media, with sess installed, and its
+	// ReInvite.
+	setup func(t *testing.T, sess *media.MediaSession, onRequest func(*sip.Request) *sip.Response) (*DialogMedia, func(context.Context) error)
+}{
+	{
+		name: "inbound",
+		setup: func(t *testing.T, sess *media.MediaSession, onRequest func(*sip.Request) *sip.Response) (*DialogMedia, func(context.Context) error) {
+			ua, err := sipgo.NewUA()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ua.Close() })
+			client, err := sipgo.NewClient(ua)
+			require.NoError(t, err)
+			client.TxRequester = &clientTxRequester{onRequest: onRequest}
+			d := newTestDialogOverUA(t, newByeServerTx(), &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}}})
+			res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+			res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+			d.InviteResponse = res
+			confirm(t, d)
+			installTestMedia(t, &d.DialogMedia, sess)
+			return &d.DialogMedia, d.ReInvite
+		},
+	},
+	{
+		name: "outbound",
+		setup: func(t *testing.T, sess *media.MediaSession, onRequest func(*sip.Request) *sip.Response) (*DialogMedia, func(context.Context) error) {
+			reInviting := false
+			dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+				if reInviting {
+					return onRequest(req)
+				}
+				res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+				if req.IsInvite() {
+					res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+					res.SetBody(peerSDP())
+				}
+				return res
+			})
+			ctx := context.Background()
+			d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = d.Close() })
+			require.NoError(t, d.Invite(ctx, InviteClientOptions{}))
+			require.NoError(t, d.Ack(ctx))
+			reInviting = true
+
+			installTestMedia(t, &d.DialogMedia, sess)
+			return &d.DialogMedia, d.ReInvite
+		},
+	},
+}
+
+// installTestMedia installs sess in m in place of the media it has, with an RTP
+// session whose monitor runs.
+func installTestMedia(t *testing.T, m *DialogMedia, sess *media.MediaSession) {
+	t.Helper()
+	rtpSess := media.NewRTPSession(sess)
+	m.mu.Lock()
+	old := m.rtpSession
+	m.initRTPSessionUnsafe(sess, rtpSess)
+	m.mu.Unlock()
+	if old != nil {
+		require.NoError(t, old.MonitorClose())
+	}
+	require.NoError(t, rtpSess.MonitorBackground())
+	t.Cleanup(func() { _ = m.Close() })
+}
+
+// TestDialogReInviteOffersActpass pins the offer of ReInvite on a DTLS-SRTP
+// call, on either side: a subsequent offer carries a=setup:actpass (RFC 8842
+// section 5.5), whatever role the endpoint plays. The media session in place
+// has its role set, passive for the offerer the peer answered active, active
+// for the answerer of an actpass offer, and offering from it signalled that
+// role.
+func TestDialogReInviteOffersActpass(t *testing.T) {
+	for _, side := range reInviteSides {
+		t.Run(side.name, func(t *testing.T) {
+			sess := newDTLSMediaSession(t, testdata.ClientCertificate())
+			peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+			if side.name == "inbound" {
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+			} else {
+				require.NoError(t, peer.RemoteSDP(sess.LocalSDP()))
+				sess.RemoteSDPIsAnswer = true
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+			}
+
+			offers := make(chan []byte, 1)
+			_, reInvite := side.setup(t, sess, func(req *sip.Request) *sip.Response {
+				offers <- req.Body()
+				return sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := reInvite(ctx)
+			var resErr sipgo.ErrDialogResponse
+			require.ErrorAs(t, err, &resErr)
+			require.Equal(t, "a=setup:actpass", iceSDPLine(t, <-offers, "a=setup:"))
+		})
+	}
+}
+
+// TestDialogReInviteAppliesAnswer pins that ReInvite applies the answer it
+// gets, on either side: here the peer answers from another port, and the
+// media then goes there. Before, the answer was dropped and the media kept
+// going to the old port.
+func TestDialogReInviteAppliesAnswer(t *testing.T) {
+	for _, side := range reInviteSides {
+		t.Run(side.name, func(t *testing.T) {
+			peer := newMediaSessionForTest(t)
+			sess := newMediaSessionForTest(t)
+			require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+
+			moved := newMediaSessionForTest(t)
+			m, reInvite := side.setup(t, sess, func(req *sip.Request) *sip.Response {
+				res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+				res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+				if req.IsInvite() {
+					if err := moved.RemoteSDP(req.Body()); err == nil {
+						res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+						res.SetBody(moved.LocalSDP())
+					}
+				}
+				return res
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, reInvite(ctx))
+			require.Equal(t, moved.Laddr.Port, m.MediaSession().Raddr.Port, "the answer was not applied")
+		})
+	}
+}
+
+// TestDialogReInviteOffersNegotiatedCodecs pins the codecs ReInvite offers, on
+// either side: the ones the call runs on, as an offer made from the session in
+// place did, so a session refresh does not ask the peer to move the call to
+// another codec. The session keeps every codec it was set up with, for a later
+// offer of the peer's.
+func TestDialogReInviteOffersNegotiatedCodecs(t *testing.T) {
+	newSession := func(t *testing.T, codecs ...media.Codec) *media.MediaSession {
+		s := &media.MediaSession{Codecs: codecs, Mode: sdp.ModeSendrecv, Laddr: net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}}
+		require.NoError(t, s.Init())
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	for _, side := range reInviteSides {
+		t.Run(side.name, func(t *testing.T) {
+			sess := newSession(t, media.CodecAudioUlaw, media.CodecAudioAlaw)
+			peer := newSession(t, media.CodecAudioAlaw)
+			if side.name == "inbound" {
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+			} else {
+				require.NoError(t, peer.RemoteSDP(sess.LocalSDP()))
+				sess.RemoteSDPIsAnswer = true
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP()))
+			}
+			require.Equal(t, []media.Codec{media.CodecAudioAlaw}, sess.CommonCodecs())
+
+			var offer []byte
+			m, reInvite := side.setup(t, sess, func(req *sip.Request) *sip.Response {
+				res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+				res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+				if req.IsInvite() {
+					offer = req.Body()
+					answerer := newSession(t, media.CodecAudioUlaw, media.CodecAudioAlaw)
+					if err := answerer.RemoteSDP(offer); err == nil {
+						res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+						res.SetBody(answerer.LocalSDP())
+					}
+				}
+				return res
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, reInvite(ctx))
+			assert.Equal(t, fmt.Sprintf("m=audio %d RTP/AVP 8", sess.Laddr.Port), iceSDPLine(t, offer, "m=audio "), "the offer must keep the call's codec")
+
+			cur := m.MediaSession()
+			assert.Equal(t, []media.Codec{media.CodecAudioAlaw}, cur.CommonCodecs())
+			assert.Equal(t, []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw}, cur.Codecs, "the session lost codecs it was set up with")
 		})
 	}
 }

@@ -795,52 +795,40 @@ func (d *DialogServerSession) Hangup(ctx context.Context) error {
 	return d.Respond(sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)
 }
 
+// ReInvite sends a re-INVITE offering the media session as it is, and installs
+// it with the answer. The offer is made by a fork of the media session, which
+// takes the answer: a subsequent offer carries a=setup:actpass (RFC 8842
+// section 5.5), which the media session in place, whose role is set, would not
+// offer. It offers the codecs the call runs on, see negotiatedOffer, as a
+// session refresh renegotiates nothing.
 func (d *DialogServerSession) ReInvite(ctx context.Context) error {
-	sdp := d.mediaSession.LocalSDP()
-	contact := d.RemoteContact()
-	req := sip.NewRequest(sip.INVITE, contact.Address)
-	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	req.SetBody(sdp)
-
-	res, err := d.Do(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	if !res.IsSuccess() {
-		return sipgo.ErrDialogResponse{
-			Res: res,
-		}
-	}
-
-	cont := res.Contact()
-	if cont == nil {
-		return fmt.Errorf("reinvite: no contact header present")
-	}
-
-	ack := sip.NewRequest(sip.ACK, cont.Address)
-	return d.WriteRequest(ack)
+	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
+		m := cur.Fork()
+		return m, negotiatedOffer(m, cur)
+	})
 }
 
 // reInviteMediaSession re-INVITEs with ms, a fork of the media session, and
 // installs it with the answer.
 func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *media.MediaSession) error {
-	return d.reInviteMedia(ctx, func(*media.MediaSession) *media.MediaSession { return ms })
+	return d.reInviteMedia(ctx, func(*media.MediaSession) (*media.MediaSession, []byte) {
+		return ms, ms.LocalSDP()
+	})
 }
 
 // reInviteMedia re-INVITEs with the fork of the installed media session that
-// fork returns, and installs the fork with the answer. Each attempt waits
+// fork returns, and its offer, and installs the fork with the answer. Each attempt waits
 // first for a re-INVITE in progress to end, and marks ours in progress, see
 // beginOwnMediaUpdate. A 491 is retried after the wait RFC 3261 section 14.1
 // gives, with no re-INVITE of ours in progress meanwhile.
-func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *media.MediaSession) *media.MediaSession) error {
+func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *media.MediaSession) (*media.MediaSession, []byte)) error {
 	for {
 		end, err := d.beginOwnMediaUpdate(ctx)
 		if err != nil {
 			return err
 		}
-		ms := fork(d.MediaSession())
-		pending, err := d.reInviteMediaOnce(ctx, ms)
+		ms, sdp := fork(d.MediaSession())
+		pending, err := d.reInviteMediaOnce(ctx, ms, sdp)
 		end()
 		if !pending {
 			return err
@@ -855,13 +843,11 @@ func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *
 	}
 }
 
-// reInviteMediaOnce sends one re-INVITE offering ms, and installs ms with the
-// answer, unless the dialog media is closed or the dialog has ended by then.
-// ms is discarded when it is not installed. It reports a 491, for the caller
-// to retry.
-func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.MediaSession) (bool, error) {
-	sdp := ms.LocalSDP()
-
+// reInviteMediaOnce sends one re-INVITE with sdp, the offer of ms, and installs
+// ms with the answer, unless the dialog media is closed or the dialog has ended
+// by then. ms is discarded when it is not installed. It reports a 491, for the
+// caller to retry.
+func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.MediaSession, sdp []byte) (bool, error) {
 	// NOTE: we do not change original invite request
 	d.mu.Lock()
 	contact := d.remoteContactUnsafe()
@@ -1188,17 +1174,17 @@ func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTra
 }
 
 func (d *DialogServerSession) Hold(ctx context.Context) error {
-	return d.reInviteMedia(ctx, func(cur *media.MediaSession) *media.MediaSession {
+	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
 		m := cur.Fork()
 		m.Mode = sdp.ModeSendonly
-		return m
+		return m, m.LocalSDP()
 	})
 }
 
 func (d *DialogServerSession) Unhold(ctx context.Context) error {
-	return d.reInviteMedia(ctx, func(cur *media.MediaSession) *media.MediaSession {
+	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
 		m := cur.Fork()
 		m.Mode = sdp.ModeSendrecv
-		return m
+		return m, m.LocalSDP()
 	})
 }
