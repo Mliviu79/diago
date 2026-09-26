@@ -583,14 +583,13 @@ func (tx *loggedServerTx) Respond(res *sip.Response) error {
 	return nil
 }
 
-// TestDialogReInviteRacingBye pins that the peer's re-INVITE and BYE on one
-// dialog are handled one after the other, on either side. sipgo hands each
-// request to its handler on its own goroutine, and a re-INVITE that has found
-// the dialog live goes on to renegotiate the media and answer 200. A BYE
-// handled meanwhile answers 200 and ends the dialog, so the peer could get
-// the 200 to its BYE and then a 200 to a re-INVITE on the dialog it ended. The
-// re-INVITE here carries an offer, and its media update callback reads the
-// BYE, which holds the re-INVITE in that window for as long as the BYE takes.
+// TestDialogReInviteRacingBye pins how the peer's BYE is handled while its
+// re-INVITE is pending, on either side. sipgo hands each request to its handler
+// on its own goroutine. The re-INVITE here carries an offer, and its media
+// update callback reads the BYE and holds the re-INVITE until the BYE is
+// answered. RFC 3261 section 15.1.2 has the BYE answered and every pending
+// request answered too, 487 recommended. So the BYE is answered 200 while the
+// re-INVITE is still pending, which gets 487, and never a 200 after the BYE's.
 func TestDialogReInviteRacingBye(t *testing.T) {
 	sides := []struct {
 		name string
@@ -651,28 +650,26 @@ func TestDialogReInviteRacingBye(t *testing.T) {
 
 			var byeErr error
 			byeDone := make(chan struct{})
+			byeAnswered := make(chan bool, 1)
 			m.mu.Lock()
 			m.onMediaUpdate = func(*DialogMedia) {
 				go func() {
 					defer close(byeDone)
 					byeErr = readBye(newLoggedServerTx("BYE", log))
 				}()
-				// Long enough for a BYE nothing holds back to be answered.
 				select {
 				case <-byeDone:
-				case <-time.After(300 * time.Millisecond):
+					byeAnswered <- true
+				case <-time.After(5 * time.Second):
+					byeAnswered <- false
 				}
 			}
 			m.mu.Unlock()
 
 			require.NoError(t, handleReInvite(newLoggedServerTx("re-INVITE", log)))
-			select {
-			case <-byeDone:
-			case <-time.After(5 * time.Second):
-				t.Fatal("the BYE was never handled")
-			}
+			require.True(t, <-byeAnswered, "the BYE waited for the re-INVITE")
 			require.NoError(t, byeErr)
-			assert.Equal(t, []string{"re-INVITE 200", "BYE 200"}, log.list(), "the re-INVITE was answered after the BYE that ended the dialog")
+			assert.Equal(t, []string{"BYE 200", "re-INVITE 487"}, log.list())
 		})
 	}
 }

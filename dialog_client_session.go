@@ -698,29 +698,34 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 	dialogHandleRefer(d, dg, req, tx, onRefDialog)
 }
 
-// ReadBye reads the peer's BYE as the embedded session does, once a re-INVITE
-// being handled has been answered, so a re-INVITE is never answered 200 after
-// the BYE that ended the dialog.
+// ReadBye reads the peer's BYE as the embedded session does. It does not wait
+// for a re-INVITE being handled: a re-INVITE with no final response yet is
+// answered 487 (RFC 3261 section 15.1.2), so none is answered 200 after the
+// BYE that ended the dialog.
 func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
-	d.requestMu.Lock()
-	defer d.requestMu.Unlock()
-	return d.DialogClientSession.ReadBye(req, tx)
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
+	if err := d.DialogClientSession.ReadBye(req, tx); err != nil {
+		return err
+	}
+	return d.terminatePeerReInviteLocked()
 }
 
 func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
-	// Held until the re-INVITE is answered, so a BYE ends the dialog either
-	// after that answer or before the check below.
 	d.requestMu.Lock()
 	defer d.requestMu.Unlock()
 
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
-	// media.
-	if ended, err := respondDialogEnded(d, req, tx); ended {
+	// media. A live one is answered through respondPeerReInvite, or 487 by a
+	// BYE that ends the dialog first.
+	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
 		return err
 	}
+	defer d.endPeerReInvite(tx)
 
 	if err := d.ReadRequest(req, tx); err != nil {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
+		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
+		return err
 	}
 
 	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteRequest.Contact()); err != nil {

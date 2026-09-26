@@ -523,6 +523,120 @@ func TestDialogServerReInviteNewAssociationFailureHangsUp(t *testing.T) {
 	}
 }
 
+// newNewAssociationReInviteDialog returns a confirmed inbound dialog whose
+// DTLS-SRTP media is keyed, the session installed, and a re-INVITE from the
+// peer whose offer asks for a new DTLS association: it comes from another
+// session with a certificate of its own, which never takes part in the
+// handshake.
+func newNewAssociationReInviteDialog(t *testing.T) (*DialogServerSession, *media.MediaSession, *sip.Request) {
+	t.Helper()
+	d, _ := newRecordingServerDialog(t, newByeServerTx(), nil, MediaConfig{})
+	res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+	res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+	d.InviteResponse = res
+	confirm(t, d)
+
+	_, answerer := newEstablishedDTLSMedia(t)
+	rtpSess := media.NewRTPSession(answerer)
+	d.mu.Lock()
+	d.initRTPSessionUnsafe(answerer, rtpSess)
+	d.mu.Unlock()
+	require.NoError(t, rtpSess.MonitorBackground())
+
+	other, err := selfsign.GenerateSelfSigned()
+	require.NoError(t, err)
+	peer := newDTLSMediaSession(t, other)
+	req := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(peer.LocalSDP())
+	return d, answerer, req
+}
+
+// requirePortReleased requires that the RTP port of the m= line of sdp can be
+// bound again.
+func requirePortReleased(t *testing.T, body []byte) {
+	t.Helper()
+	var port int
+	_, err := fmt.Sscanf(iceSDPLine(t, body, "m=audio "), "m=audio %d", &port)
+	require.NoError(t, err)
+	reuse, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	require.NoError(t, err, "the fork's socket must be released")
+	require.NoError(t, reuse.Close())
+}
+
+// TestDialogByeEndsNewAssociationHandshake is a BYE that arrives while the
+// handshake of a new DTLS association, asked for by a re-INVITE already
+// answered 200, is still running. The peer never runs it, so it would take
+// until DTLSHandshakeTimeout. The BYE is answered at once, the end of the
+// dialog ends the handshake, and the fork is not installed: its sockets are
+// released and the session is left as it was.
+func TestDialogByeEndsNewAssociationHandshake(t *testing.T) {
+	d, answerer, req := newNewAssociationReInviteDialog(t)
+
+	tx := newRespondedServerTx()
+	handled := make(chan error, 1)
+	go func() { handled <- d.handleReInvite(req, tx) }()
+
+	var answer []byte
+	select {
+	case res := <-tx.responded:
+		require.Equal(t, sip.StatusOK, res.StatusCode, "reason: %s", res.Reason)
+		answer = res.Body()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the re-INVITE was not answered")
+	}
+
+	byeTx := newByeServerTx()
+	byeRead := make(chan error, 1)
+	go func() { byeRead <- d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), byeTx) }()
+	select {
+	case err := <-byeRead:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the BYE waited for the handshake")
+	}
+	require.Len(t, byeTx.responses, 1)
+	require.Equal(t, sip.StatusOK, byeTx.responses[0].StatusCode)
+
+	select {
+	case err := <-handled:
+		require.NoError(t, err, "the end of the dialog is no failure of the re-INVITE")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the end of the dialog did not end the handshake")
+	}
+	require.Same(t, answerer, d.MediaSession(), "nothing may be installed on an ended dialog")
+	requirePortReleased(t, answer)
+}
+
+// TestDialogByeBeforeNewAssociationAnswer is a BYE that ends the dialog after a
+// re-INVITE asking for a new DTLS association was found live and before its
+// answer. The BYE answers it 487 (RFC 3261 section 15.1.2), so the update
+// sends nothing, runs no handshake and closes the fork it built.
+func TestDialogByeBeforeNewAssociationAnswer(t *testing.T) {
+	d, answerer, req := newNewAssociationReInviteDialog(t)
+
+	tx := newByeServerTx()
+	answered, err := d.beginPeerReInvite(&d.Dialog, req, tx)
+	require.NoError(t, err)
+	require.False(t, answered)
+	require.NoError(t, d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), newByeServerTx()))
+	require.Len(t, tx.responses, 1)
+	require.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
+
+	d.mu.Lock()
+	msess, err := d.sdpReInviteUnsafe(req.Body())
+	require.NoError(t, err)
+	require.True(t, msess.FinalizePending())
+	d.mediaUpdating = true
+	d.mu.Unlock()
+
+	contact := &sip.ContactHeader{Address: d.InviteRequest.Recipient}
+	require.NoError(t, d.answerNewAssociation(d.Context(), req, tx, contact, msess))
+	require.Len(t, tx.responses, 1, "the re-INVITE got a second final response")
+	require.Same(t, answerer, d.MediaSession())
+	requirePortReleased(t, msess.LocalSDP())
+}
+
 // sentPacketConn records every datagram a media session writes through it, so
 // a test sees what went on the wire from that session.
 type sentPacketConn struct {

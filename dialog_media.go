@@ -18,6 +18,7 @@ import (
 	"github.com/emiago/diago/audio"
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
 
@@ -52,12 +53,22 @@ func init() {
 type DialogMedia struct {
 	mu sync.Mutex
 
-	// requestMu makes the peer's BYE and its re-INVITEs take turns, each held
-	// from the check that the dialog is live to its answer. A re-INVITE is then
-	// answered either before a BYE ends the dialog or, after that, as a request
-	// for an ended dialog, never with a 200 behind the BYE's. It is taken
-	// before mu and held while the answer is sent.
+	// requestMu makes the peer's re-INVITEs take turns, each held for the
+	// whole of its handling. It is taken before mu and answerMu.
 	requestMu sync.Mutex
+
+	// answerMu makes the peer's BYE and the final response to its re-INVITE
+	// take turns. The BYE holds it while it ends the dialog and answers, and
+	// answers a re-INVITE still pending 487 (RFC 3261 section 15.1.2); a
+	// re-INVITE is answered under it only while the dialog is live. A
+	// re-INVITE is then answered either before a BYE ends the dialog or with
+	// 487, never with a 200 behind the BYE's, and the BYE never waits for the
+	// re-INVITE's media update. It is never taken with mu held, since ending
+	// the dialog runs the state callbacks, which may take mu.
+	answerMu sync.Mutex
+	// peerReInvite is the peer's re-INVITE being handled, until its handling
+	// ends. Guarded by answerMu.
+	peerReInvite *pendingReInvite
 
 	// media session is RTP local and remote
 	// it is forked on media changes and updated on writer and reader
@@ -136,6 +147,79 @@ type DialogMedia struct {
 	mediaUpdating bool
 
 	closed bool
+}
+
+// pendingReInvite is a re-INVITE of the peer's being handled. Every field is
+// guarded by DialogMedia.answerMu.
+type pendingReInvite struct {
+	req *sip.Request
+	tx  sip.ServerTransaction
+	// dialog is the dialog the re-INVITE belongs to. Once it has ended the
+	// re-INVITE is answered 487.
+	dialog *sipgo.Dialog
+	// answered is set once the re-INVITE has its final response.
+	answered bool
+}
+
+// beginPeerReInvite answers req 481 when dialog has ended, and otherwise
+// records it as the peer's re-INVITE being handled, until endPeerReInvite. It
+// reports whether it answered. An ended dialog stays in the dialog cache until
+// its call handler returns, for an inbound call, or until it is closed, for an
+// outbound one, so a re-INVITE can still find it. It matches no live dialog,
+// and RFC 3261 section 12.2.2 has it answered 481.
+func (d *DialogMedia) beginPeerReInvite(dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
+	if dialog.LoadState() == sip.DialogStateEnded {
+		res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
+		return true, tx.Respond(res)
+	}
+	d.peerReInvite = &pendingReInvite{req: req, tx: tx, dialog: dialog}
+	return false, nil
+}
+
+// endPeerReInvite forgets the re-INVITE beginPeerReInvite recorded for tx.
+func (d *DialogMedia) endPeerReInvite(tx sip.ServerTransaction) {
+	d.answerMu.Lock()
+	if p := d.peerReInvite; p != nil && p.tx == tx {
+		d.peerReInvite = nil
+	}
+	d.answerMu.Unlock()
+}
+
+// respondPeerReInvite sends res as the final response to the peer's re-INVITE
+// on tx, and reports whether res was sent. A re-INVITE the end of the dialog
+// has answered gets nothing more, and one found pending once the dialog has
+// ended is answered 487 instead (RFC 3261 section 15.1.2). A request
+// beginPeerReInvite did not record is answered res as it is.
+func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Response) (bool, error) {
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
+	p := d.peerReInvite
+	if p == nil || p.tx != tx {
+		return true, tx.Respond(res)
+	}
+	if p.answered {
+		return false, nil
+	}
+	p.answered = true
+	if p.dialog.LoadState() == sip.DialogStateEnded {
+		return false, tx.Respond(sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
+	}
+	return true, tx.Respond(res)
+}
+
+// terminatePeerReInviteLocked answers the peer's re-INVITE 487 when it is
+// still pending once a BYE has ended the dialog: RFC 3261 section 15.1.2 has
+// every pending request answered, and recommends 487. Called with answerMu
+// held.
+func (d *DialogMedia) terminatePeerReInviteLocked() error {
+	p := d.peerReInvite
+	if p == nil || p.answered {
+		return nil
+	}
+	p.answered = true
+	return p.tx.Respond(sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
 }
 
 // referAttempt is one REFER sent on the dialog and what has been observed for
@@ -537,23 +621,32 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 
 // handleMediaUpdate answers an in-dialog INVITE and applies its offer, if it
 // has one, to a fork of the media session. ctx is the dialog's: it bounds a
-// DTLS handshake the offer asks for. An error wrapping
-// errMediaUpdateAfterAnswer means the update failed after the 2xx was sent,
-// and the caller ends the call.
+// DTLS handshake the offer asks for, which the end of the dialog ends. An error
+// wrapping errMediaUpdateAfterAnswer means the update failed after the 2xx was
+// sent, and the caller ends the call.
+//
+// The answer is sent through respondPeerReInvite with mu released, so a BYE
+// that ends the dialog meanwhile has it answered 487 instead.
 func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
+	respond := func(res *sip.Response) error {
+		_, err := d.respondPeerReInvite(tx, res)
+		return err
+	}
+
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	// A BYE handled while this request was pending has closed the media. The
 	// request is still answered, with the 487 RFC 3261 section 15.1.2
 	// recommends, and nothing is negotiated on the closed session.
 	if d.closed {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
+		d.mu.Unlock()
+		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
 	}
 	// The previous update is still running the handshake of a new DTLS
 	// association. RFC 3261 section 14.2 lets a request that cannot be taken
 	// now be retried after a 491.
 	if d.mediaUpdating {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		d.mu.Unlock()
+		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 	d.remoteContactTarget = req.Contact().Clone()
 
@@ -564,12 +657,15 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 	if len(req.Body()) > 0 {
 		msess, err := d.sdpReInviteUnsafe(req.Body())
 		if err == nil && msess.FinalizePending() {
-			return d.answerNewAssociationUnsafe(ctx, req, tx, contactHDR, msess)
+			d.mediaUpdating = true
+			d.mu.Unlock()
+			return d.answerNewAssociation(ctx, req, tx, contactHDR, msess)
 		}
 		if err == nil {
 			err = d.replaceRTPSessionUnsafe(msess)
 		}
 		if err != nil {
+			d.mu.Unlock()
 			// The offer is well formed but needs an ICE restart, to restart ICE
 			// or to run a new DTLS association over it (RFC 8842 section 6),
 			// which this session cannot perform. The fork was never installed,
@@ -577,9 +673,9 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 			// is fixed and carries no error text, so nothing internal reaches
 			// the peer.
 			if errors.Is(err, media.ErrICERestartUnsupported) {
-				return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+				return respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
 			}
-			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
+			return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
 		}
 
 		if d.onMediaUpdate != nil {
@@ -592,39 +688,69 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 	// A request for an offer can not be answered with an SDP we never built.
 	// The bodied path rejects this inside sdpReInviteUnsafe.
 	if d.mediaSession == nil {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - no media session present", nil))
+		d.mu.Unlock()
+		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - no media session present", nil))
 	}
 
 	// Reply with updated SDP
 	sd := d.mediaSession.LocalSDP()
+	d.mu.Unlock()
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sd)
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	return tx.Respond(res)
+	return respond(res)
 }
 
-// answerNewAssociationUnsafe answers a re-INVITE whose offer msess found to ask
-// for a new DTLS association, runs the handshake, and only then installs
-// msess. The handshake needs the answer, which tells the peer where msess is
-// and which certificate it presents (RFC 8842 section 5.3), and msess has no
-// SRTP keys until it completes, so the current session carries the media
-// meanwhile.
-func (d *DialogMedia) answerNewAssociationUnsafe(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
+// answerNewAssociation answers a re-INVITE whose offer msess found to ask for
+// a new DTLS association, runs the handshake, and only then installs msess.
+// The handshake needs the answer, which tells the peer where msess is and
+// which certificate it presents (RFC 8842 section 5.3), and msess has no SRTP
+// keys until it completes, so the current session carries the media
+// meanwhile. It is called without mu and with mediaUpdating set, which keeps
+// other media updates out until it clears it.
+//
+// A dialog that ends before the answer has the re-INVITE answered 487 by the
+// BYE, and one that ends while the handshake runs ends it through ctx. Either
+// way nothing is installed and the fork is discarded.
+func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", msess.LocalSDP())
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	if err := tx.Respond(res); err != nil {
-		return errors.Join(err, d.discardForkUnsafe(msess))
+	sent, err := d.respondPeerReInvite(tx, res)
+	if err != nil || !sent {
+		d.mu.Lock()
+		d.mediaUpdating = false
+		err = errors.Join(err, d.discardForkUnsafe(msess))
+		d.mu.Unlock()
+		return err
 	}
 
-	if err := d.finalizeAndReplaceUnsafe(ctx, msess); err != nil {
+	err = msess.FinalizeContext(ctx)
+
+	d.mu.Lock()
+	d.mediaUpdating = false
+	switch {
+	case ctx.Err() != nil:
+		// The dialog ended, which is no failure of the update.
+		err = d.discardForkUnsafe(msess)
+		d.mu.Unlock()
+		return err
+	case err == nil && d.closed:
+		err = fmt.Errorf("media closed during the media update")
+	}
+	if err != nil {
+		err = errors.Join(err, d.discardForkUnsafe(msess))
+	} else {
+		err = d.replaceRTPSessionUnsafe(msess)
+	}
+	onMediaUpdate := d.onMediaUpdate
+	d.mu.Unlock()
+	if err != nil {
 		return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
 	}
 
-	if d.onMediaUpdate != nil {
-		d.mu.Unlock()
-		d.onMediaUpdate(d)
-		d.mu.Lock()
+	if onMediaUpdate != nil {
+		onMediaUpdate(d)
 	}
 	return nil
 }

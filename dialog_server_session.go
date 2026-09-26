@@ -726,8 +726,10 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // that media closed under it by the BYE's handler. It also has the answer see
 // the ACK the peer sent ahead of the BYE, rather than the dialog ending before
 // any ACK, which the answer would report as a missing ACK. A BYE that arrives
-// while a re-INVITE is being handled is read once that re-INVITE is answered,
-// so the peer never gets a 200 to the re-INVITE after the one to its BYE.
+// while a re-INVITE is being handled does not wait for it: the BYE is answered,
+// and the re-INVITE, when it has no final response yet, is answered 487 (RFC
+// 3261 section 15.1.2), so the peer never gets a 200 to the re-INVITE after
+// the one to its BYE.
 //
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
@@ -743,8 +745,8 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // is answered here and the error returned: the dialog goes on.
 func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.awaitAnswer(tx)
-	d.requestMu.Lock()
-	defer d.requestMu.Unlock()
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
 	d.terminatingBye.Store(req)
 	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
 		// Not this dialog's ending: leave no cause planted on it.
@@ -755,7 +757,7 @@ func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 		}
 		return err
 	}
-	return nil
+	return d.terminatePeerReInviteLocked()
 }
 
 // Hangup ends the call: it declines one not answered yet with 480, and ends an
@@ -1030,16 +1032,16 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 
-	// Held until the re-INVITE is answered, so a BYE ends the dialog either
-	// after that answer or before the check below.
 	d.requestMu.Lock()
 	defer d.requestMu.Unlock()
 
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
-	// media.
-	if ended, err := respondDialogEnded(d, req, tx); ended {
+	// media. A live one is answered through respondPeerReInvite, or 487 by a
+	// BYE that ends the dialog first.
+	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
 		return err
 	}
+	defer d.endPeerReInvite(tx)
 
 	// NOTE: Calling ReadRequest increases remote CSEQ.
 	// We should not call this until dialog is confirmed, otherwise any intermidiate response
@@ -1054,10 +1056,12 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 			//    randomly chosen value of between 0 and 10 seconds.
 			res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
 			res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(rand.IntN(10))))
-			return tx.Respond(res)
+			_, err := d.respondPeerReInvite(tx, res)
+			return err
 		}
 
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+		return err
 	}
 
 	// RFC 4028: an inbound refresh re-INVITE resets the active timer. When the
