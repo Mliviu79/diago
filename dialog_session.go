@@ -523,6 +523,13 @@ func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTra
 		return
 	}
 
+	// A NOTIFY for no REFER sent on this dialog matches none of its
+	// subscriptions, which RFC 6665 section 4.1.3 has answered 481.
+	if !d.Media().referNotifyExpected(req) {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
+		return
+	}
+
 	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
 
 	// Every parsed NOTIFY, 1xx progress included, goes to the REFER attempt it

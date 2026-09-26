@@ -206,9 +206,10 @@ func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
 
 // TestDialogHandleReferNotifyLeavesTheDialogAlone checks a REFER NOTIFY hands
 // the result on and never ends the dialog, whoever sent it and whenever it
-// arrives. Each row has no Refer waiting and no OnNotify callback, which is the
-// shape of a NOTIFY arriving after Refer stopped waiting: what follows a
-// transfer result is the dialog owner's decision.
+// arrives. Each row has a REFER whose wait ended on its deadline and no
+// OnNotify callback, which is the shape of a NOTIFY arriving after Refer
+// stopped waiting: what follows a transfer result is the dialog owner's
+// decision.
 func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -225,6 +226,7 @@ func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &referNotifyDialog{media: &DialogMedia{}}
+			d.media.finishReferAttempt(d.media.beginReferAttempt(nil), ReferEndDeadline)
 
 			req := newReferNotifyRequest(t, "message/sipfrag", tc.body)
 			for _, h := range tc.headers {

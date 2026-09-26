@@ -490,11 +490,8 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 	server.OnInfo(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
 		// Handle DTMF out of band
-		// An INFO without a body carries no Content-Type (RFC 3261 §20.15).
-		if ct := req.ContentType(); ct == nil || ct.Value() != "application/dtmf-relay" {
-			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
-		}
-
+		// The dialog is matched first: an INFO for no live dialog is answered
+		// 481 (RFC 3261 section 12.2.2), whatever it carries.
 		sd, cd, err := dg.cache.MatchDialog(req)
 		if err != nil {
 			return handleNoDialog(req, tx, err)

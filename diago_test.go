@@ -358,8 +358,10 @@ func TestDiagoNewDialog(t *testing.T) {
 // TestDiagoInfoWithoutContentType sends real INFO requests to the INFO handler
 // over a loopback socket. A body-less INFO is valid SIP and carries no
 // Content-Type (RFC 3261 §20.15), so the handler must answer it rather than
-// fail on the missing header. A middleware recovers any panic from the handler
-// so the failure is reported instead of ending the test binary.
+// fail on the missing header. The dialog is matched first, so one outside any
+// dialog is refused as every in-dialog request without the tags of a dialog
+// is. A middleware recovers any panic from the handler so the failure is
+// reported instead of ending the test binary.
 func TestDiagoInfoWithoutContentType(t *testing.T) {
 	var mu sync.Mutex
 	panics := map[string]string{}
@@ -399,8 +401,8 @@ func TestDiagoInfoWithoutContentType(t *testing.T) {
 		body        []byte
 		wantStatus  int
 	}{
-		{name: "no Content-Type", wantStatus: sip.StatusNotAcceptable},
-		{name: "not DTMF relay", contentType: "text/plain", body: []byte("hello"), wantStatus: sip.StatusNotAcceptable},
+		{name: "no Content-Type", wantStatus: sip.StatusBadRequest},
+		{name: "not DTMF relay", contentType: "text/plain", body: []byte("hello"), wantStatus: sip.StatusBadRequest},
 		{name: "DTMF relay outside any dialog", contentType: "application/dtmf-relay", toTag: ";tag=nodialog", body: []byte("Signal=1\r\nDuration=100\r\n"), wantStatus: sip.StatusCallTransactionDoesNotExists},
 	}
 	for i, tc := range tests {
@@ -429,6 +431,158 @@ func TestDiagoInfoWithoutContentType(t *testing.T) {
 			mu.Unlock()
 			require.Empty(t, recovered, "INFO handler panicked")
 			assert.Equal(t, tc.wantStatus, res.StatusCode)
+		})
+	}
+}
+
+// TestDiagoInfoMatchesDialogFirst sends real INFO requests to the INFO handler
+// over a loopback socket, each carrying a Content-Type other than DTMF relay.
+// An INFO for no dialog, or for an ended one, matches no live dialog, and RFC
+// 3261 section 12.2.2 has it answered 481, whatever it carries. The
+// Content-Type was checked first, so it was answered 406. An INFO for a live
+// dialog is still refused 406.
+func TestDiagoInfoMatchesDialogFirst(t *testing.T) {
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua)
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	// newInfo builds an INFO in the dialog of d, or in no dialog when d is
+	// nil.
+	newInfo := func(t *testing.T, d *DialogServerSession) *sip.Request {
+		t.Helper()
+		req := sip.NewRequest(sip.INFO, sip.Uri{User: "dg", Host: "127.0.0.1", Port: port})
+		if d == nil {
+			req.AppendHeader(sip.NewHeader("From", "<sip:peer@127.0.0.1>;tag=peer"))
+			req.AppendHeader(sip.NewHeader("To", "<sip:dg@127.0.0.1>;tag=nodialog"))
+			req.AppendHeader(sip.NewHeader("Call-ID", "info-first-nodialog"))
+		} else {
+			inv := d.InviteRequest
+			req.AppendHeader(sip.HeaderClone(inv.From()))
+			req.AppendHeader(sip.HeaderClone(inv.To()))
+			req.AppendHeader(sip.HeaderClone(inv.CallID()))
+		}
+		req.AppendHeader(sip.NewHeader("CSeq", "500 INFO"))
+		req.AppendHeader(sip.NewHeader("Content-Type", "text/plain"))
+		req.SetBody([]byte("hello"))
+		return req
+	}
+	// storedDialog returns an inbound dialog, confirmed, stored in the cache
+	// of dg, with a Call-ID of its own.
+	storedDialog := func(t *testing.T, callID string) *DialogServerSession {
+		t.Helper()
+		d := newTestDialogOverUA(t, newByeServerTx(), &sipgo.DialogUA{})
+		d.InviteRequest.ReplaceHeader(sip.NewHeader("Call-ID", callID))
+		id, err := sip.DialogIDFromRequestUAS(d.InviteRequest)
+		require.NoError(t, err)
+		d.ID = id
+		d.InviteResponse = sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+		confirm(t, d)
+		require.NoError(t, dg.cache.server.DialogStore(context.Background(), d.ID, d))
+		t.Cleanup(func() { _ = dg.cache.server.DialogDelete(context.Background(), d.ID) })
+		return d
+	}
+
+	for _, tc := range []struct {
+		name       string
+		dialog     func(t *testing.T) *DialogServerSession
+		wantStatus int
+	}{
+		{
+			name:       "no dialog",
+			dialog:     func(*testing.T) *DialogServerSession { return nil },
+			wantStatus: sip.StatusCallTransactionDoesNotExists,
+		},
+		{
+			name: "ended dialog",
+			dialog: func(t *testing.T) *DialogServerSession {
+				d := storedDialog(t, "info-first-ended")
+				require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+				return d
+			},
+			wantStatus: sip.StatusCallTransactionDoesNotExists,
+		},
+		{
+			name:       "live dialog",
+			dialog:     func(t *testing.T) *DialogServerSession { return storedDialog(t, "info-first-live") },
+			wantStatus: sip.StatusNotAcceptable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newInfo(t, tc.dialog(t))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, err := client.Do(ctx, req)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStatus, res.StatusCode)
+		})
+	}
+}
+
+// TestDialogNotifyForNoRefer pins how a NOTIFY on a live dialog is answered
+// when the dialog sent no REFER it belongs to, on either side. It matches none
+// of the dialog's subscriptions, and RFC 6665 section 4.1.3 has it answered
+// 481. It was answered 200. A NOTIFY for a REFER the dialog tracks is still
+// answered 200.
+func TestDialogNotifyForNoRefer(t *testing.T) {
+	sides := []struct {
+		name    string
+		newLive func(t *testing.T) inDialogHandlers
+	}{
+		{
+			name: "inbound",
+			newLive: func(t *testing.T) inDialogHandlers {
+				d := newTestDialogOverUA(t, newByeServerTx(), &sipgo.DialogUA{})
+				d.InviteResponse = sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+				confirm(t, d)
+				return d
+			},
+		},
+		{
+			name: "outbound",
+			newLive: func(t *testing.T) inDialogHandlers {
+				d, _ := newAnsweredTestClientDialog(t)
+				return d
+			},
+		},
+	}
+	newNotify := func() *sip.Request {
+		req := newPeerInDialogRequest(sip.NOTIFY, 500)
+		req.AppendHeader(sip.NewHeader("Event", "refer;id=7"))
+		req.AppendHeader(sip.NewHeader("Subscription-State", "terminated;reason=noresource"))
+		req.AppendHeader(sip.NewHeader("Content-Type", "message/sipfrag;version=2.0"))
+		req.SetBody([]byte("SIP/2.0 200 OK"))
+		return req
+	}
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			t.Run("no REFER", func(t *testing.T) {
+				d := side.newLive(t)
+				tx := newByeServerTx()
+				d.handleReferNotify(newNotify(), tx)
+				require.Len(t, tx.responses, 1)
+				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
+			})
+
+			t.Run("tracked REFER", func(t *testing.T) {
+				d := side.newLive(t)
+				attempt := d.Media().beginReferAttempt(nil)
+				d.Media().setReferAttemptCSeq(attempt, 7)
+				tx := newByeServerTx()
+				d.handleReferNotify(newNotify(), tx)
+				require.Len(t, tx.responses, 1)
+				assert.Equal(t, sip.StatusOK, tx.responses[0].StatusCode)
+			})
 		})
 	}
 }

@@ -625,7 +625,9 @@ func endReferOnDeadline(t *testing.T, d *referObserveDialog, onLate func(ReferLa
 
 // TestReferObserveLateNotify checks a terminal NOTIFY that arrives after the
 // wait ended is answered 200, delivered once to that attempt's OnLate with the
-// attempt's CSeq, and never touches the dialog.
+// attempt's CSeq, and never touches the dialog. A NOTIFY after that one, or
+// after the media is closed, matches no subscription, and is answered 481
+// (RFC 6665 section 4.1.3).
 func TestReferObserveLateNotify(t *testing.T) {
 	t.Run("a final NOTIFY after the deadline is delivered once", func(t *testing.T) {
 		d := newReferObserveDialog(t, 202, "Accepted")
@@ -638,7 +640,7 @@ func TestReferObserveLateNotify(t *testing.T) {
 			Status: 200, Reason: "OK", SubscriptionState: "terminated;reason=noresource", HasSubscriptionState: true, EventID: 7, HasEventID: true,
 		}}}, lates.calls())
 
-		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=7", "terminated;reason=noresource"))
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=7", "terminated;reason=noresource"))
 		assert.Len(t, lates.calls(), 1, "a duplicate late NOTIFY is not delivered again")
 		assert.Zero(t, d.hangups.Load(), "a late NOTIFY never ends the dialog")
 	})
@@ -694,7 +696,7 @@ func TestReferObserveLateNotify(t *testing.T) {
 		endReferOnDeadline(t, d, lates.record)
 		require.NoError(t, d.media.Close())
 
-		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", "terminated"))
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", "terminated"))
 		assert.Empty(t, lates.calls())
 		assert.Zero(t, registeredReferAttempts(d.media))
 		assert.Zero(t, d.hangups.Load())
@@ -814,7 +816,8 @@ func TestReferObserveStaleEventID(t *testing.T) {
 		assert.Equal(t, []int{200}, notifyStatuses(newer), "the older attempt's NOTIFY was recorded on the newer one")
 		require.Len(t, newer.Notifies, 1)
 		assert.Equal(t, uint32(5), newer.Notifies[0].EventID)
-		assert.Equal(t, []int{sip.StatusOK, sip.StatusOK, sip.StatusOK}, answers, "every NOTIFY is answered 200")
+		// The stale NOTIFY matches no subscription (RFC 6665 section 4.1.3).
+		assert.Equal(t, []int{sip.StatusOK, sip.StatusCallTransactionDoesNotExists, sip.StatusOK}, answers)
 		assert.Zero(t, registeredReferAttempts(d.media))
 		assert.Zero(t, d.hangups.Load())
 	})

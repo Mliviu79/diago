@@ -1193,6 +1193,9 @@ func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTra
 	if ended, err := respondDialogEnded(d, req, tx); ended {
 		return err
 	}
+	// DTMF relay is not read yet, so an INFO on a live dialog is refused
+	// whatever it carries, without a body and so without a Content-Type (RFC
+	// 3261 section 20.15) too.
 	return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 	// if err := d.ReadRequest(req, tx); err != nil {
 	// 	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
