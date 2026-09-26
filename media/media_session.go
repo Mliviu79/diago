@@ -303,6 +303,10 @@ type MediaSession struct {
 	// Close may run on another goroutine than the one that waits.
 	finalizeMu  sync.Mutex
 	finalizeRun *finalizeRun
+	// finalizeErr is the error of a negotiation FinalizeWithin left running
+	// that failed. Every later FinalizeContext and FinalizeWithin reports it,
+	// since the session was never keyed. Guarded by finalizeMu.
+	finalizeErr error
 	// dtlsUnkeyed is set when FinalizeWithin leaves a DTLS handshake running,
 	// and cleared by the handshake once it has keyed SRTP; WriteRTP and
 	// WriteRTCP refuse while it is set. It is cleared only after the SRTP
@@ -1600,6 +1604,9 @@ func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 	if run := s.loadFinalizeRun(); run != nil {
 		return s.awaitFinalizeRun(ctx, run)
 	}
+	if err := s.loadFinalizeErr(); err != nil {
+		return err
+	}
 	if s.onFinalize != nil {
 		err := s.onFinalize(ctx, true)
 		s.onFinalize = nil
@@ -1624,14 +1631,29 @@ func (s *MediaSession) FinalizeContext(ctx context.Context) error {
 // and by Close, which ends it. The session carries no media meanwhile: WriteRTP
 // and WriteRTCP return ErrDTLSNotKeyed, and nothing may read from the session
 // or change it, since the negotiation does both. A negotiation that ends within
-// wait, successfully or not, is reported as FinalizeContext reports it.
+// wait, successfully or not, is reported as FinalizeContext reports it, and so
+// is one that failed before. A wait of zero or less does not wait: it reports a
+// negotiation left running that has ended, and ErrFinalizeInProgress for one
+// that has not.
 func (s *MediaSession) FinalizeWithin(ctx context.Context, wait time.Duration) error {
 	run := s.loadFinalizeRun()
 	if run == nil {
+		if err := s.loadFinalizeErr(); err != nil {
+			return err
+		}
 		if s.onFinalize == nil {
 			return nil
 		}
 		run = s.startFinalizeRun(ctx)
+	}
+
+	if wait <= 0 {
+		select {
+		case <-run.done:
+			return s.endFinalizeRun(run)
+		default:
+			return ErrFinalizeInProgress
+		}
 	}
 
 	timer := time.NewTimer(wait)
@@ -1693,15 +1715,24 @@ func (s *MediaSession) loadFinalizeRun() *finalizeRun {
 	return s.finalizeRun
 }
 
-// endFinalizeRun forgets a negotiation that has returned, and reports its
-// result.
+// endFinalizeRun forgets a negotiation that has returned, keeping the error of
+// one that failed, and reports its result.
 func (s *MediaSession) endFinalizeRun(run *finalizeRun) error {
 	s.finalizeMu.Lock()
 	if s.finalizeRun == run {
 		s.finalizeRun = nil
+		if run.err != nil {
+			s.finalizeErr = run.err
+		}
 	}
 	s.finalizeMu.Unlock()
 	return run.err
+}
+
+func (s *MediaSession) loadFinalizeErr() error {
+	s.finalizeMu.Lock()
+	defer s.finalizeMu.Unlock()
+	return s.finalizeErr
 }
 
 // awaitFinalizeRun waits for a negotiation FinalizeWithin left running, under

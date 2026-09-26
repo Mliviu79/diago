@@ -869,6 +869,29 @@ func TestDTLSFinalizeWithinEndsWithContext(t *testing.T) {
 	}
 }
 
+// TestDTLSFinalizeWithinFailureIsKept pins that a handshake left running that
+// fails stays failed: every later FinalizeWithin and FinalizeContext reports
+// its error, where they reported a session with nothing left to negotiate once
+// the error had been returned. A FinalizeWithin that does not wait reports
+// whether the handshake has ended, without waiting for it.
+func TestDTLSFinalizeWithinFailureIsKept(t *testing.T) {
+	offerer := newDTLSForkTestSession(t, testdata.ClientCertificate())
+	answerer := newDTLSForkTestSession(t, testdata.ServerCertificate())
+	negotiateDTLS(t, offerer, answerer, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.ErrorIs(t, answerer.FinalizeWithin(ctx, 100*time.Millisecond), ErrFinalizeInProgress)
+	require.ErrorIs(t, answerer.FinalizeWithin(ctx, 0), ErrFinalizeInProgress, "the handshake has not ended")
+
+	cancel()
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 10*time.Second), context.Canceled)
+	require.ErrorIs(t, answerer.FinalizeWithin(context.Background(), 0), context.Canceled)
+	require.ErrorIs(t, answerer.FinalizeContext(context.Background()), context.Canceled)
+	require.False(t, answerer.FinalizePending())
+	require.ErrorIs(t, answerer.WriteRTP(dtlsTestPacket(1)), ErrDTLSNotKeyed)
+}
+
 // TestDTLSFinalizeWithinSendsNoMedia pins that a session whose handshake
 // FinalizeWithin left running sends no media. Without keys WriteRTP and
 // WriteRTCP would put it on the wire in plaintext, where the profile has none:

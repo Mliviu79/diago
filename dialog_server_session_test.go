@@ -692,3 +692,46 @@ func TestDialogServerReInviteEndedDialog(t *testing.T) {
 		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
 	})
 }
+
+// TestDialogServerAnswerRepeatsEarlyAnswer pins that the 200 after
+// ProgressMedia carries the answer the 183 carried, byte for byte: RFC 3261
+// section 13.2.1 has an answer placed in a provisional response be that same
+// exact answer. The 200 was built by LocalSDP again, which changes at least
+// the o= version.
+func TestDialogServerAnswerRepeatsEarlyAnswer(t *testing.T) {
+	peer := newMediaSessionForTest(t)
+	inviteTx := &respondedServerTx{byeServerTx: newByeServerTx(), responded: make(chan *sip.Response, 4)}
+	d := newTestDialogOver(t, inviteTx)
+	d.InviteRequest.SetBody(peer.LocalSDP())
+	d.mediaConf = MediaConfig{
+		Codecs: []media.Codec{media.CodecAudioUlaw},
+		bindIP: net.IPv4(127, 0, 0, 1),
+	}
+	t.Cleanup(func() { _ = d.DialogMedia.Close() })
+
+	require.NoError(t, d.ProgressMedia())
+	var early *sip.Response
+	select {
+	case early = <-inviteTx.responded:
+		require.Equal(t, sip.StatusSessionInProgress, early.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no 183 was sent")
+	}
+
+	answered := make(chan error, 1)
+	go func() { answered <- d.Answer() }()
+	select {
+	case res := <-inviteTx.responded:
+		require.Equal(t, sip.StatusOK, res.StatusCode)
+		assert.Equal(t, string(early.Body()), string(res.Body()), "the 200 must repeat the answer of the 183")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no 200 was sent")
+	}
+	readAck(t, d)
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Answer did not return")
+	}
+}

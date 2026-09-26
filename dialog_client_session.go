@@ -35,6 +35,11 @@ type DialogClientSession struct {
 	// returns: once the media it finalizes is keyed, or has failed. awaitAck
 	// waits on it. Guarded by d.mu.
 	acking chan struct{}
+	// earlyUnkeyed is set when the answer in a 183 was applied and the DTLS
+	// handshake it started was left running, not keyed within
+	// InviteClientOptions.EarlyMediaKeyTimeout. The answer stands, and Ack
+	// sets the media up once the handshake has keyed it. Guarded by d.mu.
+	earlyUnkeyed bool
 
 	closed atomic.Uint32
 }
@@ -104,6 +109,11 @@ type InviteClientOptions struct {
 	Headers []sip.Header
 	// Stop on early media. ErrClientEarlyMedia will be returned
 	EarlyMediaDetect bool
+	// EarlyMediaKeyTimeout bounds how long, with EarlyMediaDetect, a DTLS-SRTP
+	// call waits for the callee to key the early media of a 183 before it
+	// takes the call as having none. Zero means five seconds. It bounds the
+	// wait only: the handshake goes on, and Ack completes it.
+	EarlyMediaKeyTimeout time.Duration
 }
 
 // WithAnonymousCaller sets from user Anonymous per RFC
@@ -134,6 +144,9 @@ func (o *InviteClientOptions) WithCaller(displayName string, callerID string, ho
 // - It RETURNS ErrClientEarlyMedia if remote answers with 183 Session in Progress
 // - Media is negotiated and setuped
 // - You need to call WaitAnswer() if you want to proceed with answering call
+// - For DTLS-SRTP, early media the callee does not key within
+// EarlyMediaKeyTimeout is not reported: Invite goes on waiting for the answer,
+// and Ack completes the handshake
 //
 // Errors:
 // - sipgo.ErrDialogResponse
@@ -269,7 +282,7 @@ func (d *DialogClientSession) invite(ctx context.Context, med *DialogMedia, opts
 	}
 
 	if opts.EarlyMediaDetect {
-		return d.waitAnswerEarly(ctx, med, ansOpts)
+		return d.waitAnswerEarly(ctx, med, ansOpts, opts.EarlyMediaKeyTimeout)
 	}
 
 	return d.waitAnswer(ctx, med, ansOpts)
@@ -281,9 +294,12 @@ func (d *DialogClientSession) WaitAnswer(ctx context.Context, opts sipgo.AnswerO
 	return d.waitAnswer(ctx, &d.DialogMedia, opts)
 }
 
-func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
+func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, keyTimeout time.Duration) error {
 	sess := med.mediaSession
 	onResps := opts.OnResponse
+	if keyTimeout <= 0 {
+		keyTimeout = defaultEarlyMediaKeyTimeout
+	}
 
 	// Add early media check
 	opts.OnResponse = func(res *sip.Response) error {
@@ -311,18 +327,34 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 			return nil
 		}
 
+		// A 183 after the one whose handshake was left running carries
+		// nothing more: the first session description is the answer (RFC
+		// 3261 section 13.2.1).
+		d.mu.Lock()
+		unkeyed := d.earlyUnkeyed
+		d.mu.Unlock()
+		if unkeyed {
+			return nil
+		}
+
 		// A response body answers the offer we sent on the INVITE.
 		sess.RemoteSDPIsAnswer = true
 		if err := sess.RemoteSDP(remoteSDP); err != nil {
 			return err
 		}
 
-		// The wait for the answer cannot see the caller give up while the
-		// handshake runs, so the handshake ends with ctx, and with the call.
-		fctx, cancel := contextWithDialog(ctx, d.Context())
-		err := sess.FinalizeContext(fctx)
-		cancel()
-		if err != nil {
+		// The callee may take part in the handshake only once the call is
+		// answered, as a callee that ignores early media does (RFC 3960), so
+		// the wait for the keys is bounded, and the handshake is not ended
+		// with it: it runs until the call ends, and Ack completes it.
+		// Meanwhile the session sends no media and has none set up.
+		if err := d.awaitEarlyKeys(ctx, sess, keyTimeout); err != nil {
+			if errors.Is(err, media.ErrFinalizeInProgress) {
+				d.mu.Lock()
+				d.earlyUnkeyed = true
+				d.mu.Unlock()
+				return nil
+			}
 			return err
 		}
 
@@ -342,6 +374,29 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 		return ErrClientEarlyMedia
 	}
 	return d.waitAnswer(ctx, med, opts)
+}
+
+// awaitEarlyKeys runs the negotiation the answer in a 183 armed on sess, and
+// waits for it up to wait, or until ctx is done, which the wait for the answer
+// it runs in cannot see. The negotiation is bounded by the call only, and a
+// wait that ends before it does returns media.ErrFinalizeInProgress and leaves
+// it running.
+func (d *DialogClientSession) awaitEarlyKeys(ctx context.Context, sess *media.MediaSession, wait time.Duration) error {
+	// Checked in steps, as the wait is not bounded by ctx itself.
+	const step = 50 * time.Millisecond
+	deadline := time.Now().Add(wait)
+	for {
+		err := sess.FinalizeWithin(d.Context(), min(time.Until(deadline), step))
+		if !errors.Is(err, media.ErrFinalizeInProgress) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if time.Until(deadline) <= 0 {
+			return media.ErrFinalizeInProgress
+		}
+	}
 }
 
 func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
@@ -367,6 +422,16 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, 
 
 func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte) error {
 	sess := med.mediaSession
+
+	// The answer in the 183 stands (RFC 3261 section 13.2.1), and its
+	// handshake is still running on the session, which Ack sets up once it
+	// is keyed.
+	d.mu.Lock()
+	unkeyed := d.earlyUnkeyed
+	d.mu.Unlock()
+	if unkeyed {
+		return nil
+	}
 
 	// This body comes from a response, so it answers our offer. checkEarlyMedia
 	// forks the session, and Fork carries the role.
@@ -429,6 +494,19 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 		}
 	}
 
+	// The handshake of early media left running has keyed the session, whose
+	// media is set up only now.
+	d.mu.Lock()
+	unkeyed := d.earlyUnkeyed
+	d.earlyUnkeyed = false
+	if unkeyed {
+		rtpSess := media.NewRTPSession(msess)
+		d.initRTPSessionUnsafe(msess, rtpSess)
+		d.mu.Unlock()
+		// Must be called after reader and writer setup due to race
+		return rtpSess.MonitorBackground()
+	}
+	d.mu.Unlock()
 	return nil
 }
 

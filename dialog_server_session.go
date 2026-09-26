@@ -54,11 +54,15 @@ type DialogServerSession struct {
 	// the dialog, for the answer waiting on that ACK to report. Guarded by
 	// d.mu.
 	ackAnswerErr error
-	// earlyAnswerSDP is the answer the 183 carried, set when ProgressMedia
-	// returned ErrEarlyMediaNotKeyed. The 200 repeats it, since the handshake
-	// ProgressMedia left running still uses the media session and LocalSDP
-	// cannot read it meanwhile. Guarded by d.mu.
+	// earlyAnswerSDP is the answer the 183 of ProgressMedia carried, which the
+	// 200 repeats: RFC 3261 section 13.2.1 has the answer placed in a
+	// provisional response be that same exact answer. LocalSDP would change it,
+	// at least in its o= version, and cannot read the media session while a
+	// handshake ProgressMedia left running uses it. Guarded by d.mu.
 	earlyAnswerSDP []byte
+	// earlyUnkeyed is set when ProgressMedia returned ErrEarlyMediaNotKeyed.
+	// Guarded by d.mu.
+	earlyUnkeyed bool
 
 	// terminatingBye holds the BYE request that ended this dialog, captured by
 	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
@@ -169,7 +173,8 @@ const defaultEarlyMediaKeyTimeout = 5 * time.Second
 // or writer, and its media session refuses to send with media.ErrDTLSNotKeyed;
 // nothing may use it before Answer. Answer sends the 200 and then completes the
 // handshake ProgressMedia started, bounded by the call and by
-// media.DTLSHandshakeTimeout, before it sets the media up.
+// media.DTLSHandshakeTimeout, before it sets the media up. When that handshake
+// has failed by then, Answer declines the call 488 instead.
 var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has not completed the DTLS handshake")
 
 func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) error {
@@ -212,6 +217,7 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 		if errors.Is(err, media.ErrFinalizeInProgress) {
 			d.mu.Lock()
 			d.earlyAnswerSDP = body
+			d.earlyUnkeyed = true
 			d.mu.Unlock()
 			return ErrEarlyMediaNotKeyed
 		}
@@ -221,6 +227,7 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 	rtpSess := media.NewRTPSession(sess)
 	d.mu.Lock()
 	d.initRTPSessionUnsafe(sess, rtpSess)
+	d.earlyAnswerSDP = body
 	d.mu.Unlock()
 	return rtpSess.MonitorBackground()
 }
@@ -489,19 +496,24 @@ func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) 
 }
 
 // answerEarlyMedia answers a call whose media session exists already: set up
-// by ProgressMedia, or installed by the application. It only sends the 200,
-// unless ProgressMedia left the DTLS handshake of the early media running.
+// by ProgressMedia, whose answer the 200 repeats, or installed by the
+// application. It only sends the 200, unless ProgressMedia left the DTLS
+// handshake of the early media running.
 func (d *DialogServerSession) answerEarlyMedia() error {
 	d.mu.Lock()
 	sess := d.mediaSession
 	earlyAnswer := d.earlyAnswerSDP
+	unkeyed := d.earlyUnkeyed
 	d.mu.Unlock()
 
-	if earlyAnswer == nil {
-		// This will now block until ACK received with 64*T1 as max.
-		return d.RespondSDP(sess.LocalSDP())
+	if unkeyed {
+		return d.answerUnkeyedEarlyMedia(sess, earlyAnswer)
 	}
-	return d.answerUnkeyedEarlyMedia(sess, earlyAnswer)
+	if earlyAnswer == nil {
+		earlyAnswer = sess.LocalSDP()
+	}
+	// This will now block until ACK received with 64*T1 as max.
+	return d.RespondSDP(earlyAnswer)
 }
 
 // answerUnkeyedEarlyMedia answers a call whose caller did not key the early
@@ -511,6 +523,12 @@ func (d *DialogServerSession) answerEarlyMedia() error {
 // media.DTLSHandshakeTimeout: a caller that ignored the 183 takes part in it
 // only after the 200. The media is set up once the handshake has keyed it. An
 // in-dialog request waits for all of it, as it does for answerSession.
+//
+// A handshake that has already failed leaves the call no media to answer
+// with, so the call is declined 488 rather than answered 200 and ended with a
+// BYE: RFC 3261 section 21.4.26 gives 488 the meaning of 606, a session
+// description the callee cannot support, and RFC 5763 section 5 has the media
+// session torn down on a certificate that does not match its fingerprint.
 func (d *DialogServerSession) answerUnkeyedEarlyMedia(sess *media.MediaSession, earlyAnswer []byte) error {
 	d.mu.Lock()
 	answering := make(chan struct{})
@@ -518,6 +536,9 @@ func (d *DialogServerSession) answerUnkeyedEarlyMedia(sess *media.MediaSession, 
 	d.mu.Unlock()
 	defer close(answering)
 
+	if err := sess.FinalizeWithin(d.Context(), 0); err != nil && !errors.Is(err, media.ErrFinalizeInProgress) {
+		return errors.Join(err, d.Respond(sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+	}
 	if err := d.respondSDP(earlyAnswer); err != nil {
 		return err
 	}

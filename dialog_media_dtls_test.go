@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"strings"
@@ -781,6 +782,156 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 		}
 		require.Same(t, sess, d.MediaSession(), "the re-INVITE must not reach the media")
 	})
+}
+
+// TestDialogServerAnswerAfterEarlyHandshakeFailed is an Answer after
+// ProgressMedia returned ErrEarlyMediaNotKeyed, once the handshake it left
+// running has failed: the caller took part in it only after the wait, and
+// presented a certificate that matches none of the fingerprints of its offer.
+// The call has no media to answer with, so it is declined 488 (RFC 3261
+// section 21.4.26), where a 200 went out and a BYE followed.
+func TestDialogServerAnswerAfterEarlyHandshakeFailed(t *testing.T) {
+	d, peer, inviteTx := newProgressMediaDTLSDialog(t)
+	other, err := selfsign.GenerateSelfSigned()
+	require.NoError(t, err)
+	offer := string(peer.LocalSDP())
+	offer = strings.Replace(offer, iceSDPLine(t, []byte(offer), "a=fingerprint:"), iceSDPLine(t, newDTLSMediaSession(t, other).LocalSDP(), "a=fingerprint:"), 1)
+	d.InviteRequest.SetBody([]byte(offer))
+
+	require.ErrorIs(t, d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: 200 * time.Millisecond}), ErrEarlyMediaNotKeyed)
+	var early *sip.Response
+	select {
+	case early = <-inviteTx.responded:
+		require.Equal(t, sip.StatusSessionInProgress, early.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no 183 was sent")
+	}
+
+	peer.RemoteSDPIsAnswer = true
+	require.NoError(t, peer.RemoteSDP(early.Body()))
+	peerDone := make(chan error, 1)
+	go func() { peerDone <- peer.Finalize() }()
+	// Our side fails the handshake on the certificate. The failure stays
+	// with the session.
+	require.Error(t, d.MediaSession().FinalizeWithin(context.Background(), 10*time.Second))
+
+	answered := make(chan error, 1)
+	go func() { answered <- d.Answer() }()
+	select {
+	case res := <-inviteTx.responded:
+		require.Equal(t, sip.StatusNotAcceptableHere, res.StatusCode, "a call whose handshake failed was answered")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the INVITE was not answered")
+	}
+	// The transaction ends, as the ACK to the 488 ends it.
+	close(inviteTx.done)
+	select {
+	case err := <-answered:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Answer did not return")
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the peer's handshake did not return")
+	}
+}
+
+// stagedTxRequester sends each request over a client transaction without a
+// transport, and has respond hand it its responses through deliver, when and
+// in the order it chooses.
+type stagedTxRequester struct {
+	respond func(req *sip.Request, deliver func(*sip.Response))
+}
+
+func (r *stagedTxRequester) Request(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	key, _ := sip.ClientTxKeyMake(req)
+	tx := sip.NewClientTx(key, req, NewConnRecorder(), slog.Default())
+	if err := tx.Init(); err != nil {
+		return nil, err
+	}
+	r.respond(req, func(res *sip.Response) { tx.Receive(res) })
+	return tx, nil
+}
+
+// TestDialogClientEarlyMediaUnkeyedByCallee is a DTLS-SRTP call with
+// EarlyMediaDetect whose callee sends its answer in a 183 but takes part in
+// the handshake only after the 200, as a callee that ignores early media does
+// (RFC 3960). The wait for keys in the 183 is bounded by
+// EarlyMediaKeyTimeout, so Invite goes on to the 200, where it waited
+// DTLSHandshakeTimeout, and Ack completes the handshake left running and sets
+// the media up, encrypted.
+func TestDialogClientEarlyMediaUnkeyedByCallee(t *testing.T) {
+	peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+	var peerErr error
+	requester := &stagedTxRequester{respond: func(req *sip.Request, deliver func(*sip.Response)) {
+		if req.Method != sip.INVITE {
+			go deliver(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+			return
+		}
+		peerErr = peer.RemoteSDP(req.Body())
+		answer := peer.LocalSDP()
+		early := sip.NewResponseFromRequest(req, sip.StatusSessionInProgress, "Session Progress", answer)
+		early.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		ok := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", answer)
+		ok.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		ok.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5099}})
+		go func() {
+			deliver(early)
+			deliver(ok)
+		}()
+	}}
+	ua, err := sipgo.NewUA()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ua.Close() })
+	client, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	client.TxRequester = requester
+	dg := NewDiago(ua, WithClient(client),
+		WithTransport(Transport{
+			Transport: "udp",
+			BindHost:  "127.0.0.1",
+			MediaSRTP: media.SecureRTPModeDTLS,
+			MediaDTLSConf: media.DTLSConfig{
+				Certificates: []tls.Certificate{testdata.ClientCertificate()},
+			},
+		}),
+		WithMediaConfig(MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}}),
+	)
+
+	d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5099}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	invited := make(chan error, 1)
+	go func() {
+		invited <- d.Invite(ctx, InviteClientOptions{EarlyMediaDetect: true, EarlyMediaKeyTimeout: 300 * time.Millisecond})
+	}()
+	select {
+	case err := <-invited:
+		require.NoError(t, err, "unkeyed early media is not reported, and the call is answered")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Invite waited for the keys of the early media")
+	}
+	require.NoError(t, peerErr)
+
+	acked := make(chan error, 1)
+	go func() { acked <- d.Ack(ctx) }()
+	peerDone := make(chan error, 1)
+	go func() { peerDone <- peer.Finalize() }()
+	for _, done := range []chan error{acked, peerDone} {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the handshake left running did not complete")
+		}
+	}
+	require.NotNil(t, d.RTPSession(), "Ack did not set the media up")
+	requireEncryptedMedia(t, &d.DialogMedia, &DialogMedia{mediaSession: peer}, 100)
 }
 
 // sentPacketConn records every datagram a media session writes through it, so
