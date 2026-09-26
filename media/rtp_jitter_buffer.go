@@ -24,9 +24,10 @@ var rtpJitterDebug = envBool("JITTER_DEBUG")
 
 // RTPJitterBufferOptions configures a fixed RTP jitter buffer.
 type RTPJitterBufferOptions struct {
-	// DelayPackets is the initial fixed playout delay in packets. If unset, 3 is used.
+	// DelayPackets is the initial fixed playout delay in packets. If unset, 20 is used.
 	DelayPackets int
-	// MaxPackets caps buffered packets and the forward reordering window. If unset, 10 is used.
+	// MaxPackets caps buffered packets and the forward reordering window. If unset, 40 is used.
+	// A value below DelayPackets is raised to DelayPackets.
 	MaxPackets int
 }
 

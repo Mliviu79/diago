@@ -97,6 +97,17 @@ func TestRTPJitterBuffer(t *testing.T) {
 		)
 	})
 
+	t.Run("defaults", func(t *testing.T) {
+		// The values RTPJitterBufferOptions documents.
+		jb := NewRTPJitterBuffer(&sliceRTPReader{}, time.Millisecond, RTPJitterBufferOptions{})
+		require.Equal(t, 20, jb.delayPackets)
+		require.Equal(t, 40, jb.maxPackets)
+
+		jb = NewRTPJitterBuffer(&sliceRTPReader{}, time.Millisecond, RTPJitterBufferOptions{DelayPackets: 5, MaxPackets: 2})
+		require.Equal(t, 5, jb.delayPackets)
+		require.Equal(t, 5, jb.maxPackets, "MaxPackets below DelayPackets is raised to it")
+	})
+
 	t.Run("inOrder", func(t *testing.T) {
 		jb := newTestRTPJitterBuffer(t, rtpPackets(1234, 0, 1, 2))
 
