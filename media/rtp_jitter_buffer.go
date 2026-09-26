@@ -247,6 +247,13 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 			return 0, io.EOF
 		}
 
+		// Once the read loop has ended, input is closed and always ready, so it
+		// is left out and only the timers wake the remaining playout.
+		var inputC <-chan rtpJitterInput
+		if !j.inputClosed {
+			inputC = j.input
+		}
+
 		var initialC <-chan time.Time
 		if !j.playout && j.expectedSet {
 			initialC = j.initialTimer.C
@@ -262,7 +269,7 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 			j.stopTimers()
 			return 0, io.ErrClosedPipe
 
-		case input, ok := <-j.input:
+		case input, ok := <-inputC:
 			if !ok {
 				j.inputClosed = true
 				continue

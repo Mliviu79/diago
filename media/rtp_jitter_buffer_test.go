@@ -8,7 +8,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,6 +379,70 @@ func TestRTPJitterBufferDone(t *testing.T) {
 			close(reader.packets)
 		}
 	})
+}
+
+func TestRTPJitterBufferEndedUpstreamWaitBlocks(t *testing.T) {
+	// The upstream ends with packets still queued and the next release is an
+	// hour away. ReadRTP has to wait for it blocked. The read loop has closed
+	// input, and a select on a closed channel is always ready, so a ReadRTP that
+	// still selects on it spins instead and never parks.
+	jb := NewRTPJitterBuffer(&sliceRTPReader{packets: rtpPackets(1234, 0, 1, 2)}, time.Hour, RTPJitterBufferOptions{
+		DelayPackets: 2,
+		MaxPackets:   8,
+	})
+	require.Equal(t, uint16(0), readJitterSeq(t, jb))
+	requireJitterDone(t, jb)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- jitterEndedUpstreamRead(jb)
+	}()
+
+	var status string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status = goroutineStatus("media.jitterEndedUpstreamRead(")
+		if strings.HasPrefix(status, "select") {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	require.NoError(t, jb.Close())
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, io.ErrClosedPipe)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadRTP did not return after Close")
+	}
+	require.True(t, strings.HasPrefix(status, "select"),
+		"ReadRTP never blocked waiting for its next release, last seen %q", status)
+}
+
+// jitterEndedUpstreamRead is a named frame, so its goroutine can be found in a
+// stack dump.
+func jitterEndedUpstreamRead(jb *RTPJitterBuffer) error {
+	var pkt rtp.Packet
+	_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
+	return err
+}
+
+// goroutineStatus returns the status a stack dump prints for the goroutine
+// whose stack contains fn, such as "select" or "runnable", or "" if no
+// goroutine's does.
+func goroutineStatus(fn string) string {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if !strings.Contains(g, fn) {
+			continue
+		}
+		header, _, _ := strings.Cut(g, "\n")
+		_, status, _ := strings.Cut(header, "[")
+		status, _, _ = strings.Cut(status, "]")
+		return status
+	}
+	return ""
 }
 
 func TestRTPJitterBufferOverflow(t *testing.T) {
