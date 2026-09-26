@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -35,6 +36,10 @@ var (
 	// answer was sent. The peer has moved to the new session by then, so the
 	// call has no media left.
 	errMediaUpdateAfterAnswer = errors.New("media update failed after its answer")
+
+	// errMediaClosed refuses to install a media session once the dialog media
+	// is closed or the dialog has ended, since nothing would close it.
+	errMediaClosed = errors.New("dialog media closed")
 )
 
 // jitterBufferStopTimeout bounds how long Close waits for a jitter buffer's
@@ -150,6 +155,12 @@ type DialogMedia struct {
 	// that carried none, until the ACK to that 2xx brings the answer (RFC 3261
 	// section 14.2). Guarded by mu.
 	ackOffer *ackOffer
+
+	// mediaUpdateDone is set while a re-INVITE of the peer's or one of ours
+	// is in progress, and closed when it ends. Our re-INVITE waits for the
+	// peer's to end, and the peer's finding ours in progress is answered 491
+	// (RFC 3261 sections 14.1 and 14.2). Guarded by mu.
+	mediaUpdateDone chan struct{}
 
 	closed bool
 }
@@ -828,8 +839,9 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 
 // finalizeAndReplaceUnsafe runs the negotiation msess has pending and then
 // installs it. d.mu is released while the negotiation waits for the peer, and
-// mediaUpdating keeps other media updates out meanwhile. When it fails, or the
-// dialog media is closed meanwhile, msess is not installed and is discarded.
+// mediaUpdating keeps other media updates out meanwhile. ctx is the dialog's.
+// When the negotiation fails, or the dialog media is closed or the dialog ends
+// meanwhile, msess is not installed and is discarded.
 func (d *DialogMedia) finalizeAndReplaceUnsafe(ctx context.Context, msess *media.MediaSession) error {
 	d.mediaUpdating = true
 	d.mu.Unlock()
@@ -837,13 +849,93 @@ func (d *DialogMedia) finalizeAndReplaceUnsafe(ctx context.Context, msess *media
 	d.mu.Lock()
 	d.mediaUpdating = false
 
-	if err == nil && d.closed {
-		err = fmt.Errorf("media closed during the media update")
+	if err == nil && (d.closed || ctx.Err() != nil) {
+		err = errMediaClosed
+	}
+	if err == nil {
+		err = d.replaceRTPSessionUnsafe(msess)
 	}
 	if err != nil {
 		return errors.Join(err, d.discardForkUnsafe(msess))
 	}
-	return d.replaceRTPSessionUnsafe(msess)
+	return nil
+}
+
+// beginOwnMediaUpdate waits, bounded by ctx, until no re-INVITE is in
+// progress, and marks one of ours in progress until the returned func is
+// called. RFC 3261 section 14.1 has a UAC start no re-INVITE while another
+// INVITE transaction is in progress in either direction.
+func (d *DialogMedia) beginOwnMediaUpdate(ctx context.Context) (func(), error) {
+	for {
+		d.mu.Lock()
+		if d.closed {
+			d.mu.Unlock()
+			return nil, errMediaClosed
+		}
+		done := d.mediaUpdateDone
+		if done == nil {
+			done = make(chan struct{})
+			d.mediaUpdateDone = done
+			d.mu.Unlock()
+			return func() { d.endMediaUpdate(done) }, nil
+		}
+		d.mu.Unlock()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// beginPeerMediaUpdate marks a re-INVITE of the peer's in progress until the
+// returned func is called, and reports false when one of ours is in progress
+// instead, which RFC 3261 section 14.2 has the peer's answered 491. The peer's
+// re-INVITEs take turns under requestMu, so only ours can be in progress.
+func (d *DialogMedia) beginPeerMediaUpdate() (func(), bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.mediaUpdateDone != nil {
+		return nil, false
+	}
+	done := make(chan struct{})
+	d.mediaUpdateDone = done
+	return func() { d.endMediaUpdate(done) }, true
+}
+
+// reInviteRetryWait waits, bounded by ctx, before a re-INVITE of ours answered
+// 491 is sent again. callIDOwner tells whether we generated the dialog's
+// Call-ID, as the caller does. RFC 3261 section 14.1:
+//
+//	If a UAC receives a 491 response to a re-INVITE, it SHOULD start a
+//	timer with a value T chosen as follows:
+//	   1. If the UAC is the owner of the Call-ID of the dialog ID
+//	      (meaning it generated the value), T has a randomly chosen value
+//	      between 2.1 and 4 seconds in units of 10 ms.
+//	   2. If the UAC is not the owner of the Call-ID of the dialog ID, T
+//	      has a randomly chosen value of between 0 and 2 seconds in units
+//	      of 10 ms.
+func reInviteRetryWait(ctx context.Context, callIDOwner bool) error {
+	wait := time.Duration(mrand.IntN(201)) * 10 * time.Millisecond
+	if callIDOwner {
+		wait = time.Duration(210+mrand.IntN(191)) * 10 * time.Millisecond
+	}
+	select {
+	case <-time.After(wait):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *DialogMedia) endMediaUpdate(done chan struct{}) {
+	d.mu.Lock()
+	if d.mediaUpdateDone == done {
+		d.mediaUpdateDone = nil
+	}
+	d.mu.Unlock()
+	close(done)
 }
 
 // discardForkUnsafe closes a fork that is not going to be installed, if it was
@@ -916,6 +1008,10 @@ func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
 // fully stopped. A fork preserves statistics and shared connections; a new
 // session is used when media connections were recreated.
 func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
+	// Close has taken what it closes already, and would not close msess.
+	if d.closed {
+		return errMediaClosed
+	}
 	oldRTPSess := d.rtpSession
 	if oldRTPSess == nil {
 		return fmt.Errorf("RTP Session is nil while trying to update it")

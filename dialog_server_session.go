@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	mrand "math/rand/v2"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -823,9 +822,44 @@ func (d *DialogServerSession) ReInvite(ctx context.Context) error {
 	return d.WriteRequest(ack)
 }
 
-// reInviteMediaSession updates with full new media session
-// media MUST BE Forked
+// reInviteMediaSession re-INVITEs with ms, a fork of the media session, and
+// installs it with the answer.
 func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *media.MediaSession) error {
+	return d.reInviteMedia(ctx, func(*media.MediaSession) *media.MediaSession { return ms })
+}
+
+// reInviteMedia re-INVITEs with the fork of the installed media session that
+// fork returns, and installs the fork with the answer. Each attempt waits
+// first for a re-INVITE in progress to end, and marks ours in progress, see
+// beginOwnMediaUpdate. A 491 is retried after the wait RFC 3261 section 14.1
+// gives, with no re-INVITE of ours in progress meanwhile.
+func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *media.MediaSession) *media.MediaSession) error {
+	for {
+		end, err := d.beginOwnMediaUpdate(ctx)
+		if err != nil {
+			return err
+		}
+		ms := fork(d.MediaSession())
+		pending, err := d.reInviteMediaOnce(ctx, ms)
+		end()
+		if !pending {
+			return err
+		}
+		// The caller generated the Call-ID.
+		if err := reInviteRetryWait(ctx, false); err != nil {
+			d.mu.Lock()
+			derr := d.discardForkUnsafe(ms)
+			d.mu.Unlock()
+			return errors.Join(err, derr)
+		}
+	}
+}
+
+// reInviteMediaOnce sends one re-INVITE offering ms, and installs ms with the
+// answer, unless the dialog media is closed or the dialog has ended by then.
+// ms is discarded when it is not installed. It reports a 491, for the caller
+// to retry.
+func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.MediaSession) (bool, error) {
 	sdp := ms.LocalSDP()
 
 	// NOTE: we do not change original invite request
@@ -837,85 +871,77 @@ func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *medi
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	req.SetBody(sdp)
 
-	res, err := d.reInviteDo(ctx, req)
+	res, err := d.reInviteSend(ctx, req)
+	if res != nil && res.StatusCode == sip.StatusRequestPending {
+		return true, nil
+	}
 	if err != nil {
-		return err
+		d.mu.Lock()
+		derr := d.discardForkUnsafe(ms)
+		d.mu.Unlock()
+		return false, errors.Join(err, derr)
 	}
 
 	// Save new remote target contact and update media
 	err = func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
+		if d.DialogMedia.closed || d.Context().Err() != nil {
+			return errors.Join(errMediaClosed, d.discardForkUnsafe(ms))
+		}
 		d.remoteContactTarget = res.Contact()
 
 		remoteSDP := res.Body()
 		// The 200 OK answers the offer we sent on the re-INVITE.
 		ms.RemoteSDPIsAnswer = true
 		if err := ms.RemoteSDP(remoteSDP); err != nil {
-			return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+			return errors.Join(fmt.Errorf("sdp update media remote SDP applying failed: %w", err), d.discardForkUnsafe(ms))
 		}
 
 		// The answer completes a new DTLS association, whose handshake runs
 		// before ms carries any media.
 		if ms.FinalizePending() {
 			if err := d.finalizeAndReplaceUnsafe(d.Context(), ms); err != nil {
+				if errors.Is(err, errMediaClosed) {
+					return err
+				}
 				return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
 			}
 			return nil
 		}
-		return d.mediaUpdateUnsafe(ms)
+		if err := d.mediaUpdateUnsafe(ms); err != nil {
+			return errors.Join(err, d.discardForkUnsafe(ms))
+		}
+		return nil
 	}()
 	if errors.Is(err, errMediaUpdateAfterAnswer) {
-		return errors.Join(err, d.hangupNoMedia())
+		return false, errors.Join(err, d.hangupNoMedia())
 	}
-	return err
+	return false, err
 }
 
-func (d *DialogServerSession) reInviteDo(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-
-	for {
-		res, err := d.Do(ctx, req.Clone())
-		if err != nil {
-			return nil, err
-		}
-
-		if !res.IsSuccess() {
-			// https://datatracker.ietf.org/doc/html/rfc3261#section-14.1
-			// If a UAC receives a 491 response to a re-INVITE, it SHOULD start a
-			//    timer with a value T chosen as follows:
-			//       1. If the UAC is the owner of the Call-ID of the dialog ID
-			//          (meaning it generated the value), T has a randomly chosen value
-			//          between 2.1 and 4 seconds in units of 10 ms.
-
-			//       2. If the UAC is not the owner of the Call-ID of the dialog ID, T
-			//          has a randomly chosen value of between 0 and 2 seconds in units
-			//          of 10 ms.
-
-			if res.StatusCode == sip.StatusRequestPending {
-				select {
-				case <-time.After(time.Duration(2000+mrand.IntN(200)*10) * time.Millisecond):
-					continue
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-
-			return nil, sipgo.ErrDialogResponse{
-				Res: res,
-			}
-		}
-
-		// Now do ACK on new Contact
-		cont := res.Contact()
-		if cont == nil {
-			return res, fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
-		}
-		if err := d.ack(ctx, cont.Address, nil); err != nil {
-			return res, err
-		}
-
-		return res, nil
+// reInviteSend sends req, a re-INVITE, and acknowledges its 2xx. A final
+// response other than 2xx is returned with sipgo.ErrDialogResponse.
+func (d *DialogServerSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	res, err := d.Do(ctx, req.Clone())
+	if err != nil {
+		return nil, err
 	}
+	if !res.IsSuccess() {
+		return res, sipgo.ErrDialogResponse{
+			Res: res,
+		}
+	}
+
+	// Now do ACK on new Contact
+	cont := res.Contact()
+	if cont == nil {
+		return res, fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
+	}
+	if err := d.ack(ctx, cont.Address, nil); err != nil {
+		return res, err
+	}
+	return res, nil
 }
 
 func (d *DialogServerSession) ack(ctx context.Context, remoteTarget sip.Uri, body []byte) error {
@@ -1087,6 +1113,15 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return err
 	}
 
+	// RFC 3261 section 14.2: a re-INVITE arriving while one of ours is in
+	// progress is answered 491.
+	endUpdate, ok := d.beginPeerMediaUpdate()
+	if !ok {
+		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return err
+	}
+	defer endUpdate()
+
 	// RFC 4028: an inbound refresh re-INVITE resets the active timer. When the
 	// peer is the refresher its watchdog is rearmed. When we refresh, the loop's
 	// ticker self-rearms each tick, so no reset is needed. A plain media-update
@@ -1153,19 +1188,17 @@ func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTra
 }
 
 func (d *DialogServerSession) Hold(ctx context.Context) error {
-	m := d.MediaSession().Fork()
-	m.Mode = sdp.ModeSendonly
-	if err := d.reInviteMediaSession(ctx, m); err != nil {
-		return err
-	}
-	return nil
+	return d.reInviteMedia(ctx, func(cur *media.MediaSession) *media.MediaSession {
+		m := cur.Fork()
+		m.Mode = sdp.ModeSendonly
+		return m
+	})
 }
 
 func (d *DialogServerSession) Unhold(ctx context.Context) error {
-	m := d.MediaSession().Fork()
-	m.Mode = sdp.ModeSendrecv
-	if err := d.reInviteMediaSession(ctx, m); err != nil {
-		return err
-	}
-	return nil
+	return d.reInviteMedia(ctx, func(cur *media.MediaSession) *media.MediaSession {
+		m := cur.Fork()
+		m.Mode = sdp.ModeSendrecv
+		return m
+	})
 }

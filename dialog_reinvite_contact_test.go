@@ -93,8 +93,8 @@ func TestDialogServerReinviteContactMissing(t *testing.T) {
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		_, err = d.reInviteDo(ctx, req)
+		_, err = d.reInviteSend(ctx, req)
 	}()
-	require.Nil(t, recovered, "reInviteDo panicked")
+	require.Nil(t, recovered, "reInviteSend panicked")
 	require.ErrorIs(t, err, sipgo.ErrDialogInviteNoContact)
 }
