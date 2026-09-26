@@ -35,8 +35,11 @@ type ICEConfig struct {
 	// Example: []string{"stun:stun.l.google.com:19302"}
 	STUNServers []string
 
-	// Lite runs an ICE lite agent, which only answers connectivity checks and
-	// never initiates them. Suitable for an endpoint on a public address.
+	// Lite runs an ICE lite agent (RFC 8445 section 2.5), which gathers host
+	// candidates only, says so with a=ice-lite, and takes the controlled role
+	// against a full agent, answering its connectivity checks. Suitable for an
+	// endpoint on a public address. STUNServers must be empty, since a lite
+	// agent gathers no server reflexive candidates.
 	Lite bool
 
 	// NetworkTypes restricts candidate gathering. Defaults to udp4.
@@ -69,6 +72,9 @@ type ICEAgent struct {
 // NewICEAgent builds an agent and its local credentials. No socket is bound
 // and no candidate is gathered until Init.
 func NewICEAgent(config ICEConfig) (*ICEAgent, error) {
+	if config.Lite && len(config.STUNServers) > 0 {
+		return nil, fmt.Errorf("ice: a lite agent gathers host candidates only and uses no STUN servers")
+	}
 	if len(config.NetworkTypes) == 0 {
 		config.NetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4}
 	}
@@ -99,13 +105,21 @@ func (a *ICEAgent) Init(ctx context.Context, conn *net.UDPConn) error {
 	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: conn})
 	a.udpMux = mux
 
+	// A lite agent has host candidates only (RFC 8445 section 2.5). Without a
+	// list every type is gathered, which the ICE stack refuses for one.
+	var candidateTypes []ice.CandidateType
+	if a.config.Lite {
+		candidateTypes = []ice.CandidateType{ice.CandidateTypeHost}
+	}
+
 	agent, err := ice.NewAgent(&ice.AgentConfig{
-		NetworkTypes: a.config.NetworkTypes,
-		Urls:         iceSTUNURIs(a.config.STUNServers),
-		UDPMux:       mux,
-		Lite:         a.config.Lite,
-		LocalUfrag:   a.ufrag,
-		LocalPwd:     a.pwd,
+		NetworkTypes:   a.config.NetworkTypes,
+		CandidateTypes: candidateTypes,
+		Urls:           iceSTUNURIs(a.config.STUNServers),
+		UDPMux:         mux,
+		Lite:           a.config.Lite,
+		LocalUfrag:     a.ufrag,
+		LocalPwd:       a.pwd,
 	})
 	if err != nil {
 		_ = mux.Close()
@@ -202,8 +216,9 @@ func (a *ICEAgent) AddRemoteCandidate(candidate string) error {
 }
 
 // Connect runs connectivity checks and returns the selected pair connection
-// plus the remote address it settled on. The offerer is the controlling agent
-// per RFC 8445 section 6.1. It blocks until a pair is nominated or ctx is done.
+// plus the remote address it settled on. controlling is the role RFC 8445
+// section 6.1.1 gives this agent. It blocks until a pair is nominated or ctx is
+// done.
 func (a *ICEAgent) Connect(ctx context.Context, controlling bool) (*ice.Conn, *net.UDPAddr, error) {
 	if a.agent == nil {
 		return nil, nil, fmt.Errorf("ice: agent not initialized")

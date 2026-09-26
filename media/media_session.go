@@ -263,6 +263,9 @@ type MediaSession struct {
 	rtcpMux        bool
 	remoteICEUfrag string
 	remoteICEPwd   string
+	// remoteICELite is set when the peer's SDP carries a=ice-lite: it runs a
+	// lite agent, which decides the ICE roles (RFC 8445 section 6.1.1).
+	remoteICELite bool
 	// establishedICE describes the pair the agent nominated. Finalize sets it
 	// once SRTP is keyed over the pair and Fork shares it, because a fork has
 	// no agent: without this record a renegotiating fork has nothing to
@@ -1368,6 +1371,7 @@ func (s *MediaSession) agentICESetup() iceSetup {
 		pwd:        pwd,
 		candidates: attrs,
 		rtcpMux:    s.rtcpMux,
+		lite:       s.ICEConf.Lite,
 	}
 }
 
@@ -1385,11 +1389,16 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 	// listenICE has already set it for every ICE session, so it says nothing
 	// about what the remote agreed to.
 	remoteRTCPMux := false
+	remoteLite := false
 	var ufrag, pwd string
 	var candidates []string
 
 	for _, v := range attrs {
 		switch {
+		case v == "ice-lite":
+			// Session level only (RFC 8839 section 5.3), which is among the
+			// attributes RemoteSDP passes.
+			remoteLite = true
 		case strings.HasPrefix(v, "ice-ufrag:"):
 			ufrag = strings.TrimSpace(v[len("ice-ufrag:"):])
 		case strings.HasPrefix(v, "ice-pwd:"):
@@ -1415,6 +1424,7 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 	case s.iceAgent != nil:
 		s.remoteICEUfrag = ufrag
 		s.remoteICEPwd = pwd
+		s.remoteICELite = remoteLite
 		for _, c := range candidates {
 			if err := s.iceAgent.AddRemoteCandidate(c); err != nil {
 				// One malformed candidate must not fail the session: ICE can
@@ -1447,12 +1457,27 @@ func (s *MediaSession) remoteICE(attrs []string) error {
 	}
 }
 
+// iceControlling reports whether this agent takes the controlling role, by
+// RFC 8445 section 6.1.1: against a lite agent the full one controls, since a
+// lite agent never sends checks, and otherwise the offerer, the agent that
+// started ICE, does.
+//
+// Two lite agents send no checks by that section. The ICE stack runs them for
+// a lite agent that is controlling, which only a lite peer makes it, and the
+// lite peer answers them, so the pair is found all the same.
+func (s *MediaSession) iceControlling() bool {
+	if lite := s.ICEConf.Lite; lite != s.remoteICELite {
+		return !lite
+	}
+	return s.dtlsEndpointRole() == DTLSEndpointRoleOfferer
+}
+
 // startICE runs connectivity checks and installs the nominated pair as the
 // session transport.
 //
-// The offerer is the controlling agent (RFC 8445 section 6.1). Once a pair is
-// nominated, rtpConn and rtcpConn become views on the one ICE connection, so
-// the rest of MediaSession reads and writes over ICE without further changes.
+// The role is iceControlling's. Once a pair is nominated, rtpConn and rtcpConn
+// become views on the one ICE connection, so the rest of MediaSession reads
+// and writes over ICE without further changes.
 func (s *MediaSession) startICE(ctx context.Context) error {
 	// Only the session that created the agent can run checks. A fork reaching
 	// here would be a fault in RemoteSDP, which never arms Finalize for one, so
@@ -1464,8 +1489,7 @@ func (s *MediaSession) startICE(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, ICEConnectTimeout)
 	defer cancel()
 
-	controlling := s.dtlsEndpointRole() == DTLSEndpointRoleOfferer
-	conn, raddr, err := s.iceAgent.Connect(ctx, controlling)
+	conn, raddr, err := s.iceAgent.Connect(ctx, s.iceControlling())
 	if err != nil {
 		return err
 	}
@@ -2134,6 +2158,8 @@ type iceSetup struct {
 	// candidates are rendered a=candidate values, without the "a=" prefix
 	candidates []string
 	rtcpMux    bool
+	// lite marks a lite agent, which the SDP says with a=ice-lite.
+	lite bool
 }
 
 // establishedICE is what a session knows about the ICE pair its agent
@@ -2311,8 +2337,13 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 		// "b=AS:84",
 		fmt.Sprintf("c=IN %s %s", sdpIP(connectionIP), connectionIP),
 		"t=0 0",
-		fmt.Sprintf("m=audio %d %s %s", rtpPort, rtpProfile, strings.Join(fmts, " ")),
 	}
+	if iceSet != nil && iceSet.lite {
+		// Session level only (RFC 8839 section 5.3), and only from a lite
+		// agent (section 4.2.1.4).
+		s = append(s, "a=ice-lite")
+	}
+	s = append(s, fmt.Sprintf("m=audio %d %s %s", rtpPort, rtpProfile, strings.Join(fmts, " ")))
 
 	s = append(s, formatsMap...)
 	s = append(s,
