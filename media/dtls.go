@@ -61,9 +61,13 @@ type DTLSConfig struct {
 	// If used as client this would verify server certificate
 	ServerName string
 
-	// ServerClientAuth determines the server's policy for
-	// TLS Client Authentication. The default is ServerClientAuthNoCert.
-	// Check ServerClientAuth
+	// ServerClientAuth is the client certificate policy when this endpoint is
+	// the DTLS server. The server always requires the client's certificate,
+	// because it checks it against the peer's a=fingerprint (RFC 5763 section
+	// 5), so a policy that lets the client leave it out is raised to requiring
+	// one. That covers ServerClientAuthNoCert, the default, and
+	// ServerClientAuthRequireCert, which requests a certificate without
+	// requiring it. A stricter policy is kept.
 	ServerClientAuth int
 
 	// SRTPProfiles to use in exchange. Check constant vars with media.SRTPProfile...
@@ -102,10 +106,7 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []sdpFingerprints) *dtls.Config {
 		// 	tls.ECDSAWithP256AndSHA256
 		// },
 
-		// If you're acting as the server
-		// We are verifying Connection fingerprints so we require client cert
-		// use dtls.NoClientCert without verfication
-		ClientAuth:           dtls.ClientAuthType(conf.ServerClientAuth),
+		ClientAuth:           conf.clientAuth(),
 		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
 
 		InsecureSkipVerify: conf.ServerName == "", // Accept self-signed certs (for dev)
@@ -140,6 +141,18 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []sdpFingerprints) *dtls.Config {
 		config.LoggerFactory = loggerFactory
 	}
 	return config
+}
+
+// clientAuth is the policy the DTLS server applies to the client certificate.
+// The peer is checked against its SDP fingerprints, which needs its
+// certificate, so the policy requires one at least. A server that sends no
+// CertificateRequest receives no certificate and fails every handshake.
+func (conf *DTLSConfig) clientAuth() dtls.ClientAuthType {
+	auth := dtls.ClientAuthType(conf.ServerClientAuth)
+	if auth < dtls.RequireAnyClientCert {
+		return dtls.RequireAnyClientCert
+	}
+	return auth
 }
 
 // dtlsKeyExchangeConn lends the media socket to the DTLS stack.

@@ -507,3 +507,94 @@ func TestDTLSLibConfAlwaysChecksFingerprint(t *testing.T) {
 	state := &dtls.State{PeerCertificates: testdata.ClientCertificate().Certificate}
 	assert.Error(t, libConf.VerifyConnection(state))
 }
+
+// TestDTLSDefaultConfigOffererCompletesHandshake negotiates DTLS-SRTP between two
+// sessions configured with nothing but a certificate, the way a dialog builds
+// them. The offerer advertises actpass and the answerer takes active, as RFC
+// 5763 section 5 recommends, so the offerer is the DTLS server. It checks the
+// client's certificate against the answer's a=fingerprint, so it has to ask the
+// client for one: a server that never sends a CertificateRequest gets no
+// certificate and fails every handshake.
+func TestDTLSDefaultConfigOffererCompletesHandshake(t *testing.T) {
+	newSess := func(cert tls.Certificate) *MediaSession {
+		t.Helper()
+		s := &MediaSession{
+			Codecs:    []Codec{CodecAudioUlaw},
+			Mode:      sdp.ModeSendrecv,
+			SecureRTP: SecureRTPModeDTLS,
+			DTLSConf:  DTLSConfig{Certificates: []tls.Certificate{cert}},
+		}
+		s.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+		require.NoError(t, s.Init())
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+
+	offerer := newSess(testdata.ClientCertificate())
+	answerer := newSess(testdata.ServerCertificate())
+
+	offer := offerer.LocalSDP()
+	require.Contains(t, string(offer), "a=setup:actpass")
+	require.NoError(t, answerer.RemoteSDP(offer))
+	answer := answerer.LocalSDP()
+	require.Contains(t, string(answer), "a=setup:active")
+	// As applyRemoteSDP does for the answer to our own INVITE.
+	offerer.RemoteSDPIsAnswer = true
+	require.NoError(t, offerer.RemoteSDP(answer))
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- answerer.Finalize() }()
+	go func() { errCh <- offerer.Finalize() }()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "DTLS negotiation failed")
+		case <-time.After(20 * time.Second):
+			t.Fatal("DTLS negotiation did not complete")
+		}
+	}
+
+	payload := []byte{0xd5, 0xd5, 0xd5, 0xd5}
+	pkt := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    CodecAudioUlaw.PayloadType,
+			SequenceNumber: 1,
+			Timestamp:      160,
+			SSRC:           0xdeadbeef,
+		},
+		Payload: payload,
+	}
+	require.NoError(t, offerer.WriteRTP(pkt))
+	require.NoError(t, answerer.rtpConn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	got := rtp.Packet{}
+	_, err := answerer.ReadRTP(make([]byte, RTPBufSize), &got)
+	require.NoError(t, err, "media must arrive and decrypt")
+	assert.Equal(t, payload, got.Payload)
+}
+
+// TestDTLSLibConfRequiresClientCertificate pins what ServerClientAuth means for a
+// session checking the peer against its SDP fingerprints: the server always
+// requires the client's certificate, since without one there is nothing to
+// check, and a stricter policy is kept.
+func TestDTLSLibConfRequiresClientCertificate(t *testing.T) {
+	tests := []struct {
+		name string
+		auth int
+		want dtls.ClientAuthType
+	}{
+		{name: "default", auth: 0, want: dtls.RequireAnyClientCert},
+		{name: "no cert", auth: ServerClientAuthNoCert, want: dtls.RequireAnyClientCert},
+		{name: "require cert", auth: ServerClientAuthRequireCert, want: dtls.RequireAnyClientCert},
+		{name: "stricter", auth: int(dtls.RequireAndVerifyClientCert), want: dtls.RequireAndVerifyClientCert},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := DTLSConfig{
+				Certificates:     []tls.Certificate{testdata.ServerCertificate()},
+				ServerClientAuth: tc.auth,
+			}
+			assert.Equal(t, tc.want, conf.ToLibConf(nil).ClientAuth)
+		})
+	}
+}
