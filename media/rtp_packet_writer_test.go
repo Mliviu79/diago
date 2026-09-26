@@ -5,12 +5,15 @@ package media
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/fakes"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -188,4 +191,76 @@ func requireDisableEndsWrite(t *testing.T, w *RTPPacketWriter) {
 
 	w.ClockDisable()
 	requireRTPWriterWriteReturns(t, result)
+}
+
+// seqRecordingRTPWriter records the sequence number of every packet written.
+type seqRecordingRTPWriter struct {
+	mu   sync.Mutex
+	seqs []uint16
+}
+
+func (w *seqRecordingRTPWriter) WriteRTP(p *rtp.Packet) error {
+	w.mu.Lock()
+	w.seqs = append(w.seqs, p.SequenceNumber)
+	w.mu.Unlock()
+	return nil
+}
+
+// TestRTPPacketWriterOverlappingPlaybacks is two playbacks on one dialog that
+// overlap: each resets the timestamp when it starts, as PlaybackCreate's
+// onPlay does, and writes its frames, while the other writes. Write recorded
+// the time of its last frame without the lock ResetTimestamp reads it under,
+// and wrote the packet under a read lock that two writers share, so -race
+// reported both. Every packet must also get a sequence number of its own.
+func TestRTPPacketWriterOverlappingPlaybacks(t *testing.T) {
+	for _, clock := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clock=%t", clock), func(t *testing.T) {
+			rec := &seqRecordingRTPWriter{}
+			codec := CodecAudioUlaw
+			codec.SampleDur = time.Millisecond
+			w := NewRTPPacketWriter(rec, codec)
+			if !clock {
+				w.ClockDisable()
+			}
+			t.Cleanup(w.ClockDisable)
+
+			const playbacks, frames = 2, 50
+			var wg sync.WaitGroup
+			errs := make(chan error, playbacks)
+			for i := 0; i < playbacks; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					w.ResetTimestamp()
+					payload := make([]byte, 160)
+					for j := 0; j < frames; j++ {
+						if _, err := w.Write(payload); err != nil {
+							errs <- err
+							return
+						}
+					}
+				}()
+			}
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the playbacks did not finish")
+			}
+			close(errs)
+			for err := range errs {
+				require.NoError(t, err)
+			}
+
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			require.Len(t, rec.seqs, playbacks*frames)
+			seen := make(map[uint16]bool, len(rec.seqs))
+			for _, seq := range rec.seqs {
+				require.False(t, seen[seq], "sequence number %d was written twice", seq)
+				seen[seq] = true
+			}
+		})
+	}
 }

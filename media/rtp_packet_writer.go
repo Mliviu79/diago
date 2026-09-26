@@ -136,7 +136,8 @@ func (w *RTPPacketWriter) ClockEnable() {
 }
 
 // ResetTimestamp can mark new stream comming. If stream is continuous it will add timestamp difference
-// MUST Not be called during stream Write
+// It is safe to call while another stream writes, as a playback starting on a
+// dialog another one plays on does.
 func (p *RTPPacketWriter) ResetTimestamp() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -169,30 +170,35 @@ func (p *RTPPacketWriter) DelayTimestamp(ofsset uint32) {
 // Write implements io.Writer and does payload RTP packetization
 // Media clock rate is determined
 // For more control or dynamic payload WriteSamples can be used
-// It is not thread safe and order of payload frames is required
+// Order of payload frames is required. Writes from several goroutines are
+// packetized one at a time, each packet with a sequence number of its own, and
+// interleave on the wire.
 func (p *RTPPacketWriter) Write(b []byte) (int, error) {
-	p.mu.RLock()
+	p.mu.Lock()
 	n, err := p.writeSamplesUnsafe(p.writer, b, p.sampleRateTimestamp, p.nextTimestamp == p.initTimestamp, p.codec.PayloadType)
 	ticker, stopped := p.clockTicker, p.clockStopped
-	p.mu.RUnlock()
-	if ticker == nil {
-		p.lastSampleTime = time.Now()
-		return n, err
+	p.mu.Unlock()
+
+	sampleTime := time.Now()
+	if ticker != nil {
+		select {
+		case sampleTime = <-ticker.C:
+		case <-stopped:
+			sampleTime = time.Now()
+		}
 	}
-	select {
-	case p.lastSampleTime = <-ticker.C:
-	case <-stopped:
-		p.lastSampleTime = time.Now()
-	}
+	p.mu.Lock()
+	p.lastSampleTime = sampleTime
+	p.mu.Unlock()
 	return n, err
 }
 
 // WriteSamples allows to skip default packet rate.
 // This is useful if you need to write different payload but keeping same SSRC
 func (p *RTPPacketWriter) WriteSamples(payload []byte, sampleRateTimestamp uint32, marker bool, payloadType uint8) (int, error) {
-	p.mu.RLock()
+	p.mu.Lock()
 	n, err := p.writeSamplesUnsafe(p.writer, payload, sampleRateTimestamp, marker, payloadType)
-	p.mu.RUnlock()
+	p.mu.Unlock()
 	return n, err
 }
 
@@ -236,7 +242,8 @@ func (w *RTPPacketWriter) UpdateRTPSession(rtpSess *RTPSession) {
 	w.codec = codec
 	w.writer = rtpSess
 
-	// In case of codec cha
+	// The new session may run another codec, whose timestamp step and sample
+	// duration the clock takes.
 	w.clockReset()
 	// rtpSess.writeStats.SSRC = w.SSRC
 	// rtpSess.writeStats.sampleRate = w.sampleRate
