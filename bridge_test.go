@@ -210,6 +210,52 @@ func TestIntegrationBridging(t *testing.T) {
 	}
 }
 
+// TestBridgeMixStopKeepsStoppingState checks that a mix loop stopped by
+// mixStopWait leaves the bridge in the stopping state until the stopping caller
+// has resumed. A caller that found the bridge idle earlier would start a mix and
+// add to mixWG while the stopping caller is still waiting on it.
+func TestBridgeMixStopKeepsStoppingState(t *testing.T) {
+	t.Run("StoppedLoop", func(t *testing.T) {
+		b := NewBridgeMix()
+		// A mix loop is running
+		b.mu.Lock()
+		b.mixWG.Add(1)
+		b.stateWriteUnsafe(1)
+		b.mu.Unlock()
+
+		stopped := make(chan error, 1)
+		go func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			stopped <- b.mixStopWait()
+		}()
+		require.Eventually(t, func() bool { return b.stateRead() == 2 }, time.Second, time.Millisecond)
+
+		// The loop exits while the stopping caller is still waiting on mixWG
+		b.mixEnded()
+		assert.Equal(t, 2, b.stateRead(), "bridge must stay stopping until the stopping caller resumes")
+
+		b.mixWG.Done()
+		select {
+		case err := <-stopped:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			t.Fatal("mixStopWait did not return after the loop exited")
+		}
+		assert.Equal(t, 0, b.stateRead())
+	})
+
+	t.Run("LoopEndedOnItsOwn", func(t *testing.T) {
+		b := NewBridgeMix()
+		b.mu.Lock()
+		b.stateWriteUnsafe(1)
+		b.mu.Unlock()
+
+		b.mixEnded()
+		assert.Equal(t, 0, b.stateRead())
+	})
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())

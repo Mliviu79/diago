@@ -390,10 +390,16 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 	return b.mixStart()
 }
 
-func (b *BridgeMix) stateWrite(s int) {
+// mixEnded runs when a mix loop exits. A loop that ended on its own goes from
+// running to idle. A loop stopped by mixStopWait stays in the stopping state,
+// which the stopping caller clears once mixWG has drained, so no other caller
+// starts a mix and adds to mixWG while that caller is still waiting.
+func (b *BridgeMix) mixEnded() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stateWriteUnsafe(s)
+	if b.mixState == 1 {
+		b.stateWriteUnsafe(0)
+	}
 }
 
 func (b *BridgeMix) stateWriteUnsafe(s int) {
@@ -409,14 +415,16 @@ func (b *BridgeMix) stateRead() int {
 func (b *BridgeMix) mixStopWait() error {
 	// DO NOT CALL THIS INSIDE LOOP of b.dialogs. This Unlocks
 	stopInProgress, err := b.mixStop()
-	if err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
-	}
-
 	if stopInProgress {
+		// This caller set the stopping state, so it clears it once the stopped
+		// mix has drained, even when stopping reported an error.
 		b.mu.Unlock()
 		b.mixWG.Wait()
 		b.mu.Lock()
+		b.stateWriteUnsafe(0)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to stop current mixing: %w", err)
 	}
 	// Enable RTP again
 	var allErros error
@@ -480,7 +488,7 @@ func (b *BridgeMix) mixStart() error {
 	go func(rwStreams []*bridgePCMStream) {
 		defer cancelPoll()
 		defer b.mixWG.Done()
-		defer b.stateWrite(0)
+		defer b.mixEnded()
 		b.log.Debug("Starting mix loop", "streams.len", len(rwStreams))
 		if err := b.mixLoop(rwStreams, poll); err != nil {
 			b.log.Info("Mix stopped with error", "error", err)
