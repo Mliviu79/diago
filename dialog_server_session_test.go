@@ -118,6 +118,9 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The calling side logs from its own goroutine once the hangup ends its
+	// dialog, so the test waits for that before it returns.
+	dialogDone := make(chan struct{})
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
 		defer ua.Close()
@@ -135,6 +138,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		require.NoError(t, err)
 
 		go func() {
+			defer close(dialogDone)
 			dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{})
 			require.NoError(t, err)
 			<-dialog.Context().Done()
@@ -168,6 +172,11 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	require.NoError(t, err)
 
 	d.Hangup(context.TODO())
+	select {
+	case <-dialogDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("calling side dialog did not end after hangup")
+	}
 }
 
 func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
