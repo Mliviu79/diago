@@ -442,9 +442,10 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 // without CSeq never reaches the handler: the transaction layer answers it
 // before any handler runs, with a reason phrase sipgo chooses and its own tests
 // pin, so that row asserts the status only. The control row is a complete
-// INVITE for a dialog that does not exist, which is answered 481 as before.
-// Each row gets its own Diago so the handler runs and the logged warnings
-// belong to that row alone.
+// INVITE for a dialog that does not exist: the handler runs once and answers
+// it 481 (RFC 3261 section 12.2.2) without logging a warning. Each row gets
+// its own Diago so the handler runs and the logged warnings belong to that row
+// alone.
 func TestDiagoNewInviteMissingHeader(t *testing.T) {
 	tests := []struct {
 		name       string
