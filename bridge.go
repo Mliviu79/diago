@@ -791,8 +791,10 @@ type bridgePCMStream struct {
 func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mixCodec media.Codec) error {
 	m := d.Media()
 
+	// The reader, the writer and their codec are read together, so a re-INVITE
+	// can not give the stream's decoder and encoder different codecs.
 	p := MediaProps{}
-	r, err := m.AudioReader(WithAudioReaderMediaProps(&p))
+	r, w, err := m.audioReaderWriterProps(&p)
 	if err != nil {
 		return err
 	}
@@ -810,19 +812,12 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mi
 	}
 
 	// Attach PCM decoder
-	readCodec := p.Codec
 	pcmReader := audio.PCMDecoderReader{}
-	if err := pcmReader.Init(readCodec, rtr); err != nil {
+	if err := pcmReader.Init(p.Codec, rtr); err != nil {
 		return err
 	}
 
 	// Now do write stream
-	p = MediaProps{}
-	w, err := m.AudioWriter(WithAudioWriterMediaProps(&p))
-	if err != nil {
-		return err
-	}
-
 	pcmWriter := audio.PCMEncoderWriter{}
 	if err := pcmWriter.Init(p.Codec, w); err != nil {
 		return err
@@ -831,7 +826,7 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mi
 	*stream = bridgePCMStream{
 		r:         &pcmReader,
 		w:         &pcmWriter,
-		codec:     readCodec,
+		codec:     p.Codec,
 		media:     m,
 		id:        m.RTPPacketWriter.SSRC,
 		buf:       make([]byte, media.RTPBufSize),

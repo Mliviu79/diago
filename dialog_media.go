@@ -1572,6 +1572,19 @@ func (d *DialogMedia) audioWriterProps(p *MediaProps) io.Writer {
 	return d.getAudioWriter()
 }
 
+// audioReaderWriterProps returns the dialog's audio reader and writer, and in p
+// the props of the media session they run on, read in one hold of the lock, so
+// a re-INVITE can not give the reader and the writer different codecs.
+func (d *DialogMedia) audioReaderWriterProps(p *MediaProps) (io.Reader, io.Writer, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := WithAudioReaderMediaProps(p)(d); err != nil {
+		return nil, nil, err
+	}
+	return d.getAudioReader(), d.getAudioWriter(), nil
+}
+
 // SetAudioWriter adds/changes audio reader.
 // Use this when you want to have pipelines of your audio
 func (d *DialogMedia) SetAudioWriter(r io.Writer) {

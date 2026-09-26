@@ -1405,6 +1405,69 @@ func TestBridgeMixFollowsCodecChange(t *testing.T) {
 	waitHeard(t, movedHeard, alawFrame[0])
 }
 
+// TestBridgeMixStreamTakesOneCodec checks that a mix stream decodes its dialog
+// and encodes to it with one codec, read in one go. A re-INVITE that lands
+// between reading the codec for the stream's decoder and reading it for its
+// encoder otherwise leaves the stream decoding the dialog in one codec and
+// encoding to it in another. The window is short, so the stream is set up
+// many times while re-INVITEs move the dialog between PCMU and PCMA.
+func TestBridgeMixStreamTakesOneCodec(t *testing.T) {
+	b := NewBridgeMix()
+	b.RealtimeReader = false
+	d := newBridgeTestDialog(t, "d", media.CodecAudioUlaw)
+
+	reinviting := make(chan struct{})
+	reinvited := make(chan struct{})
+	go func() {
+		defer close(reinvited)
+		for i := 0; ; i++ {
+			select {
+			case <-reinviting:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				d.renegotiate(media.CodecAudioAlaw)
+			} else {
+				d.renegotiate(media.CodecAudioUlaw)
+			}
+		}
+	}()
+	defer func() {
+		close(reinviting)
+		select {
+		case <-reinvited:
+		case <-time.After(5 * time.Second):
+			t.Error("the re-INVITEs did not stop")
+		}
+	}()
+
+	// A frame decoded and encoded again in one G.711 codec comes back as it
+	// was, and in two it does not
+	frame := bytes.Repeat([]byte{0x55}, 160)
+	const joins = 2000
+	mixed := 0
+	for range joins {
+		heard := newBridgeTestWriter()
+		d.media.mu.Lock()
+		d.media.audioReader = bytes.NewReader(frame)
+		d.media.audioWriter = heard
+		d.media.mu.Unlock()
+
+		stream := bridgePCMStream{}
+		require.NoError(t, b.addDialogStream(d, &stream, media.CodecAudioUlaw))
+		pcm := make([]byte, media.RTPBufSize)
+		n, err := stream.r.Read(pcm)
+		require.NoError(t, err)
+		_, err = stream.w.Write(pcm[:n])
+		require.NoError(t, err)
+		if !bytes.Equal(frame, <-heard.frames) {
+			mixed++
+		}
+	}
+	assert.Zero(t, mixed, "%d of %d streams decode and encode their dialog in two codecs", mixed, joins)
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())
