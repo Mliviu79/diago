@@ -339,3 +339,41 @@ func TestSDPSetupRoleOverrideStillWins(t *testing.T) {
 		t.Error("override says passive but the session acts as client; the override must govern both")
 	}
 }
+
+// TestSDPSetupRoleIsToldWhetherWeOffer pins what the SDPSetupRole override is
+// passed: whether this endpoint is the offerer of the exchange, decided as the
+// derivation without the override decides it. A known remote address says
+// nothing about that, since an offerer knows whom it is calling and an offerer
+// reading the answer knows the answerer's address too.
+func TestSDPSetupRoleIsToldWhetherWeOffer(t *testing.T) {
+	raddr := net.UDPAddr{IP: net.ParseIP("194.102.34.49"), Port: 19132}
+	tests := []struct {
+		name string
+		s    *MediaSession
+		want bool
+	}{
+		{name: "making an offer", s: &MediaSession{}, want: true},
+		{name: "making an offer to a known address", s: &MediaSession{Raddr: raddr}, want: true},
+		{name: "answering an offer", s: &MediaSession{remoteProto: "UDP/TLS/RTP/SAVP", Raddr: raddr}, want: false},
+		{name: "reading the answer to our offer", s: &MediaSession{remoteProto: "UDP/TLS/RTP/SAVP", RemoteSDPIsAnswer: true, Raddr: raddr}, want: true},
+		{name: "explicit answerer", s: &MediaSession{DTLSRole: DTLSEndpointRoleAnswerer}, want: false},
+		{name: "explicit offerer", s: &MediaSession{DTLSRole: DTLSEndpointRoleOfferer, remoteProto: "UDP/TLS/RTP/SAVP", Raddr: raddr}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			tt.s.SecureRTP = SecureRTPModeDTLS
+			tt.s.DTLSConf.SDPSetupRole = func(offer bool) string {
+				called = true
+				if offer != tt.want {
+					t.Errorf("SDPSetupRole(offer=%t), want offer=%t", offer, tt.want)
+				}
+				return "actpass"
+			}
+			tt.s.localDTLSSetup()
+			if !called {
+				t.Fatal("SDPSetupRole was not consulted")
+			}
+		})
+	}
+}

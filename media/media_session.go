@@ -314,9 +314,18 @@ const (
 // ClientHello, and the peer failed the handshake with UnexpectedMessage having
 // expected a ServerHello to its own.
 func (s *MediaSession) localDTLSSetup() string {
+	// Which of offerer and answerer we are comes from whether an offer was
+	// applied, never from whether the remote address is known. Knowing the
+	// address means we dialled someone -- an offerer knows exactly who it is
+	// calling -- so it cannot be read as "we are answering".
+	answering := s.answeringOffer()
+	if s.DTLSRole != DTLSEndpointRoleUnknown {
+		answering = s.DTLSRole == DTLSEndpointRoleAnswerer
+	}
+
 	// An explicit override wins: the caller has said what it wants to be.
 	if s.DTLSConf.SDPSetupRole != nil {
-		return s.DTLSConf.SDPSetupRole(s.Raddr.IP != nil)
+		return s.DTLSConf.SDPSetupRole(!answering)
 	}
 
 	switch strings.ToLower(strings.TrimSpace(s.dtlsRemoteSetup)) {
@@ -336,16 +345,6 @@ func (s *MediaSession) localDTLSSetup() string {
 
 	// No remote a=setup to be complementary to: either we are making the offer, or
 	// the offer we are answering carried no a=setup at all.
-	//
-	// Which of those it is comes from whether an offer was applied, never from
-	// whether the remote address is known. Knowing the address means we dialled
-	// someone -- an offerer knows exactly who it is calling -- so reading it as
-	// "we are answering" is precisely the inference that produced a passive
-	// answer to an actpass offer.
-	answering := s.answeringOffer()
-	if s.DTLSRole != DTLSEndpointRoleUnknown {
-		answering = s.DTLSRole == DTLSEndpointRoleAnswerer
-	}
 	if answering {
 		// RFC 4145 section 4.1 makes actpass the default when the attribute is
 		// absent, so answer as though the offer had carried it.

@@ -73,9 +73,14 @@ type DTLSConfig struct {
 	// SRTPProfiles to use in exchange. Check constant vars with media.SRTPProfile...
 	SRTPProfiles []uint16
 
-	// SDP Setup Role force value.
+	// SDPSetupRole overrides the a=setup value this endpoint advertises, and
+	// with it the DTLS role it plays: active is the client, passive the server
+	// (RFC 5763 section 5). offer reports whether this endpoint is the offerer
+	// of the exchange, as MediaSession.DTLSRole or the SDP applied so far says.
 	// Values: active,passive,actpass
-	// Default: offer->active answer->passive
+	// Default: an offerer advertises actpass. An answerer takes the role
+	// complementary to the offer's a=setup, and active against actpass or an
+	// offer without one.
 	SDPSetupRole func(offer bool) string `json:"-"`
 
 	// List of Elliptic Curves to use
