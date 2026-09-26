@@ -67,7 +67,10 @@ type RTPSession struct {
 	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
 	sourceLock        bool
 	sourceLockPackets int
-	sourceLockAddr    *net.UDPAddr
+	// sourceLockSeq is the sequence number of the last packet counted while
+	// the source is learned.
+	sourceLockSeq  uint16
+	sourceLockAddr *net.UDPAddr
 }
 
 // Some of fields here are exported (as readonly) intentionally
@@ -175,10 +178,17 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 	fork.onReadRTCP = s.onReadRTCP
 	fork.onWriteRTCP = s.onWriteRTCP
 	fork.sourceLock = s.sourceLock
-	fork.sourceLockPackets = s.sourceLockPackets
-	if s.sourceLockAddr != nil {
-		addr := *s.sourceLockAddr
-		fork.sourceLockAddr = &addr
+	// The learned source belongs to one peer on one socket. A fork toward
+	// another address, or on a new socket, learns its source again: the peer
+	// it now talks to sends from somewhere else, and the old lock would refuse
+	// all of it.
+	if udpAddrEqual(s.Sess.Laddr, sess.Laddr) && udpAddrEqual(s.Sess.Raddr, sess.Raddr) {
+		fork.sourceLockPackets = s.sourceLockPackets
+		fork.sourceLockSeq = s.sourceLockSeq
+		if s.sourceLockAddr != nil {
+			addr := *s.sourceLockAddr
+			fork.sourceLockAddr = &addr
+		}
 	}
 
 	oldCodec := CodecAudioFromSession(s.Sess)
@@ -194,6 +204,10 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 	}
 
 	return fork
+}
+
+func udpAddrEqual(a, b net.UDPAddr) bool {
+	return a.IP.Equal(b.IP) && a.Port == b.Port && a.Zone == b.Zone
 }
 
 func (s *RTPSession) close(wait bool) error {
@@ -378,13 +392,14 @@ func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
 		return s.sourceLockAddr.IP.Equal(fromAddr.IP) && s.sourceLockAddr.Port == fromAddr.Port && s.sourceLockAddr.Zone == fromAddr.Zone
 	}
 
-	if s.readStats.lastSeq.seqNum+1 != pkt.SequenceNumber {
-		if s.readStats.lastSeq.seqNum != 0 {
-			// if not first packet then reset
-			s.sourceLockPackets = 0
-			return false
-		}
+	// The packets counted must be in sequence with each other. They are
+	// compared with the last one counted rather than with the read statistics,
+	// which a fork carries over from the stream of its previous peer and which
+	// no packet refused here moves on.
+	if s.sourceLockPackets > 0 && s.sourceLockSeq+1 != pkt.SequenceNumber {
+		s.sourceLockPackets = 0
 	}
+	s.sourceLockSeq = pkt.SequenceNumber
 
 	// We wait couple packets before considering this is right source
 	s.sourceLockPackets++
