@@ -217,6 +217,26 @@ func TestDiagoNewDialog(t *testing.T) {
 		// assert.NotEmpty(t, dialog.ID)
 	})
 
+	t.Run("StoredBeforeAck", func(t *testing.T) {
+		// The peer may send an in-dialog request the moment our ACK reaches
+		// it, before the ACK write has returned here, so the dialog has to be
+		// found from its 2xx on. Closing it removes it again.
+		dialog, err := dg.NewDialog(sip.Uri{User: "alice", Host: "localhost"}, NewDialogOptions{})
+		require.NoError(t, err)
+		defer dialog.Close()
+
+		err = dialog.Invite(ctx, InviteClientOptions{})
+		require.NoError(t, err)
+
+		stored, err := dg.cache.client.DialogLoad(ctx, dialog.ID)
+		require.NoError(t, err)
+		assert.Same(t, dialog, stored)
+
+		require.NoError(t, dialog.Close())
+		_, err = dg.cache.client.DialogLoad(ctx, dialog.ID)
+		assert.ErrorIs(t, err, sipgo.ErrDialogDoesNotExists)
+	})
+
 	// _, err := dg.Invite(context.Background(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
 	// if assert.Error(t, err) {
 	// 	assert.Equal(t, "no SDP in response", err.Error())

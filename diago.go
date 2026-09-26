@@ -838,13 +838,16 @@ func (dg *Diago) newSipDialog(recipient sip.Uri, tran *Transport, opts NewDialog
 
 	d.mediaConfig = dg.mediaConfForTransport(tran)
 
-	// This should be run on ACK
+	// The dialog exists from its 2xx (RFC 3261 section 12.1.2), so it is
+	// stored then, before the ACK goes out. The peer may send an in-dialog
+	// request as soon as the ACK reaches it, and sipgo confirms the dialog only
+	// after the ACK is written, so storing on confirmation answered such a
+	// request 481.
 	d.OnState(func(s sip.DialogState) {
-		if s != sip.DialogStateConfirmed {
+		if s != sip.DialogStateEstablished {
 			return
 		}
 
-		// Now dialog is established and can be add into store
 		if err := dg.cache.client.DialogStore(context.Background(), d.ID, d); err != nil {
 			dg.log.Error("Failed to store in dialog cache", "error", err)
 		}
