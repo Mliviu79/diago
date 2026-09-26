@@ -686,7 +686,8 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 		}
 	}
 
-	return d.mediaSession.Finalize()
+	// Another in-dialog offer can swap the session under the lock meanwhile.
+	return d.MediaSession().Finalize()
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {
