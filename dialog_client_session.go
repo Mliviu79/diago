@@ -32,6 +32,11 @@ type DialogClientSession struct {
 	onReferDialog OnReferDialogFunc
 	mediaConfig   MediaConfig
 
+	// acking is set by Ack before it sends the ACK, and closed when Ack
+	// returns: once the media it finalizes is keyed, or has failed. awaitAck
+	// waits on it. Guarded by d.mu.
+	acking chan struct{}
+
 	closed atomic.Uint32
 }
 
@@ -402,7 +407,13 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 	// The session is taken under the lock before the ACK goes out. Once it is
 	// out the peer may re-INVITE, and handling that swaps in a fork of this
 	// session concurrently. The fork has nothing to finalize; this one does.
-	msess := d.MediaSession()
+	// Such a re-INVITE waits for Ack to return, see awaitAck.
+	d.mu.Lock()
+	msess := d.mediaSession
+	acking := make(chan struct{})
+	d.acking = acking
+	d.mu.Unlock()
+	defer close(acking)
 
 	if err := d.ack(ctx, recipient, nil); err != nil {
 		return err
@@ -711,7 +722,40 @@ func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return d.terminatePeerReInviteLocked()
 }
 
+// awaitAck waits until Ack has returned before a re-INVITE of the peer's is
+// handled, and reports whether it has. The peer may re-INVITE as soon as our
+// ACK reaches it, while Ack still runs the DTLS handshake of the media the
+// ACK started. A fork made then has no association to continue and would arm
+// a second handshake on the socket the first one runs on; once Ack has
+// returned, the fork continues the association Ack keyed. The wait ends with
+// tx, or after two T1 intervals, which covers the handshake's last flight; RFC
+// 5407 section 3.1.4 lets a re-INVITE crossing the ACK be answered 491, which
+// asks the peer to retry.
+func (d *DialogClientSession) awaitAck(tx sip.ServerTransaction) bool {
+	d.mu.Lock()
+	acking := d.acking
+	d.mu.Unlock()
+	if acking == nil {
+		return true
+	}
+
+	timer := time.NewTimer(2 * sip.T1)
+	defer timer.Stop()
+	select {
+	case <-acking:
+		return true
+	case <-tx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
 func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
+	if !d.awaitAck(tx) {
+		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+	}
+
 	d.requestMu.Lock()
 	defer d.requestMu.Unlock()
 

@@ -637,6 +637,151 @@ func TestDialogByeBeforeNewAssociationAnswer(t *testing.T) {
 	requirePortReleased(t, msess.LocalSDP())
 }
 
+// newAckingDTLSClientDialog places a DTLS-SRTP call without ICE from a dialog
+// whose client answers the INVITE with the answer of peer, and starts its Ack.
+// The ACK reaches nobody, so Ack runs the handshake until peer takes part in
+// it. It returns once the ACK is out, with the result of Ack to come; the test
+// ends Ack and waits for it when it ends.
+func newAckingDTLSClientDialog(t *testing.T) (*DialogClientSession, *media.MediaSession, <-chan error) {
+	t.Helper()
+	peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+	var peerErr error
+	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+		if req.IsInvite() {
+			peerErr = peer.RemoteSDP(req.Body())
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.SetBody(peer.LocalSDP())
+		}
+		return res
+	},
+		WithTransport(Transport{
+			Transport: "udp",
+			BindHost:  "127.0.0.1",
+			MediaSRTP: media.SecureRTPModeDTLS,
+			MediaDTLSConf: media.DTLSConfig{
+				Certificates: []tls.Certificate{testdata.ClientCertificate()},
+			},
+		}),
+		WithMediaConfig(MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
+	require.NoError(t, err)
+	require.NoError(t, d.Invite(ctx, InviteClientOptions{}))
+	require.NoError(t, peerErr)
+
+	confirmed := make(chan struct{})
+	var once sync.Once
+	d.OnState(func(s sip.DialogState) {
+		if s == sip.DialogStateConfirmed {
+			once.Do(func() { close(confirmed) })
+		}
+	})
+	acked := make(chan error, 1)
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		acked <- d.Ack(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-ackDone:
+		case <-time.After(10 * time.Second):
+			t.Error("Ack did not return")
+		}
+		_ = d.Close()
+	})
+	select {
+	case <-confirmed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ACK was not sent")
+	}
+	return d, peer, acked
+}
+
+// TestDialogClientReInviteDuringAckHandshake is a re-INVITE the peer sends once
+// our ACK reached it, while our Ack still runs the DTLS handshake of the call.
+// A fork of the session made then has no association to continue, and would
+// arm a second handshake on the socket the first one runs on. The re-INVITE is
+// handled once Ack has returned, and continues the association Ack keyed. When
+// Ack does not return in time the re-INVITE is answered 491, which asks the
+// peer to retry (RFC 5407 section 3.1.4).
+func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
+	t.Run("keyed meanwhile", func(t *testing.T) {
+		d, peer, acked := newAckingDTLSClientDialog(t)
+		offer := peer.Fork().LocalSDP()
+		req := newPeerReInvite(d, 2)
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(offer)
+
+		tx := newRespondedServerTx()
+		handled := make(chan error, 1)
+		go func() { handled <- d.handleReInvite(req, tx) }()
+		peerDone := make(chan error, 1)
+		go func() { peerDone <- peer.Finalize() }()
+
+		select {
+		case err := <-acked:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("Ack did not return")
+		}
+		select {
+		case err := <-peerDone:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the peer's handshake did not return")
+		}
+
+		var res *sip.Response
+		select {
+		case res = <-tx.responded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE was not answered")
+		}
+		require.Equal(t, sip.StatusOK, res.StatusCode, "reason: %s", res.Reason)
+		// We offered actpass and the peer answered active, so we are the
+		// passive end of the association, and keep that role (RFC 8842
+		// section 5.3).
+		require.Equal(t, "a=setup:passive", iceSDPLine(t, res.Body(), "a=setup:"), "the answer did not continue the association")
+		select {
+		case err := <-handled:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE handler did not return")
+		}
+		require.False(t, d.MediaSession().FinalizePending(), "the installed fork has a handshake pending")
+	})
+
+	t.Run("not keyed in time", func(t *testing.T) {
+		d, peer, _ := newAckingDTLSClientDialog(t)
+		sess := d.MediaSession()
+		req := newPeerReInvite(d, 2)
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(peer.Fork().LocalSDP())
+
+		tx := newRespondedServerTx()
+		handled := make(chan error, 1)
+		go func() { handled <- d.handleReInvite(req, tx) }()
+		select {
+		case res := <-tx.responded:
+			require.Equal(t, sip.StatusRequestPending, res.StatusCode, "reason: %s", res.Reason)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE was not answered")
+		}
+		select {
+		case err := <-handled:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE handler did not return")
+		}
+		require.Same(t, sess, d.MediaSession(), "the re-INVITE must not reach the media")
+	})
+}
+
 // sentPacketConn records every datagram a media session writes through it, so
 // a test sees what went on the wire from that session.
 type sentPacketConn struct {
