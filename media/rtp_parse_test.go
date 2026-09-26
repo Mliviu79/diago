@@ -93,18 +93,25 @@ func BenchmarkReadRTP(b *testing.B) {
 	}()
 	defer stopPipeWriter(b, reader, writerDone)
 
+	// A media session is read by one goroutine at a time, so each parallel body
+	// reads through a session of its own over the shared connection. A body
+	// runs off the benchmark goroutine, so it reports a failure with Error and
+	// returns rather than calling Fatal.
 	b.Run("return", func(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 
 		b.RunParallel(func(p *testing.PB) {
+			sess := &MediaSession{rtpConn: session.rtpConn}
 			for p.Next() {
-				pkt, err := session.readRTPParsed()
+				pkt, err := sess.readRTPParsed()
 				if err != nil {
-					b.Fatal(err)
+					b.Error(err)
+					return
 				}
 				if len(pkt.Payload) != 160 {
-					b.Fatal("payload not parsed")
+					b.Error("payload not parsed")
+					return
 				}
 			}
 		})
@@ -116,15 +123,18 @@ func BenchmarkReadRTP(b *testing.B) {
 		b.ReportAllocs()
 
 		b.RunParallel(func(p *testing.PB) {
+			sess := &MediaSession{rtpConn: session.rtpConn}
 			buf := make([]byte, RTPBufSize)
 			for p.Next() {
 				pkt := rtp.Packet{}
-				_, err := session.ReadRTP(buf, &pkt)
+				_, err := sess.ReadRTP(buf, &pkt)
 				if err != nil {
-					b.Fatal(err)
+					b.Error(err)
+					return
 				}
 				if len(pkt.Payload) != 160 {
-					b.Fatal("payload not parsed")
+					b.Error("payload not parsed")
+					return
 				}
 			}
 		})
@@ -135,17 +145,20 @@ func BenchmarkReadRTP(b *testing.B) {
 		b.ReportAllocs()
 
 		b.RunParallel(func(p *testing.PB) {
+			sess := &MediaSession{rtpConn: session.rtpConn}
 			buf := make([]byte, RTPBufSize)
 			for p.Next() {
 				pkt := rtp.Packet{
 					Payload: buf,
 				}
-				_, err := session.ReadRTP(buf, &pkt)
+				_, err := sess.ReadRTP(buf, &pkt)
 				if err != nil {
-					b.Fatal(err)
+					b.Error(err)
+					return
 				}
 				if len(pkt.Payload) == 0 {
-					b.Fatal("payload not parsed")
+					b.Error("payload not parsed")
+					return
 				}
 			}
 		})

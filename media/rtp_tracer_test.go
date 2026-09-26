@@ -47,7 +47,7 @@ func TestRTPDebugTracer(t *testing.T) {
 	tracer := &testRTPTracer{}
 	RTPDebugTracer(tracer)
 
-	sess := fakeMediaSessionWriter(0, 1234, nil)
+	sess := fakeMediaSessionWriter(0, 1234, io.Discard)
 	pkt := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,

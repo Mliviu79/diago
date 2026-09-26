@@ -23,7 +23,7 @@ func fakeMediaSessionWriter(lport int, rport int, rtpWriter io.Writer) *MediaSes
 
 	conn := &fakes.UDPConn{
 		Writers: map[string]io.Writer{
-			sess.Raddr.String(): bytes.NewBuffer([]byte{}),
+			sess.Raddr.String(): rtpWriter,
 		},
 	}
 	sess.rtpConn = conn
@@ -62,7 +62,7 @@ func BenchmarkRTPPacketWriter(b *testing.B) {
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		io.ReadAll(reader)
+		_, _ = io.Copy(io.Discard, reader)
 	}()
 	// Closing the write side ends the reader, and the benchmark waits for it.
 	defer func() {
