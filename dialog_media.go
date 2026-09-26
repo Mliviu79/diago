@@ -31,6 +31,11 @@ var (
 	errNoRTPSession = errors.New("no rtp session")
 )
 
+// jitterBufferStopTimeout bounds how long Close waits for a jitter buffer's
+// read loop once the sockets it reads are closed. Closing them fails its read
+// at once, so the bound only matters for a read Close did not end.
+const jitterBufferStopTimeout = 5 * time.Second
+
 func init() {
 	if HTTPDebug {
 		DefaultPlaybackHTTPClient.Transport = &loggingTransport{}
@@ -328,6 +333,7 @@ func (d *DialogMedia) Close() error {
 	d.iceAgentOwner = nil
 	releasePort := d.releaseRTPPort
 	d.releaseRTPPort = nil
+	jitter := d.jitterBuffer
 
 	d.mu.Unlock()
 
@@ -340,7 +346,7 @@ func (d *DialogMedia) Close() error {
 	d.referLatest = nil
 	d.referMu.Unlock()
 
-	var e1, e2, e3, e4 error
+	var e1, e2, e3, e4, e5 error
 	if onClose != nil {
 		e1 = onClose()
 	}
@@ -360,6 +366,17 @@ func (d *DialogMedia) Close() error {
 		e4 = iceOwner.Close()
 	}
 
+	// The jitter buffer was closed with the hooks above, but its read loop may
+	// still be in a read on the session. Closing the sockets fails that read,
+	// and the loop has stopped reading them once Done is closed.
+	if jitter != nil {
+		select {
+		case <-jitter.Done():
+		case <-time.After(jitterBufferStopTimeout):
+			e5 = errors.New("jitter buffer read loop did not stop")
+		}
+	}
+
 	// After the sockets are closed, never before. An allocator may hold the port
 	// for a drain window so late RTP from this call can not land on the next
 	// call socket, and that window has to start when the wire is actually down.
@@ -367,7 +384,7 @@ func (d *DialogMedia) Close() error {
 	if releasePort != nil {
 		releasePort()
 	}
-	return errors.Join(e1, e2, e3, e4)
+	return errors.Join(e1, e2, e3, e4, e5)
 }
 
 func (d *DialogMedia) OnClose(f func() error) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,7 +252,9 @@ type jitterDialogRead struct {
 	err error
 }
 
-func newJitterDialog(t *testing.T) *jitterDialog {
+// newAnsweredDialogMedia returns a dialog's media that answered an offer over
+// loopback, the way an answer sets it up, and the session that made the offer.
+func newAnsweredDialogMedia(t *testing.T) (*DialogMedia, *media.MediaSession) {
 	t.Helper()
 	ours := newMediaSessionForTest(t)
 	offerer := newMediaSessionForTest(t)
@@ -262,6 +265,12 @@ func newJitterDialog(t *testing.T) *jitterDialog {
 	d.initRTPSessionUnsafe(ours, rtpSess)
 	d.onCloseUnsafe(rtpSess.Close)
 	require.NoError(t, rtpSess.MonitorBackground())
+	return d, offerer
+}
+
+func newJitterDialog(t *testing.T) *jitterDialog {
+	t.Helper()
+	d, offerer := newAnsweredDialogMedia(t)
 
 	ar, err := d.AudioReader(WithAudioReaderJitterBuffer(media.RTPJitterBufferOptions{
 		DelayPackets: 1,
@@ -407,4 +416,116 @@ func TestDialogMediaJitterBufferSetUpOnce(t *testing.T) {
 	_, err := jd.d.AudioReader(WithAudioReaderJitterBuffer(media.RTPJitterBufferOptions{}))
 	require.Error(t, err)
 	require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the first jitter buffer was replaced")
+}
+
+// holdingRTPReader passes reads to inner, and holds a read that failed until
+// release is closed, reporting on held that it does.
+type holdingRTPReader struct {
+	inner   media.RTPReader
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (r *holdingRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
+	n, err := r.inner.ReadRTP(buf, p)
+	if err != nil {
+		r.held <- struct{}{}
+		<-r.release
+	}
+	return n, err
+}
+
+// TestDialogMediaCloseJoinsJitterBuffer pins that Close returns only after the
+// jitter buffer's read loop has stopped reading the dialog's session. Closing
+// the sockets fails the loop's read, and the loop ends once it sees that; the
+// upstream here holds it between the two.
+func TestDialogMediaCloseJoinsJitterBuffer(t *testing.T) {
+	d, _ := newAnsweredDialogMedia(t)
+	upstream := &holdingRTPReader{
+		inner:   d.RTPPacketReader.Reader(),
+		held:    make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	d.RTPPacketReader.UpdateReader(upstream)
+	ar, err := d.AudioReader(WithAudioReaderJitterBuffer(media.RTPJitterBufferOptions{
+		DelayPackets: 1,
+		MaxPackets:   4,
+	}))
+	require.NoError(t, err)
+	jitter := d.RTPPacketReader.Reader().(*media.RTPJitterBuffer)
+
+	release := sync.OnceFunc(func() { close(upstream.release) })
+	closed := make(chan error, 1)
+	var closeDone chan struct{}
+	t.Cleanup(func() {
+		release()
+		if closeDone == nil {
+			_ = d.Close()
+			return
+		}
+		select {
+		case <-closeDone:
+		case <-time.After(5 * time.Second):
+			t.Error("Close did not return")
+		}
+	})
+
+	// One packet read through the buffer starts its read loop, which then
+	// waits on the socket for the next one.
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	raw, err := (&rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: 1, SSRC: 1234},
+		Payload: make([]byte, 160),
+	}).Marshal()
+	require.NoError(t, err)
+	addr := d.MediaSession().Laddr
+	_, err = peer.WriteToUDP(raw, &addr)
+	require.NoError(t, err)
+	read := make(chan error, 1)
+	go func() {
+		_, err := ar.Read(make([]byte, media.RTPBufSize))
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the packet was never read")
+	}
+
+	closeDone = make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		closed <- d.Close()
+	}()
+	select {
+	case <-upstream.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the sockets did not fail the read loop's read")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while the jitter buffer's read loop was still reading", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case <-jitter.Done():
+		t.Fatal("the read loop stopped while its read was held")
+	default:
+	}
+
+	release()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return once the read loop could stop")
+	}
+	select {
+	case <-jitter.Done():
+	default:
+		t.Fatal("Close returned before the read loop stopped")
+	}
 }
