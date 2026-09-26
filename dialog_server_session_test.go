@@ -68,6 +68,13 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 		dialog, err := dialer.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15010}, InviteOptions{
 			OnResponse: func(res *sip.Response) error {
 				t.Log("Received resp", res.StatusCode)
+				// The server transaction sends 100 Trying on its own when the
+				// handler has not answered within 200 ms (RFC 3261 section
+				// 17.2.1), which a loaded machine can take. Only the responses
+				// the session sends are asserted.
+				if res.StatusCode == sip.StatusTrying {
+					return nil
+				}
 				allResponses = append(allResponses, *res.Clone())
 				return nil
 			},
