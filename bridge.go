@@ -347,7 +347,8 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 	// Stop any current mixing
 	b.log.Debug("Stoping mix", "dialog", d.Id())
 	if err := b.mixStopWait(); err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
+		// The join is refused, and the dialogs already here keep being mixed.
+		return errors.Join(fmt.Errorf("failed to stop current mixing: %w", err), b.mixStart())
 	}
 
 	b.dialogs = append(b.dialogs, d)
@@ -374,8 +375,11 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 
 	b.log.Debug("Stoping mix", "dialog", dialog.Id())
 
-	if err := b.mixStopWait(); err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
+	// The dialog leaves even when stopping the mix reports an error. Kept in the
+	// bridge, it would be in every later mix.
+	stopErr := b.mixStopWait()
+	if stopErr != nil {
+		stopErr = fmt.Errorf("failed to stop current mixing: %w", stopErr)
 	}
 
 	// NOTE: mixStopWait unlocks so we can not do any update before
@@ -387,7 +391,7 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 	}
 
 	b.log.Debug("Removed dialog", "dialog", dialog.Id(), "total", len(b.dialogs))
-	return b.mixStart()
+	return errors.Join(stopErr, b.mixStart())
 }
 
 // mixEnded runs when a mix loop exits. A loop that ended on its own goes from
@@ -414,7 +418,7 @@ func (b *BridgeMix) stateRead() int {
 
 func (b *BridgeMix) mixStopWait() error {
 	// DO NOT CALL THIS INSIDE LOOP of b.dialogs. This Unlocks
-	stopInProgress, err := b.mixStop()
+	stopInProgress, stopErr := b.mixStop()
 	if stopInProgress {
 		// This caller set the stopping state, so it clears it once the stopped
 		// mix has drained, even when stopping reported an error.
@@ -423,16 +427,14 @@ func (b *BridgeMix) mixStopWait() error {
 		b.mu.Lock()
 		b.stateWriteUnsafe(0)
 	}
-	if err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
-	}
-	// Enable RTP again
-	var allErros error
+	// Enable RTP again, on every dialog even when stopping reported an error,
+	// so no dialog is left with its reads stopped.
+	var startErr error
 	for _, d := range b.dialogs {
 		err := d.Media().StartRTP(1, 0) // Start reading
-		errors.Join(allErros, err)
+		startErr = errors.Join(startErr, bridgeRTPControlErr(err))
 	}
-	return allErros
+	return errors.Join(stopErr, startErr)
 }
 
 func (b *BridgeMix) mixStop() (bool, error) {
@@ -444,9 +446,21 @@ func (b *BridgeMix) mixStop() (bool, error) {
 	var allErros error
 	for _, d := range b.dialogs {
 		err := d.Media().StopRTP(1, 0) // Stop reading
-		errors.Join(allErros, err)
+		allErros = errors.Join(allErros, bridgeRTPControlErr(err))
 	}
 	return true, allErros
+}
+
+// bridgeRTPControlErr returns the error of starting or stopping reads on a
+// dialog, or nil when the dialog's RTP connection is closed. A BYE closes the
+// dialog's media before its handler leaves the bridge, so that is the usual
+// state of a dialog that hung up: its reads already fail, there is no read to
+// start or stop, and it must still be able to leave.
+func bridgeRTPControlErr(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func (b *BridgeMix) mixStart() error {

@@ -6,7 +6,9 @@ package diago
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -253,6 +255,152 @@ func TestBridgeMixStopKeepsStoppingState(t *testing.T) {
 
 		b.mixEnded()
 		assert.Equal(t, 0, b.stateRead())
+	})
+}
+
+// bridgeTestDialog is a confirmed dialog for BridgeMix tests. Its media reads
+// RTP on a real socket, which the test sends to from peer.
+type bridgeTestDialog struct {
+	id        string
+	media     *DialogMedia
+	sipDialog *sipgo.Dialog
+	conn      *bridgeTestConn
+	peer      *net.UDPConn
+}
+
+var _ DialogSession = (*bridgeTestDialog)(nil)
+
+func newBridgeTestDialog(t *testing.T, id string, codec media.Codec) *bridgeTestDialog {
+	t.Helper()
+	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	rtpConn, err := net.ListenUDP("udp", loopback)
+	require.NoError(t, err)
+	peer, err := net.ListenUDP("udp", loopback)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		rtpConn.Close()
+		peer.Close()
+	})
+
+	conn := &bridgeTestConn{UDPConn: rtpConn}
+	sess := &media.MediaSession{Codecs: []media.Codec{codec}}
+	sess.InitWithListeners(conn, conn, peer.LocalAddr().(*net.UDPAddr))
+
+	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: id, Host: "127.0.0.1", Port: 5060})
+	sipDialog := &sipgo.Dialog{ID: id, InviteRequest: invite}
+	sipDialog.InitWithState(sip.DialogStateConfirmed)
+
+	return &bridgeTestDialog{
+		id: id,
+		media: &DialogMedia{
+			mediaSession:    sess,
+			RTPPacketReader: media.NewRTPPacketReader(sess, codec),
+			RTPPacketWriter: media.NewRTPPacketWriter(sess, codec),
+		},
+		sipDialog: sipDialog,
+		conn:      conn,
+		peer:      peer,
+	}
+}
+
+func (d *bridgeTestDialog) Id() string                       { return d.id }
+func (d *bridgeTestDialog) Context() context.Context         { return context.Background() }
+func (d *bridgeTestDialog) Hangup(ctx context.Context) error { return nil }
+func (d *bridgeTestDialog) Media() *DialogMedia              { return d.media }
+func (d *bridgeTestDialog) DialogSIP() *sipgo.Dialog         { return d.sipDialog }
+func (d *bridgeTestDialog) Close() error                     { return nil }
+
+func (d *bridgeTestDialog) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	return nil, errors.New("bridge test dialog sends no requests")
+}
+
+// bridgeTestConn is a dialog's RTP socket. With deadlineErr set, every read
+// deadline it is given is applied and then reported as failed.
+type bridgeTestConn struct {
+	*net.UDPConn
+	deadlineErr error
+}
+
+func (c *bridgeTestConn) SetReadDeadline(t time.Time) error {
+	if err := c.UDPConn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.deadlineErr
+}
+
+// stopBridgeMix stops the bridge's mix and waits, bounded, until it has.
+func stopBridgeMix(t *testing.T, b *BridgeMix) {
+	t.Helper()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_ = b.mixStopWait()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge mix did not stop")
+	}
+}
+
+// TestBridgeMixRTPControlErrors checks what a join or leave does when starting
+// or stopping reads on a dialog in the bridge fails. A hung-up dialog, whose
+// connection the BYE has already closed, leaves without an error. Any other
+// failure is returned: a join is refused, a leave still takes the dialog out,
+// and the dialogs left in the bridge keep being mixed.
+func TestBridgeMixRTPControlErrors(t *testing.T) {
+	errDeadline := errors.New("read deadline refused")
+
+	t.Run("HungUpDialogLeaves", func(t *testing.T) {
+		b := NewBridgeMix()
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+		hungUp := newBridgeTestDialog(t, "hungup", media.CodecAudioUlaw)
+		for _, d := range []*bridgeTestDialog{a, c, hungUp} {
+			require.NoError(t, b.AddDialogSession(d))
+		}
+		t.Cleanup(func() { stopBridgeMix(t, b) })
+
+		// A BYE closes the dialog's media before its handler leaves the bridge
+		require.NoError(t, hungUp.conn.Close())
+		require.NoError(t, b.RemoveDialogSession(hungUp))
+		assert.Equal(t, []DialogSession{a, c}, b.DialogSessionsList())
+		assert.Equal(t, 1, b.stateRead(), "the dialogs left must be mixed")
+	})
+
+	t.Run("JoinRefused", func(t *testing.T) {
+		b := NewBridgeMix()
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		failing := newBridgeTestDialog(t, "failing", media.CodecAudioUlaw)
+		failing.conn.deadlineErr = errDeadline
+		for _, d := range []*bridgeTestDialog{a, failing} {
+			require.NoError(t, b.AddDialogSession(d))
+		}
+		t.Cleanup(func() { stopBridgeMix(t, b) })
+
+		err := b.AddDialogSession(newBridgeTestDialog(t, "c", media.CodecAudioUlaw))
+		require.ErrorIs(t, err, errDeadline)
+		assert.Equal(t, []DialogSession{a, failing}, b.DialogSessionsList(), "a refused join must not add the dialog")
+		assert.Equal(t, 1, b.stateRead(), "the dialogs in the bridge must keep being mixed")
+	})
+
+	t.Run("LeaveReportsError", func(t *testing.T) {
+		b := NewBridgeMix()
+		a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+		c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+		failing := newBridgeTestDialog(t, "failing", media.CodecAudioUlaw)
+		failing.conn.deadlineErr = errDeadline
+		for _, d := range []*bridgeTestDialog{a, c, failing} {
+			require.NoError(t, b.AddDialogSession(d))
+		}
+		t.Cleanup(func() { stopBridgeMix(t, b) })
+
+		err := b.RemoveDialogSession(a)
+		require.ErrorIs(t, err, errDeadline)
+		assert.Equal(t, []DialogSession{c, failing}, b.DialogSessionsList(), "a leave must take the dialog out")
+		assert.Equal(t, 1, b.stateRead(), "the dialogs left must be mixed")
 	})
 }
 
