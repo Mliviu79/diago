@@ -105,6 +105,56 @@ func TestBridgeNoTranscodingAllowed(t *testing.T) {
 	require.Error(t, err)
 }
 
+// recvRTP waits, bounded, for the next RTP packet the dialog sends its peer and
+// returns its payload.
+func (d *bridgeTestDialog) recvRTP(t *testing.T) []byte {
+	t.Helper()
+	require.NoError(t, d.peer.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, media.RTPBufSize)
+	n, _, err := d.peer.ReadFrom(buf)
+	require.NoError(t, err, "the dialog sent its peer nothing")
+	pkt := rtp.Packet{}
+	require.NoError(t, pkt.Unmarshal(buf[:n]))
+	return pkt.Payload
+}
+
+// TestBridgeProxyMediaProxiesEveryFrame checks that ProxyMedia, which starts
+// the proxy by hand, passes on every frame each way until the media ends, and
+// not only the first.
+func TestBridgeProxyMediaProxiesEveryFrame(t *testing.T) {
+	for _, dtmfPass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("DTMFpass=%t", dtmfPass), func(t *testing.T) {
+			b := NewBridge()
+			b.WaitDialogsNum = 3 // The proxy is started by hand
+			b.DTMFpass = dtmfPass
+			a := newBridgeTestDialog(t, "a", media.CodecAudioUlaw)
+			c := newBridgeTestDialog(t, "c", media.CodecAudioUlaw)
+			require.NoError(t, b.AddDialogSession(a))
+			require.NoError(t, b.AddDialogSession(c))
+
+			proxied := make(chan error, 1)
+			go func() { proxied <- b.ProxyMedia() }()
+
+			for i := range 3 {
+				frame := bytes.Repeat([]byte{byte(0x20 + i)}, 160)
+				a.sendRTP(t, uint16(i), uint32(i)*160, frame)
+				assert.Equal(t, frame, c.recvRTP(t), "frame %d from a", i)
+				c.sendRTP(t, uint16(i), uint32(i)*160, frame)
+				assert.Equal(t, frame, a.recvRTP(t), "frame %d from c", i)
+			}
+
+			// Ending the media ends the proxy
+			require.NoError(t, a.conn.Close())
+			require.NoError(t, c.conn.Close())
+			select {
+			case <-proxied:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the proxy did not end with the media")
+			}
+		})
+	}
+}
+
 func TestIntegrationBridging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

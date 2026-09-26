@@ -145,9 +145,6 @@ func (b *Bridge) ProxyMedia() error {
 		return fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
 	}
 
-	for _, d := range b.dialogs {
-		d.Media().mediaSession.StopRTP(2, 0)
-	}
 	return b.proxyMedia()
 }
 
