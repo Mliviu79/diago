@@ -59,8 +59,19 @@ func BenchmarkRTPPacketWriter(b *testing.B) {
 	w := NewRTPPacketWriterSession(rtpSess)
 	w.clockTicker.Reset(1 * time.Nanosecond)
 
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		io.ReadAll(reader)
+	}()
+	// Closing the write side ends the reader, and the benchmark waits for it.
+	defer func() {
+		writer.Close()
+		select {
+		case <-readerDone:
+		case <-time.After(5 * time.Second):
+			b.Error("the pipe reader did not stop")
+		}
 	}()
 
 	data := make([]byte, 160)

@@ -6,6 +6,7 @@ package media
 import (
 	"io"
 	"testing"
+	"time"
 
 	"github.com/emiago/sipgo/fakes"
 	"github.com/pion/rtcp"
@@ -14,7 +15,9 @@ import (
 
 func BenchmarkRTCPUnmarshal(b *testing.B) {
 	reader, writer := io.Pipe()
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		for {
 			sr := rtcp.SenderReport{}
 			data, err := sr.Marshal()
@@ -22,9 +25,12 @@ func BenchmarkRTCPUnmarshal(b *testing.B) {
 				return
 			}
 
-			writer.Write(data)
+			if _, err := writer.Write(data); err != nil {
+				return
+			}
 		}
 	}()
+	defer stopPipeWriter(b, reader, writerDone)
 
 	b.Run("pionRTCP", func(b *testing.B) {
 		buf := make([]byte, 1500)
@@ -69,7 +75,9 @@ func BenchmarkReadRTP(b *testing.B) {
 		Reader: reader,
 	}
 
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		for {
 			pkt := rtp.Packet{
 				Payload: make([]byte, 160),
@@ -78,9 +86,12 @@ func BenchmarkReadRTP(b *testing.B) {
 			if err != nil {
 				return
 			}
-			writer.Write(data)
+			if _, err := writer.Write(data); err != nil {
+				return
+			}
 		}
 	}()
+	defer stopPipeWriter(b, reader, writerDone)
 
 	b.Run("return", func(b *testing.B) {
 		b.ResetTimer()
@@ -139,4 +150,16 @@ func BenchmarkReadRTP(b *testing.B) {
 			}
 		})
 	})
+}
+
+// stopPipeWriter closes the read side of a pipe whose writer runs until its
+// write fails, and waits for the writer, which done reports, to return.
+func stopPipeWriter(b *testing.B, reader *io.PipeReader, done <-chan struct{}) {
+	b.Helper()
+	reader.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.Error("the pipe writer did not stop")
+	}
 }
