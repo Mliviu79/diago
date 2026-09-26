@@ -473,6 +473,32 @@ func referAccepted(status int) bool {
 	return status >= 200 && status <= 299
 }
 
+// respondDialogEnded answers req 481 when d has ended, and reports whether it
+// did. An ended dialog stays in the dialog cache until its call handler
+// returns, for an inbound call, or until it is closed, for an outbound one, so
+// an in-dialog request can still find it. It matches no live dialog, and RFC
+// 3261 section 12.2.2 has such a request answered 481.
+func respondDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
+	if d.DialogSIP().LoadState() != sip.DialogStateEnded {
+		return false, nil
+	}
+	res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
+	return true, tx.Respond(res)
+}
+
+// respondNotifyDialogEnded answers a NOTIFY as respondDialogEnded does, unless
+// it is for a REFER d still tracks, and reports whether it did. A BYE ends the
+// INVITE usage of a dialog, not the subscription usage a REFER created, and
+// the dialog lives on until its last usage ends (RFC 5057 sections 2 and 4.1),
+// so a transfer outcome is still taken after the call has ended.
+func respondNotifyDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) bool {
+	if d.DialogSIP().LoadState() != sip.DialogStateEnded || d.Media().referNotifyExpected(req) {
+		return false
+	}
+	ended, _ := respondDialogEnded(d, req, tx)
+	return ended
+}
+
 func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
 	// TODO how to know this is refer
 	contentType := req.ContentType()

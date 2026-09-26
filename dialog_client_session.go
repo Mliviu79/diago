@@ -675,10 +675,18 @@ func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.U
 }
 
 func (d *DialogClientSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
+	if respondNotifyDialogEnded(d, req, tx) {
+		return
+	}
 	dialogHandleReferNotify(d, req, tx)
 }
 
 func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
+	// A REFER asks to transfer this call, which an ended dialog no longer has.
+	if ended, _ := respondDialogEnded(d, req, tx); ended {
+		return
+	}
+
 	d.mu.Lock()
 	onRefDialog := d.onReferDialog
 	d.mu.Unlock()
@@ -691,11 +699,10 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 }
 
 func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) error {
-	// After our BYE an ended dialog stays in the cache until it is closed, so a
-	// re-INVITE can still find it. It matches no live dialog and is answered 481
-	// (RFC 3261 section 12.2.2), without reaching the media.
-	if d.LoadState() == sip.DialogStateEnded {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+	// A re-INVITE for an ended dialog is answered 481 without reaching the
+	// media.
+	if ended, err := respondDialogEnded(d, req, tx); ended {
+		return err
 	}
 
 	if err := d.ReadRequest(req, tx); err != nil {
@@ -748,6 +755,9 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {
+	if ended, err := respondDialogEnded(d, req, tx); ended {
+		return err
+	}
 	return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 }
 

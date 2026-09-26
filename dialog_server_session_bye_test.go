@@ -49,6 +49,13 @@ func newByeTestDialog(t *testing.T) (*DialogServerSession, *byeServerTx) {
 // newTestDialogOver builds the dialog newByeTestDialog does over inviteTx.
 func newTestDialogOver(t *testing.T, inviteTx sip.ServerTransaction) *DialogServerSession {
 	t.Helper()
+	return newTestDialogOverUA(t, inviteTx, &sipgo.DialogUA{})
+}
+
+// newTestDialogOverUA builds the dialog newTestDialogOver does, sending its own
+// requests through ua.
+func newTestDialogOverUA(t *testing.T, inviteTx sip.ServerTransaction, ua *sipgo.DialogUA) *DialogServerSession {
+	t.Helper()
 
 	recipient := sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}
 	caller := sip.Uri{User: "bob", Host: "127.0.0.2", Port: 5060}
@@ -62,7 +69,6 @@ func newTestDialogOver(t *testing.T, inviteTx sip.ServerTransaction) *DialogServ
 	invite.AppendHeader(sip.NewHeader("Call-ID", "bye-stash-test-call-id"))
 	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 100, MethodName: sip.INVITE})
 
-	ua := &sipgo.DialogUA{}
 	sess, err := ua.ReadInvite(invite, inviteTx)
 	require.NoError(t, err)
 

@@ -900,10 +900,18 @@ func (d *DialogServerSession) ReferAndObserve(ctx context.Context, referTo sip.U
 }
 
 func (d *DialogServerSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
+	if respondNotifyDialogEnded(d, req, tx) {
+		return
+	}
 	dialogHandleReferNotify(d, req, tx)
 }
 
 func (d *DialogServerSession) handleRefer(dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
+	// A REFER asks to transfer this call, which an ended dialog no longer has.
+	if ended, _ := respondDialogEnded(d, req, tx); ended {
+		return
+	}
+
 	d.mu.Lock()
 	onRefDialog := d.onReferDialog
 	d.mu.Unlock()
@@ -927,11 +935,10 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 
-	// An ended dialog stays in the cache until the call handler returns, so a
-	// re-INVITE can still find it. It matches no live dialog and is answered 481
-	// (RFC 3261 section 12.2.2), without reaching the media.
-	if d.LoadState() == sip.DialogStateEnded {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+	// A re-INVITE for an ended dialog is answered 481 without reaching the
+	// media.
+	if ended, err := respondDialogEnded(d, req, tx); ended {
+		return err
 	}
 
 	// NOTE: Calling ReadRequest increases remote CSEQ.
@@ -999,6 +1006,9 @@ func (d *DialogServerSession) resetSessionTimerOnRefresh(req *sip.Request) {
 }
 
 func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {
+	if ended, err := respondDialogEnded(d, req, tx); ended {
+		return err
+	}
 	return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 	// if err := d.ReadRequest(req, tx); err != nil {
 	// 	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))

@@ -218,6 +218,24 @@ func (d *DialogMedia) observeReferNotify(n ReferNotify) (onLate func(ReferLateNo
 	return nil, ReferLateNotify{}
 }
 
+// referNotifyExpected reports whether a NOTIFY carrying req's Event header has
+// a REFER sent on this dialog to go to: the OnNotify callback of ReferOptions,
+// or a registered attempt it is routed to.
+func (d *DialogMedia) referNotifyExpected(req *sip.Request) bool {
+	d.mu.Lock()
+	onNotify := d.onReferNotify
+	d.mu.Unlock()
+	if onNotify != nil {
+		return true
+	}
+
+	var n ReferNotify
+	n.EventID, n.HasEventID = parseReferNotifyEventID(req)
+	d.referMu.Lock()
+	defer d.referMu.Unlock()
+	return d.referNotifyTargetLocked(n) != nil
+}
+
 // referNotifyTargetLocked returns the registered attempt n belongs to, or nil.
 // Called with referMu held.
 func (d *DialogMedia) referNotifyTargetLocked(n ReferNotify) *referAttempt {
