@@ -947,6 +947,76 @@ func testBridgeMixDirectReadFollowsRebind(t *testing.T, duringRead bool) {
 	}
 }
 
+// renegotiate moves the dialog's audio to codec, as a re-INVITE that settles on
+// another codec does: under the dialog's lock its media session is replaced by
+// a fork of it on that codec.
+func (d *bridgeTestDialog) renegotiate(codec media.Codec) {
+	d.media.mu.Lock()
+	defer d.media.mu.Unlock()
+	sess := d.media.mediaSession.Fork()
+	sess.Codecs = []media.Codec{codec}
+	d.media.mediaSession = sess
+}
+
+// TestBridgeMixTakesOutRenegotiatedDialog checks what the next join or leave
+// does once a re-INVITE has moved a dialog in the bridge to audio the mix can
+// not mix with the others. The bridge keeps mixing at the codec of its last
+// mix, the dialog that no longer matches it is taken out of the bridge, and the
+// others are mixed. When every dialog has moved, the bridge follows its first
+// dialog.
+func TestBridgeMixTakesOutRenegotiatedDialog(t *testing.T) {
+	ulaw30ms := media.CodecAudioUlaw
+	ulaw30ms.SampleDur = 30 * time.Millisecond
+
+	for _, tc := range []struct {
+		name string
+		// dialogs join in this order, all on 20 ms PCMU
+		dialogs []string
+		// moved are renegotiated to 30 ms PCMU
+		moved []string
+		// then either joins, on 20 ms PCMU unless every dialog moved, or leaves
+		joins, leaves string
+		want          []string
+	}{
+		{name: "Join", dialogs: []string{"a", "x"}, moved: []string{"x"}, joins: "c", want: []string{"a", "c"}},
+		{name: "Leave", dialogs: []string{"a", "x", "c"}, moved: []string{"x"}, leaves: "a", want: []string{"c"}},
+		{name: "FirstDialogMoved", dialogs: []string{"x", "a"}, moved: []string{"x"}, joins: "c", want: []string{"a", "c"}},
+		{name: "EveryDialogMoved", dialogs: []string{"a", "x"}, moved: []string{"a", "x"}, joins: "c", want: []string{"a", "x", "c"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewBridgeMix()
+			dialogs := map[string]*bridgeTestDialog{}
+			for _, id := range tc.dialogs {
+				dialogs[id] = newBridgeTestDialog(t, id, media.CodecAudioUlaw)
+				require.NoError(t, b.AddDialogSession(dialogs[id]))
+			}
+			t.Cleanup(func() { stopBridgeMix(t, b) })
+
+			for _, id := range tc.moved {
+				dialogs[id].renegotiate(ulaw30ms)
+			}
+			if tc.joins != "" {
+				codec := media.CodecAudioUlaw
+				if len(tc.moved) == len(tc.dialogs) {
+					codec = ulaw30ms
+				}
+				dialogs[tc.joins] = newBridgeTestDialog(t, tc.joins, codec)
+				require.NoError(t, b.AddDialogSession(dialogs[tc.joins]), "a dialog that matches the mix must join")
+			}
+			if tc.leaves != "" {
+				require.NoError(t, b.RemoveDialogSession(dialogs[tc.leaves]))
+			}
+
+			var want []DialogSession
+			for _, id := range tc.want {
+				want = append(want, dialogs[id])
+			}
+			assert.Equal(t, want, b.DialogSessionsList())
+			assert.Equal(t, 1, b.stateRead(), "the dialogs left must be mixed")
+		})
+	}
+}
+
 func TestIntegrationBridgingMix(t *testing.T) {
 	// NOTE: There are more tests executed but outside repo
 	ctx, cancel := context.WithCancel(context.Background())

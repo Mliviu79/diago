@@ -282,6 +282,9 @@ type BridgeMix struct {
 	mixState int
 	// mixStopped is closed when the stop that set mixState to 2 has finished
 	mixStopped chan struct{}
+	// mixCodec is the audio of the last mix started, zero once the bridge is
+	// empty
+	mixCodec media.Codec
 
 	// WaitDialogsNum is just helper flag when to start proxy
 	WaitDialogsNum int
@@ -332,6 +335,8 @@ func (b *BridgeMix) String() string {
 
 // DialogSessionsList returns list of dialogs in bridge
 // It is not safe to use dialogs for media until they are removed from bridge
+// A dialog that a re-INVITE moved to audio the bridge can not mix with the
+// others is taken out of the bridge at the next join or leave.
 func (b *BridgeMix) DialogSessionsList() []DialogSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -350,16 +355,16 @@ func (b *BridgeMix) AddDialogSession(d DialogSession) error {
 	b.log.Debug("Stoping mix", "dialog", d.Id())
 	if err := b.mixStopWait(); err != nil {
 		// The join is refused, and the dialogs already here keep being mixed.
-		return errors.Join(fmt.Errorf("failed to stop current mixing: %w", err), b.mixStart())
+		b.mixStart()
+		return fmt.Errorf("failed to stop current mixing: %w", err)
 	}
 
 	b.dialogs = append(b.dialogs, d)
 	b.log.Debug("Added dialog", "dialog", d.Id(), "total", len(b.dialogs))
-	if err := b.mixStart(); err != nil {
-		// The dialog can not be mixed with the others. The join is refused, and
-		// the dialogs already here keep being mixed.
-		b.dialogs = slices.Delete(b.dialogs, len(b.dialogs)-1, len(b.dialogs))
-		return errors.Join(err, b.mixStart())
+	if err := b.mixStart()[d.Id()]; err != nil {
+		// The dialog can not be mixed with the others. The join is refused: the
+		// dialog is out of the bridge again, and the others are mixed.
+		return err
 	}
 	return nil
 }
@@ -398,7 +403,8 @@ func (b *BridgeMix) RemoveDialogSession(d DialogSession) error {
 	}
 
 	b.log.Debug("Removed dialog", "dialog", dialog.Id(), "total", len(b.dialogs))
-	return errors.Join(stopErr, b.mixStart())
+	b.mixStart()
+	return stopErr
 }
 
 // mixEnded runs when a mix loop exits. A loop that ended on its own goes from
@@ -480,38 +486,67 @@ func bridgeRTPControlErr(err error) error {
 	return err
 }
 
-func (b *BridgeMix) mixStart() error {
+// mixStart starts mixing the dialogs in the bridge. The mix neither resamples
+// nor reframes, so it runs at one sample rate and frame duration: those of the
+// last mix while a dialog still has them, since a re-INVITE can move a dialog
+// to other audio, and otherwise those of the first dialog. A dialog whose audio
+// differs, or can not be mixed at all, is taken out of the bridge and the
+// others are mixed. mixStart returns why each dialog it took out could not be
+// mixed, by dialog ID.
+func (b *BridgeMix) mixStart() (notMixed map[string]error) {
 	if b.mixState == 2 {
 		// A stop is in progress (another goroutine is in mixStopWait).
 		// Don't start a new mix to avoid WaitGroup Add/Wait race.
 		return nil
 	}
 	if len(b.dialogs) < 1 {
+		b.mixCodec = media.Codec{}
 		return nil
 	}
 	if len(b.dialogs) < b.WaitDialogsNum {
 		return nil
 	}
 
+	codecs := make([]media.Codec, len(b.dialogs))
+	for i, d := range b.dialogs {
+		p := MediaProps{}
+		d.Media().audioReaderProps(&p)
+		codecs[i] = p.Codec
+	}
+	mixCodec := b.mixCodec
+	if !slices.ContainsFunc(codecs, func(c media.Codec) bool { return bridgeSameAudio(c, mixCodec) }) {
+		mixCodec = codecs[0]
+	}
+
+	notMixed = map[string]error{}
+	var rwStreams []*bridgePCMStream
+	for _, d := range b.dialogs {
+		stream := &bridgePCMStream{}
+		if err := b.addDialogStream(d, stream, mixCodec); err != nil {
+			notMixed[d.Id()] = err
+			continue
+		}
+		rwStreams = append(rwStreams, stream)
+	}
+	for id, err := range notMixed {
+		b.log.Warn("Dialog can not be mixed, taking it out of the bridge", "dialog", id, "error", err)
+	}
+	b.dialogs = slices.DeleteFunc(b.dialogs, func(d DialogSession) bool {
+		_, out := notMixed[d.Id()]
+		return out
+	})
+	if len(b.dialogs) < 1 {
+		b.mixCodec = media.Codec{}
+		return notMixed
+	}
+	if len(b.dialogs) < b.WaitDialogsNum {
+		return notMixed
+	}
+	b.mixCodec = mixCodec
+
 	ctx, cancelPoll := context.WithCancel(context.Background())
 	// We could decide and optimize here, poll vs deadlines
 	poll := b.Poll
-	firstDialogCodec := media.Codec{}
-	rwStreams, err := func() ([]*bridgePCMStream, error) {
-		rwStreams := make([]*bridgePCMStream, len(b.dialogs))
-
-		for i, d := range b.dialogs {
-			rwStreams[i] = &bridgePCMStream{}
-			if err := b.addDialogStream(d, rwStreams[i], &firstDialogCodec); err != nil {
-				return nil, err
-			}
-		}
-		return rwStreams, nil
-	}()
-	if err != nil {
-		cancelPoll()
-		return err
-	}
 
 	// Readers start once every stream is set up, so a stream that can not be
 	// mixed leaves no reader behind.
@@ -560,11 +595,17 @@ func (b *BridgeMix) mixStart() error {
 		defer b.mixWG.Done()
 		defer b.mixEnded()
 		b.log.Debug("Starting mix loop", "streams.len", len(rwStreams))
-		if err := b.mixLoop(rwStreams, poll, firstDialogCodec.SampleDur); err != nil {
+		if err := b.mixLoop(rwStreams, poll, mixCodec.SampleDur); err != nil {
 			b.log.Info("Mix stopped with error", "error", err)
 		}
 	}(rwStreams)
-	return nil
+	return notMixed
+}
+
+// bridgeSameAudio reports whether audio in codec a can be mixed with audio in
+// codec b: same sample rate and frame duration.
+func bridgeSameAudio(a, b media.Codec) bool {
+	return a.SampleRate == b.SampleRate && a.SampleDur == b.SampleDur
 }
 
 func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur time.Duration) error {
@@ -652,7 +693,7 @@ type bridgePCMStream struct {
 	markGone  bool
 }
 
-func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, firstDialogCodec *media.Codec) error {
+func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, mixCodec media.Codec) error {
 	m := d.Media()
 
 	p := MediaProps{}
@@ -661,11 +702,7 @@ func (b *BridgeMix) addDialogStream(d DialogSession, stream *bridgePCMStream, fi
 		return err
 	}
 
-	if firstDialogCodec.SampleRate == 0 {
-		*firstDialogCodec = p.Codec
-	}
-
-	if firstDialogCodec.SampleRate != p.Codec.SampleRate || firstDialogCodec.SampleDur != p.Codec.SampleDur {
+	if !bridgeSameAudio(p.Codec, mixCodec) {
 		return fmt.Errorf("Codec missmatch. Resampling or transcoding is not supported")
 	}
 
