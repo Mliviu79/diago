@@ -191,6 +191,16 @@ func (j *RTPJitterBuffer) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 	j.start()
 
 	for {
+		// Close wins over anything queued or in flight. The read loop closes input
+		// when Close stops it, which is also how it reports the end of the
+		// upstream stream, so input alone cannot tell the two apart.
+		select {
+		case <-j.done:
+			j.stopTimers()
+			return 0, io.ErrClosedPipe
+		default:
+		}
+
 		if j.playout && j.releaseNow {
 			position := int(j.expectedSeq) % j.maxPackets
 			slotIndex := j.sequence[position]

@@ -73,6 +73,12 @@ func (r *chanRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 	return n, RTPUnmarshal(buf[:n], p)
 }
 
+// emptyRTPReader returns empty reads, as an RTP source does for a keepalive, so
+// a read loop over it never blocks.
+type emptyRTPReader struct{}
+
+func (emptyRTPReader) ReadRTP([]byte, *rtp.Packet) (int, error) { return 0, nil }
+
 func (r *countingChanRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 	n, err := r.chanRTPReader.ReadRTP(buf, p)
 	if err == nil && n > 0 {
@@ -252,6 +258,25 @@ func TestRTPJitterBuffer(t *testing.T) {
 		require.NoError(t, jb.Close())
 		require.ErrorIs(t, <-result, io.ErrClosedPipe)
 		close(reader.packets)
+	})
+
+	t.Run("closeAfterReadLoopStopped", func(t *testing.T) {
+		jb := NewRTPJitterBuffer(emptyRTPReader{}, time.Millisecond, RTPJitterBufferOptions{})
+		require.NoError(t, jb.Close())
+
+		// The read loop closes input when Close stops it, which is also how it
+		// reports the end of the upstream stream. Wait for that before reading.
+		jb.start()
+		_, ok := <-jb.input
+		require.False(t, ok, "the read loop must stop on Close")
+
+		// ReadRTP sees Close and the closed input at once, and a select picks
+		// among ready cases at random, so a single read proves nothing.
+		var pkt rtp.Packet
+		for i := 0; i < 64; i++ {
+			_, err := jb.ReadRTP(make([]byte, RTPBufSize), &pkt)
+			require.ErrorIs(t, err, io.ErrClosedPipe, "read %d after Close", i+1)
+		}
 	})
 }
 
