@@ -1077,9 +1077,20 @@ func TestIntegrationBridgingMix(t *testing.T) {
 	// pointer that a subtest stores only once the bridge is fully configured.
 	var currentBridge atomic.Pointer[BridgeMix]
 	currentBridge.Store(NewBridgeMix())
-	dialogExit := make(chan string, 10)
+	// Each handler hands the test the error of its join or of its leave
+	dialogExit := make(chan error, 10)
+	waitDialogExit := func(t *testing.T) {
+		t.Helper()
+		select {
+		case err := <-dialogExit:
+			assert.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a call handler did not return")
+		}
+	}
 	err := tu.ServeBackground(ctx, func(in *DialogServerSession) {
-		defer func() { dialogExit <- in.ID }()
+		var exitErr error
+		defer func() { dialogExit <- exitErr }()
 		bridge := currentBridge.Load()
 
 		in.Trying()
@@ -1089,12 +1100,18 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		// Add us in bridge
 		t.Log("Adding into bridge", in.ID)
 		if err := bridge.AddDialogSession(in); err != nil {
-			t.Log("Adding dialog in bridge failed", err)
+			// A subtest hangs its calls up as soon as they are answered, so a
+			// call can end before its handler joins it, which refuses the join
+			if in.LoadState() != sip.DialogStateEnded {
+				exitErr = fmt.Errorf("adding %s into bridge: %w", in.ID, err)
+			}
 			return
 		}
 		defer func() {
 			t.Log("Removing from bridge", in.ID)
-			bridge.RemoveDialogSession(in)
+			if err := bridge.RemoveDialogSession(in); err != nil {
+				exitErr = fmt.Errorf("removing %s from bridge: %w", in.ID, err)
+			}
 		}()
 
 		<-in.Context().Done()
@@ -1125,7 +1142,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		}
 
 		for range len(dialogs) {
-			<-dialogExit
+			waitDialogExit(t)
 		}
 		bridge := currentBridge.Load()
 		assert.Equal(t, 0, len(bridge.dialogs))
@@ -1144,7 +1161,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 	t.Run("SoundProxied", func(t *testing.T) {
 		defer func() {
 			for range 2 {
-				<-dialogExit
+				waitDialogExit(t)
 			}
 		}()
 
