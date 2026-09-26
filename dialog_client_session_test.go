@@ -574,6 +574,11 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	defer ua.Close()
 
 	ua.TransportLayer().OnMessage(func(msg sip.Message) {
+		// The server transaction sends 100 Trying whenever the answer takes
+		// over 200 ms (RFC 3261 section 17.2.1), so only final responses count.
+		if res, ok := msg.(*sip.Response); ok && res.IsProvisional() {
+			return
+		}
 		lock.Lock()
 		defer lock.Unlock()
 		responses = append(responses, msg)
@@ -593,6 +598,14 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	})
 	t.Log(err)
 	require.Error(t, err)
+
+	// The transport hands each message to the transaction layer before these
+	// hooks record it, so Invite can return before the last one is recorded.
+	require.Eventually(t, func() bool {
+		lock.Lock()
+		defer lock.Unlock()
+		return len(requests) >= 3 && len(responses) >= 2
+	}, 5*time.Second, 10*time.Millisecond)
 
 	lock.Lock()
 	defer lock.Unlock()
