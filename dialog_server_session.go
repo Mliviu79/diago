@@ -790,22 +790,19 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // one no observer can be looking at: only a BYE the delegate accepts ends the
 // dialog, and until the dialog ends nothing has cause to read the stash.
 //
-// The delegate refuses a BYE whose CSeq is below the INVITE's with
-// sipgo.ErrDialogInvalidCseq and leaves the answer to its caller. Such a BYE
-// is out of order, and RFC 3261 section 12.2.2 has it rejected with 500, so it
-// is answered here and the error returned: the dialog goes on.
+// The delegate refuses a BYE it finds out of order with
+// sipgo.ErrDialogInvalidCseq, and RFC 3261 section 12.2.2 has such a BYE
+// rejected with 500. Depending on the sipgo version, the delegate answers it
+// 500 itself or leaves the answer to its caller; readByeOnce answers it only
+// when the delegate did not, and the error is returned: the dialog goes on.
 func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.awaitAnswer(tx)
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
 	d.terminatingBye.Store(req)
-	if err := d.DialogServerSession.ReadBye(req, tx); err != nil {
+	if err := readByeOnce(req, tx, d.DialogServerSession.ReadBye); err != nil {
 		// Not this dialog's ending: leave no cause planted on it.
 		d.terminatingBye.CompareAndSwap(req, nil)
-		if errors.Is(err, sipgo.ErrDialogInvalidCseq) {
-			res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
-			return errors.Join(err, tx.Respond(res))
-		}
 		return err
 	}
 	return d.terminatePeerReInviteLocked()

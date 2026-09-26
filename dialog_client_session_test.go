@@ -1076,3 +1076,26 @@ func (tx *loggedPeerTx) Respond(res *sip.Response) error {
 	tx.h.record(fmt.Sprintf("peer's re-INVITE %d", res.StatusCode))
 	return nil
 }
+
+// TestDialogClientOutOfOrderBye reads, on the calling side, a BYE whose CSeq
+// is below that of a re-INVITE the peer sent before it. Such a BYE is out of
+// order (RFC 3261 section 12.2.2). Whichever of diago and sipgo answers it, it
+// is answered once, and the dialog ends only when that answer is a 200. A
+// sipgo that refuses it answers 500 itself; one that does not check the order
+// answers 200 and ends the dialog.
+func TestDialogClientOutOfOrderBye(t *testing.T) {
+	d, _ := newAnsweredTestClientDialog(t)
+	require.NoError(t, d.ReadRequest(newPeerInDialogRequest(sip.INVITE, 5), newByeServerTx()))
+
+	tx := newByeServerTx()
+	err := d.ReadBye(newPeerInDialogRequest(sip.BYE, 4), tx)
+	require.Len(t, tx.responses, 1, "the BYE must be answered once")
+	if tx.responses[0].StatusCode == sip.StatusOK {
+		require.NoError(t, err)
+		assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+		return
+	}
+	assert.Equal(t, sip.StatusInternalServerError, tx.responses[0].StatusCode)
+	assert.ErrorIs(t, err, sipgo.ErrDialogInvalidCseq)
+	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+}

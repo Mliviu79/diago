@@ -847,11 +847,13 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 // ReadBye reads the peer's BYE as the embedded session does. It does not wait
 // for a re-INVITE being handled: a re-INVITE with no final response yet is
 // answered 487 (RFC 3261 section 15.1.2), so none is answered 200 after the
-// BYE that ended the dialog.
+// BYE that ended the dialog. A BYE the embedded session refuses as out of
+// order, with sipgo.ErrDialogInvalidCseq, is answered 500 once, as
+// DialogServerSession.ReadBye describes, and the dialog goes on.
 func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
-	if err := d.DialogClientSession.ReadBye(req, tx); err != nil {
+	if err := readByeOnce(req, tx, d.DialogClientSession.ReadBye); err != nil {
 		return err
 	}
 	return d.terminatePeerReInviteLocked()

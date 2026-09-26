@@ -472,15 +472,15 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		// Respond to BYE
 		// Terminate our media processing
 		// As user may stuck in playing or reading media, this unblocks that goroutine
+		// A BYE refused as out of order leaves the call, and its media, going.
 		if cd != nil {
-			// The calling side refuses no BYE: it ends the dialog before it
-			// answers.
-			defer closeAndLog(&cd.DialogMedia, "failed to close client media")
-
-			return cd.ReadBye(req, tx)
+			err = cd.ReadBye(req, tx)
+			if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
+				closeAndLog(&cd.DialogMedia, "failed to close client media")
+			}
+			return err
 		}
 
-		// A BYE refused as out of order leaves the call, and its media, going.
 		err = sd.ReadBye(req, tx)
 		if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
 			closeAndLog(&sd.DialogMedia, "failed to close server media")

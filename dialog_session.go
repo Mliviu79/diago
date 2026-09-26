@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -471,6 +472,33 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 // treated as a 200.
 func referAccepted(status int) bool {
 	return status >= 200 && status <= 299
+}
+
+// readByeOnce hands the peer's BYE to readBye, the ReadBye of an embedded
+// sipgo session, and answers it 500 when readBye refused it as out of order
+// (RFC 3261 section 12.2.2) without answering it. Some sipgo versions answer
+// such a BYE themselves and some leave the answer to their caller; the BYE is
+// answered once either way.
+func readByeOnce(req *sip.Request, tx sip.ServerTransaction, readBye func(*sip.Request, sip.ServerTransaction) error) error {
+	rtx := &respondRecordingTx{ServerTransaction: tx}
+	err := readBye(req, rtx)
+	if errors.Is(err, sipgo.ErrDialogInvalidCseq) && !rtx.responded.Load() {
+		res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
+		return errors.Join(err, tx.Respond(res))
+	}
+	return err
+}
+
+// respondRecordingTx is a server transaction that records whether a response
+// was passed to it.
+type respondRecordingTx struct {
+	sip.ServerTransaction
+	responded atomic.Bool
+}
+
+func (tx *respondRecordingTx) Respond(res *sip.Response) error {
+	tx.responded.Store(true)
+	return tx.ServerTransaction.Respond(res)
 }
 
 // respondDialogEnded answers req 481 when d has ended, and reports whether it

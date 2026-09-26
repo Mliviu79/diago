@@ -1531,3 +1531,82 @@ func TestDiagoAnsweredCallRefusedAfter2xx(t *testing.T) {
 		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
 	})
 }
+
+// TestDiagoOutOfOrderByeCallingSide sends the BYE handler, over a loopback
+// socket, a BYE for an outgoing call whose CSeq is below that of a re-INVITE
+// the peer sent before it, and then one in order. The first is out of order
+// (RFC 3261 section 12.2.2). A sipgo that refuses it answers 500 and the call
+// goes on, so its media must stay open; one that does not check the order
+// answers 200 and ends the call. Either way the media is closed exactly when
+// the dialog has ended.
+func TestDiagoOutOfOrderByeCallingSide(t *testing.T) {
+	handled := make(chan struct{}, 1)
+	signalHandled := func(next sipgo.RequestHandler) sipgo.RequestHandler {
+		return func(req *sip.Request, tx sip.ServerTransaction) {
+			defer func() {
+				select {
+				case handled <- struct{}{}:
+				default:
+				}
+			}()
+			next(req, tx)
+		}
+	}
+
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua, WithServerRequestMiddleware(signalHandled))
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	d, _ := newAnsweredTestClientDialog(t)
+	require.NoError(t, d.ReadRequest(newPeerInDialogRequest(sip.INVITE, 5), newByeServerTx()))
+	// The peer's requests carry tags of their own, so the dialog is stored
+	// under the ID they give.
+	id, err := sip.DialogIDFromRequestUAC(newPeerInDialogRequest(sip.BYE, 4))
+	require.NoError(t, err)
+	require.NoError(t, dg.cache.client.DialogStore(context.Background(), id, d))
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	mediaClosed := func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.DialogMedia.closed
+	}
+	// sendBye returns the BYE's final response, nil when none came, once the
+	// handler has returned.
+	sendBye := func(t *testing.T, seq uint32) *sip.Response {
+		t.Helper()
+		bye := newPeerInDialogRequest(sip.BYE, seq)
+		bye.SetDestination(conn.LocalAddr().String())
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		res, err := client.Do(ctx, bye, sipgo.ClientRequestAddVia)
+		select {
+		case <-handled:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the BYE handler did not return")
+		}
+		assert.NoError(t, err, "the BYE was never answered")
+		return res
+	}
+
+	res := sendBye(t, 4)
+	require.NotNil(t, res)
+	if res.StatusCode == sip.StatusInternalServerError {
+		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+		assert.False(t, mediaClosed(), "an out-of-order BYE closed the media of a call that goes on")
+		res = sendBye(t, 6)
+		require.NotNil(t, res)
+	}
+	assert.Equal(t, sip.StatusOK, res.StatusCode)
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	assert.True(t, mediaClosed(), "the BYE that ended the call left its media open")
+}
