@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/emiago/diago/audio"
 	"github.com/emiago/diago/examples"
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
@@ -28,12 +30,19 @@ func main() {
 	dg := diago.NewDiago(ua,
 		diago.WithTransport(
 			diago.Transport{
-				ID:            "tcp",
-				Transport:     "tcp",
-				BindHost:      "127.0.0.1",
-				BindPort:      16441,
-				MediaSRTP:     2, // USE DTLS
-				MediaDTLSConf: media.DTLSConfig{},
+				ID:        "tcp",
+				Transport: "tcp",
+				BindHost:  "127.0.0.1",
+				BindPort:  16441,
+				MediaSRTP: 2, // USE DTLS
+				// The caller offers actpass (RFC 5763 section 5), so it acts as
+				// the DTLS server when the answer takes active, which needs a
+				// certificate. It asks for the peer's to check it against the
+				// answer's a=fingerprint.
+				MediaDTLSConf: media.DTLSConfig{
+					Certificates:     []tls.Certificate{testdata.ClientCertificate()},
+					ServerClientAuth: media.ServerClientAuthRequireCert,
+				},
 			},
 		),
 		diago.WithMediaConfig(
