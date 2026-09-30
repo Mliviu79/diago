@@ -474,9 +474,10 @@ func answerHeader(hdrs []sip.Header, name string) (string, bool) {
 }
 
 // TestTimerAnswer pins the answer-path decision over the pure buildTimerAnswer
-// helper: honor the peer's offered refresher, advertise Supported: timer and
-// never Require: timer, reject below-floor with 422 plus Min-SE, no-op
-// gracefully for a timer-unaware peer, and elect who refreshes.
+// helper: honor the peer's offered refresher, advertise Supported: timer, carry
+// Require: timer when the peer is to refresh (RFC 4028 section 9), reject
+// below-floor with 422 plus Min-SE, no-op gracefully for a timer-unaware peer,
+// and elect who refreshes.
 func TestTimerAnswer(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -485,6 +486,7 @@ func TestTimerAnswer(t *testing.T) {
 		wantStatus    int
 		wantSE        string // expected Session-Expires value, "" means none expected
 		wantSupported bool
+		wantRequire   bool   // expected Require: timer
 		wantMinSE     string // expected Min-SE value on a 422, "" means none
 		wantAnswer    bool
 		wantWeRefresh bool
@@ -492,12 +494,15 @@ func TestTimerAnswer(t *testing.T) {
 		{
 			// Peer offered refresher=uac: the answer honors uac rather than forcing
 			// uas, we are not the refresher, so the peer refreshes and we watch.
-			name:          "honor peer refresher=uac -> arm watchdog",
+			// The UAC must process the answer to know it refreshes, so it
+			// carries Require: timer.
+			name:          "honor peer refresher=uac -> Require: timer, arm watchdog",
 			se:            "1800;refresher=uac",
 			policy:        SessionTimerPolicy{Enabled: true, PreferUASRefresher: true},
 			wantStatus:    200,
 			wantSE:        "1800;refresher=uac",
 			wantSupported: true,
+			wantRequire:   true,
 			wantAnswer:    true,
 			wantWeRefresh: false,
 		},
@@ -561,10 +566,14 @@ func TestTimerAnswer(t *testing.T) {
 				}
 			}
 
-			// We advertise Supported: timer and never Require: timer, so a
-			// timer-unaware peer is never rejected for lacking timer support.
-			if _, ok := answerHeader(hdrs, "Require"); ok {
-				t.Fatalf("answer must never carry Require: timer; headers=%v", hdrs)
+			// RFC 4028 section 9: a 2xx whose Session-Expires names the UAC
+			// the refresher MUST carry Require: timer.
+			gotRequire, ok := answerHeader(hdrs, "Require")
+			if ok != tt.wantRequire {
+				t.Fatalf("Require present = %v, want %v; headers=%v", ok, tt.wantRequire, hdrs)
+			}
+			if ok && gotRequire != "timer" {
+				t.Fatalf("Require = %q, want \"timer\"", gotRequire)
 			}
 
 			if tt.wantSE != "" {
