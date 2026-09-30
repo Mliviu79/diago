@@ -279,8 +279,9 @@ type timerAnswer struct {
 //   - offered Session-Expires below the floor → status 422 plus Min-SE, nil
 //     answer, so no media, no loop and no watchdog.
 //   - otherwise → Session-Expires with the honored refresher plus Supported:
-//     timer (never Require: timer), and an answer that either refreshes or arms
-//     the watchdog.
+//     timer, and Require: timer when the refresher is uac (RFC 4028 section 9:
+//     the UAC must process the 2xx to know it refreshes), and an answer that
+//     either refreshes or arms the watchdog.
 func buildTimerAnswer(invite *sip.Request, policy SessionTimerPolicy) (ta *timerAnswer, hdrs []sip.Header, status int) {
 	if !policy.Enabled {
 		return nil, nil, sip.StatusOK
@@ -306,6 +307,9 @@ func buildTimerAnswer(invite *sip.Request, policy SessionTimerPolicy) (ta *timer
 	hdrs = []sip.Header{
 		sip.NewHeader("Session-Expires", seValue),
 		sip.NewHeader("Supported", "timer"),
+	}
+	if dec.Refresher == refresherUAC {
+		hdrs = append(hdrs, sip.NewHeader("Require", "timer"))
 	}
 	// We refresh when we are the elected refresher, otherwise the peer refreshes
 	// and the timer ends a session the peer stops refreshing.
