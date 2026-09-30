@@ -203,6 +203,9 @@ type pendingReInvite struct {
 	dialog *sipgo.Dialog
 	// answered is set once the re-INVITE has its final response.
 	answered bool
+	// on2xx, when set, is called with the 2xx to the re-INVITE just before it
+	// is sent, see onPeerReInvite2xx.
+	on2xx func(res *sip.Response)
 	// acked is made when a 2xx is sent, and closed once its ACK is read.
 	acked chan struct{}
 	// retransmitted is made when a 2xx is sent, and closed once its
@@ -258,6 +261,17 @@ func (d *DialogMedia) beginPeerReInvite(dialog *sipgo.Dialog, req *sip.Request, 
 	}
 	d.peerReInvite = p
 	return false, nil
+}
+
+// onPeerReInvite2xx has f called with the 2xx to the re-INVITE
+// beginPeerReInvite recorded for tx just before it is sent, with answerMu
+// held: f may add headers to it and act on its being sent, and must not block.
+func (d *DialogMedia) onPeerReInvite2xx(tx sip.ServerTransaction, f func(res *sip.Response)) {
+	d.answerMu.Lock()
+	defer d.answerMu.Unlock()
+	if p := d.peerReInvite; p != nil && p.tx == tx {
+		p.on2xx = f
+	}
 }
 
 // endPeerReInvite waits until the retransmission of a 2xx sent to the
@@ -377,6 +391,9 @@ func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Res
 	}
 	if !res.IsSuccess() {
 		return true, tx.Respond(res)
+	}
+	if p.on2xx != nil {
+		p.on2xx(res)
 	}
 	// Made before the 2xx goes out, which its ACK can follow at once.
 	p.acked = make(chan struct{})

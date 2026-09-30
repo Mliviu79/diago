@@ -410,6 +410,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			// TODO we may actually just build media session with this conf here
 			mediaConf:     dg.mediaConfForTransport(tran),
 			sessionTimers: dg.sessionTimers,
+			log:           dg.log,
 		}
 
 		defer closeAndLog(dWrap, "closing dialog server returned error")

@@ -7,9 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,12 +38,11 @@ type DialogServerSession struct {
 	// timerAnswer holds the negotiated timer outcome for this answer, nil until a
 	// timer-supporting peer is negotiated. Guarded by d.mu.
 	timerAnswer *timerAnswer
-	// timerOnce guards the refresh loop and watchdog launch so a re-answer or an
-	// inbound refresh can never spawn a second goroutine.
-	timerOnce sync.Once
-	// watchdog is the armed peer-refresh watchdog, set when the peer is the
-	// refresher and reset on an inbound refresh re-INVITE. Guarded by d.mu.
-	watchdog *peerRefreshWatchdog
+	// timer is the running session timer, set once by the 2xx that answered
+	// the INVITE with one, and nil without one.
+	timer atomic.Pointer[sessionTimer]
+	// log is the logger of the Diago that made this dialog.
+	log *slog.Logger
 	// answering is set by an answer before it sends its 2xx, and closed when
 	// that answer returns: after the ACK is read and, for an answer that sets
 	// up its media after the ACK, after that too. awaitAnswer waits on it.
@@ -259,15 +258,14 @@ const statusSessionIntervalTooSmall = 422
 var errSessionIntervalTooSmall = errors.New("session interval too small")
 
 // timerAnswer is the negotiated RFC 4028 outcome for a single answer: the
-// headers to append to the 200 OK and the parameters for the refresh loop or the
-// peer-refresh watchdog. It is computed before RespondSDP and consumed once the
-// 200 OK is sent.
+// headers to append to the 200 OK and the session timer it starts. It is
+// computed before RespondSDP and consumed once the 200 OK is sent.
 type timerAnswer struct {
-	headers     []sip.Header
-	interval    time.Duration
-	weRefresh   bool
-	armWatchdog bool
-	expiry      time.Duration
+	headers   []sip.Header
+	weRefresh bool
+	expiry    time.Duration
+	// minSE is the Min-SE the INVITE carried, zero when it carried none.
+	minSE time.Duration
 }
 
 // buildTimerAnswer is the pure UAS answer-path decision for RFC 4028 session
@@ -310,14 +308,16 @@ func buildTimerAnswer(invite *sip.Request, policy SessionTimerPolicy) (ta *timer
 		sip.NewHeader("Supported", "timer"),
 	}
 	// We refresh when we are the elected refresher, otherwise the peer refreshes
-	// and we arm a watchdog to bound a peer that stops refreshing.
-	return &timerAnswer{
-		headers:     hdrs,
-		interval:    dec.Interval,
-		weRefresh:   dec.WeRefresh,
-		armWatchdog: !dec.WeRefresh,
-		expiry:      dec.Negotiated,
-	}, hdrs, sip.StatusOK
+	// and the timer ends a session the peer stops refreshing.
+	ta = &timerAnswer{
+		headers:   hdrs,
+		weRefresh: dec.WeRefresh,
+		expiry:    dec.Negotiated,
+	}
+	if offer.MinSE != nil {
+		ta.minSE = time.Duration(*offer.MinSE) * time.Second
+	}
+	return ta, hdrs, sip.StatusOK
 }
 
 // prepareSessionTimers negotiates RFC 4028 session timers for the answer. On a
@@ -343,27 +343,125 @@ func (d *DialogServerSession) prepareSessionTimers() error {
 	return nil
 }
 
-// launchSessionTimers starts the RFC 4028 timer for this dialog exactly once.
-// When we are the elected refresher it runs the refresh loop, re-INVITEing at
-// half the negotiated interval. Otherwise the peer refreshes and it arms a
-// watchdog that hangs up on a missed refresh. Both run on d.Context() so dialog
-// teardown cancels them, and the grace comes from the policy via watchdogGrace.
+// launchSessionTimers starts the RFC 4028 timer the 2xx that answered the
+// INVITE set, exactly once. Its goroutine runs on d.Context(), so the end of
+// the dialog ends it: it refreshes the session while we are the refresher and
+// ends the call when the peer is and lets the session expire.
 func (d *DialogServerSession) launchSessionTimers(ta *timerAnswer) {
-	d.timerOnce.Do(func() {
-		switch {
-		case ta.weRefresh:
-			// Fire and forget: the loop's lifecycle is the dialog context, so it exits
-			// on Close or Bye. Its escalation error is not propagated here because
-			// there is no per-dialog error channel on the answer path, and a stalled
-			// refresh is independently bounded by the peer's own session timer.
-			go sessionRefreshLoop(d.Context(), ta.interval, d.ReInvite) //nolint:errcheck // see comment above
-		case ta.armWatchdog:
-			w := armPeerRefreshWatchdog(d.Context(), ta.expiry, watchdogGrace(d.sessionTimers), d.Hangup)
-			d.mu.Lock()
-			d.watchdog = w
-			d.mu.Unlock()
-		}
+	t := newSessionTimer(d.sessionTimers, sessionTimerState{
+		active:    true,
+		expires:   ta.expiry,
+		weRefresh: ta.weRefresh,
+		minSE:     ta.minSE,
 	})
+	if !d.timer.CompareAndSwap(nil, t) {
+		return
+	}
+	go t.run(d.Context(), func(ctx context.Context) refreshOutcome {
+		return d.refreshSession(ctx, t)
+	}, d.expireSession)
+}
+
+// logger returns the dialog's logger, sipgo's default for a dialog made
+// outside Diago.
+func (d *DialogServerSession) logger() *slog.Logger {
+	if d.log != nil {
+		return d.log
+	}
+	return sip.DefaultLogger()
+}
+
+// callID returns the dialog's Call-ID for a log line.
+func (d *DialogServerSession) callID() string {
+	if h := d.InviteRequest.CallID(); h != nil {
+		return h.Value()
+	}
+	return ""
+}
+
+// expireSession ends the call whose peer let the session expire without a
+// refresh (RFC 4028 section 10).
+func (d *DialogServerSession) expireSession(ctx context.Context) {
+	d.logger().Warn("The peer did not refresh the session, ending the call", "call_id", d.callID())
+	if err := d.Hangup(ctx); err != nil && ctx.Err() == nil {
+		d.logger().Warn("Ending the call whose session expired failed", "call_id", d.callID(), "error", err)
+	}
+}
+
+// errReInviteAnswerWithoutSDP is why a re-INVITE of ours answered 2xx with no
+// SDP left the media session as it was.
+var errReInviteAnswerWithoutSDP = errors.New("re-INVITE answered 2xx without SDP")
+
+// refreshSession sends one session refresh, a re-INVITE offering the media
+// session as it is, and acts on its outcome as RFC 4028 section 10 sets out: a
+// 408 or 481, or a transaction that timed out, ends the call with our BYE; a
+// 422 is retried once asking for its Min-SE (section 7.3); a 500 or 503 with
+// Retry-After is retried once after it; a 491 is retried by ReInvite; a 2xx
+// without SDP keeps the running session and refreshing goes on; any other
+// failure stops refreshing, which leaves the session to the peer's own timer.
+// Every failure is logged.
+func (d *DialogServerSession) refreshSession(ctx context.Context, t *sessionTimer) refreshOutcome {
+	log := d.logger()
+	retried := false
+	for {
+		err := d.ReInvite(ctx)
+		if err == nil {
+			return refreshGoesOn
+		}
+		if ctx.Err() != nil {
+			return refreshEnded
+		}
+		if errors.Is(err, errReInviteAnswerWithoutSDP) {
+			log.Warn("Session refresh answered without SDP, keeping the media session", "call_id", d.callID())
+			return refreshGoesOn
+		}
+		if errors.Is(err, errMediaClosed) || errors.Is(err, errMediaUpdateAfterAnswer) {
+			// The call is ending: the media is closed, or the answer could not
+			// be applied and the call was hung up.
+			log.Warn("Session refresh failed, the call is ending", "call_id", d.callID(), "error", err)
+			return refreshEnded
+		}
+
+		status := 0
+		var resErr sipgo.ErrDialogResponse
+		if errors.As(err, &resErr) && resErr.Res != nil {
+			status = resErr.Res.StatusCode
+		}
+		switch {
+		case status == sip.StatusRequestTimeout || status == sip.StatusCallTransactionDoesNotExists || errors.Is(err, sip.ErrTransactionTimeout):
+			log.Warn("Session refresh failed, ending the call", "call_id", d.callID(), "status", status, "error", err)
+			if herr := d.hangupNoMedia(); herr != nil {
+				log.Warn("Ending the call after a failed session refresh failed", "call_id", d.callID(), "error", herr)
+			}
+			return refreshEnded
+		case status == statusSessionIntervalTooSmall && !retried:
+			minSE, ok := parseMinSE(resErr.Res)
+			if !ok {
+				break
+			}
+			retried = true
+			t.raiseMinSE(time.Duration(minSE) * time.Second)
+			log.Warn("Session refresh answered 422, retrying with its Min-SE", "call_id", d.callID(), "min_se", minSE)
+			continue
+		case (status == sip.StatusInternalServerError || status == sip.StatusServiceUnavailable) && !retried:
+			after, ok := retryAfter(resErr.Res)
+			if !ok {
+				break
+			}
+			retried = true
+			log.Warn("Session refresh failed, retrying after Retry-After", "call_id", d.callID(), "status", status, "retry_after", after)
+			timer := time.NewTimer(d.sessionTimers.wall(after))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return refreshEnded
+			case <-timer.C:
+			}
+			continue
+		}
+		log.Warn("Session refresh failed, refreshing stopped", "call_id", d.callID(), "status", status, "error", err)
+		return refreshStopped
+	}
 }
 
 // RespondSDP answers the INVITE with a 2xx carrying body and waits for its
@@ -875,7 +973,10 @@ func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *
 // reInviteMediaOnce sends one re-INVITE with sdp, the offer of ms, and installs
 // ms with the answer, unless the dialog media is closed or the dialog has ended
 // by then. ms is discarded when it is not installed. It reports a 491, for the
-// caller to retry.
+// caller to retry. While the session timer runs, the re-INVITE carries its
+// headers and its 2xx sets the timer (RFC 4028 sections 7.1, 7.2 and 7.4). A
+// 2xx without SDP leaves the media session as it was and returns
+// errReInviteAnswerWithoutSDP.
 func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.MediaSession, sdp []byte) (bool, error) {
 	// NOTE: we do not change original invite request
 	d.mu.Lock()
@@ -884,6 +985,15 @@ func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 
 	req := sip.NewRequest(sip.INVITE, contact.Address)
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	timer := d.timer.Load()
+	var weRefresh bool
+	if timer != nil {
+		var hdrs []sip.Header
+		hdrs, weRefresh = timer.requestHeaders()
+		for _, h := range hdrs {
+			req.AppendHeader(h)
+		}
+	}
 	req.SetBody(sdp)
 
 	res, err := d.reInviteSend(ctx, req)
@@ -896,6 +1006,9 @@ func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 		d.mu.Unlock()
 		return false, errors.Join(err, derr)
 	}
+	if timer != nil {
+		timer.answered(res, weRefresh)
+	}
 
 	// Save new remote target contact and update media
 	err = func() error {
@@ -907,6 +1020,9 @@ func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 		d.remoteContactTarget = res.Contact()
 
 		remoteSDP := res.Body()
+		if len(remoteSDP) == 0 {
+			return errors.Join(errReInviteAnswerWithoutSDP, d.discardForkUnsafe(ms))
+		}
 		// The 200 OK answers the offer we sent on the re-INVITE.
 		ms.RemoteSDPIsAnswer = true
 		if err := ms.RemoteSDP(remoteSDP); err != nil {
@@ -1108,6 +1224,15 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
 		return err
 	}
+	// RFC 4028 section 9: while the session timer runs, the 2xx to the
+	// re-INVITE carries the timer it sets, which takes effect as it is sent.
+	if timer := d.timer.Load(); timer != nil {
+		d.onPeerReInvite2xx(tx, func(res *sip.Response) {
+			for _, h := range timer.answerPeer(req) {
+				res.AppendHeader(h)
+			}
+		})
+	}
 	// Once a 2xx has been sent, its ACK is waited for, and only then is the
 	// re-INVITE no longer in progress. A 2xx whose ACK does not come ends the
 	// call (RFC 3261 section 13.3.1.4).
@@ -1151,12 +1276,6 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 		return err
 	}
 
-	// RFC 4028: an inbound refresh re-INVITE resets the active timer. When the
-	// peer is the refresher its watchdog is rearmed. When we refresh, the loop's
-	// ticker self-rearms each tick, so no reset is needed. A plain media-update
-	// re-INVITE carries no Session-Expires and is a no-op here.
-	d.resetSessionTimerOnRefresh(req)
-
 	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteResponse.Contact()); err != nil {
 		if errors.Is(err, errMediaUpdateAfterAnswer) {
 			return errors.Join(err, d.hangupNoMedia())
@@ -1175,25 +1294,6 @@ func (d *DialogServerSession) hangupNoMedia() error {
 	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
 	defer cancel()
 	return d.Hangup(ctx)
-}
-
-// resetSessionTimerOnRefresh rearms the peer-refresh watchdog when req is an RFC
-// 4028 refresh re-INVITE. It is a no-op when timers are disabled, when the
-// request carries no Session-Expires, or when we are the refresher and therefore
-// have no watchdog armed.
-func (d *DialogServerSession) resetSessionTimerOnRefresh(req *sip.Request) {
-	if !d.sessionTimers.Enabled {
-		return
-	}
-	if _, ok := parseSessionTimerOffer(req); !ok {
-		return
-	}
-	d.mu.Lock()
-	w := d.watchdog
-	d.mu.Unlock()
-	if w != nil {
-		w.Reset()
-	}
 }
 
 func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {

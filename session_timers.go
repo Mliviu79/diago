@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
@@ -70,6 +69,20 @@ type SessionTimerPolicy struct {
 	// peer-refresh watchdog hangs up on a missed refresh. Zero falls back to
 	// defaultWatchdogGrace.
 	WatchdogGrace time.Duration
+
+	// clock is how long one second of session-timer time lasts on the wall:
+	// every interval, grace and Retry-After the timer waits out is scaled by
+	// it. Zero is a second. Only this package's tests set it, to run session
+	// timers in milliseconds.
+	clock time.Duration
+}
+
+// wall returns how long d, a session-timer duration, lasts on the wall.
+func (p SessionTimerPolicy) wall(d time.Duration) time.Duration {
+	if p.clock <= 0 {
+		return d
+	}
+	return time.Duration(int64(d) / int64(time.Second) * int64(p.clock))
 }
 
 // sessionTimerDecision is the outcome of negotiate.
@@ -155,10 +168,7 @@ func negotiate(offeredSE *uint32, offeredMinSE *uint32, offeredRefresher string,
 
 	// Refresh at half the negotiated interval, clamped so no offer can storm the
 	// signaling path.
-	interval := negotiated / 2
-	if interval < minRefreshInterval {
-		interval = minRefreshInterval
-	}
+	interval := refreshCadence(negotiated)
 
 	// Honor the peer's offered refresher. Only tiebreak with PreferUASRefresher
 	// when the peer omitted one; false stays neutral and never forces "uas".
@@ -183,17 +193,18 @@ type sessionTimerOffer struct {
 	Refresher string
 }
 
-// parseSessionTimerOffer reads Session-Expires and Min-SE off a request. sipgo
+// parseSessionTimerOffer reads Session-Expires and Min-SE off a request or a
+// response. sipgo
 // carries no typed accessors for these headers, so they are read generically and
 // parsed here. A malformed or out-of-range value is treated as absent rather
 // than as an error: a timer header is never worth failing an otherwise valid
 // INVITE over.
 // ok is false when the peer sent no Session-Expires at all (timer-unaware).
-func parseSessionTimerOffer(req *sip.Request) (offer sessionTimerOffer, ok bool) {
-	h := req.GetHeader("Session-Expires")
+func parseSessionTimerOffer(msg headerGetter) (offer sessionTimerOffer, ok bool) {
+	h := msg.GetHeader("Session-Expires")
 	if h == nil {
 		// Compact form of Session-Expires per RFC 4028 §4.
-		h = req.GetHeader("x")
+		h = msg.GetHeader("x")
 	}
 	if h == nil {
 		return sessionTimerOffer{}, false
@@ -216,15 +227,26 @@ func parseSessionTimerOffer(req *sip.Request) (offer sessionTimerOffer, ok bool)
 		}
 	}
 
-	if m := req.GetHeader("Min-SE"); m != nil {
-		// Min-SE may itself carry generic params; only the delta matters here.
-		mv, _, _ := strings.Cut(m.Value(), ";")
-		if minSE, err := parseDeltaSeconds(mv); err == nil {
-			offer.MinSE = &minSE
-		}
+	if minSE, ok := parseMinSE(msg); ok {
+		offer.MinSE = &minSE
 	}
 
 	return offer, true
+}
+
+// parseMinSE reads the delta-seconds of msg's Min-SE header, which may itself
+// carry generic params. ok is false when it has none or a malformed one.
+func parseMinSE(msg headerGetter) (minSE uint32, ok bool) {
+	m := msg.GetHeader("Min-SE")
+	if m == nil {
+		return 0, false
+	}
+	mv, _, _ := strings.Cut(m.Value(), ";")
+	v, err := parseDeltaSeconds(mv)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // parseDeltaSeconds parses an RFC 3261 delta-seconds value, the on-the-wire form
@@ -244,108 +266,304 @@ func secondsOf(d time.Duration) string {
 	return strconv.FormatInt(int64(d/time.Second), 10)
 }
 
-// sessionRefreshLoop drives the RFC 4028 in-dialog refresh when we are the
-// elected refresher. It ticks every interval and runs refresh. Unlike a liveness
-// probe, which tolerates blips and counts to a threshold, a failed session
-// refresh means the dialog is at risk, so it escalates on the first refresh
-// error. Cancellation of ctx (dialog Close or Bye) is surfaced as the context
-// error and takes precedence over a refresh error observed during shutdown, so
-// the goroutine always exits cleanly with the dialog.
-func sessionRefreshLoop(ctx context.Context, interval time.Duration, refresh func(context.Context) error) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-
-		if err := refresh(ctx); err != nil {
-			if ctx.Err() != nil {
-				// Cancellation during the refresh is a clean teardown, never a
-				// peer-failure signal, so surface the context error.
-				return ctx.Err()
-			}
-			return err
-		}
-	}
+// refreshCadence is how long after a refresh the next one is sent for a
+// session interval of expires: half of it (RFC 4028 section 10), clamped to
+// minRefreshInterval so no interval can storm the signalling path.
+func refreshCadence(expires time.Duration) time.Duration {
+	return max(expires/2, minRefreshInterval)
 }
 
-// peerRefreshWatchdog bounds the case where the peer is the elected refresher
-// and stops refreshing. It fires sendBye exactly once if no inbound refresh
-// resets it within negotiatedSE plus grace, and is cancellable via ctx (dialog
-// Close or Bye) or Stop. The caller supplies the hangup action and resets it on
-// an inbound refresh re-INVITE.
-type peerRefreshWatchdog struct {
-	resetCh chan struct{}
-	stopCh  chan struct{}
-	done    chan struct{}
-	stopOne sync.Once
-	fired   atomic.Bool
+// headerGetter is the header access requests and responses share.
+type headerGetter interface {
+	GetHeader(name string) sip.Header
+	GetHeaders(name string) []sip.Header
 }
 
-// armPeerRefreshWatchdog starts a peer-refresh watchdog that hangs up the dialog
-// via sendBye if no Reset arrives within negotiatedSE plus grace. Resolve grace
-// from policy via watchdogGrace rather than passing a literal. The watchdog exits
-// on ctx cancel, on Stop, or after it fires.
-func armPeerRefreshWatchdog(ctx context.Context, negotiatedSE, grace time.Duration, sendBye func(context.Context) error) *peerRefreshWatchdog {
-	w := &peerRefreshWatchdog{
-		resetCh: make(chan struct{}, 1),
-		stopCh:  make(chan struct{}),
-		done:    make(chan struct{}),
-	}
-	go w.run(ctx, negotiatedSE+grace, sendBye)
-	return w
-}
-
-// run is the watchdog control loop. It rearms its expiry timer on every Reset and
-// fires sendBye at most once when the timer elapses with no reset.
-func (w *peerRefreshWatchdog) run(ctx context.Context, expiry time.Duration, sendBye func(context.Context) error) {
-	defer close(w.done)
-
-	timer := time.NewTimer(expiry)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-w.stopCh:
-			return
-		case <-w.resetCh:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+// supportsTimer reports whether msg lists the timer option tag in a Supported
+// header, or in its compact form k.
+func supportsTimer(msg headerGetter) bool {
+	for _, name := range []string{"Supported", "k"} {
+		for _, h := range msg.GetHeaders(name) {
+			for _, tag := range strings.Split(h.Value(), ",") {
+				if strings.EqualFold(strings.TrimSpace(tag), "timer") {
+					return true
 				}
 			}
-			timer.Reset(expiry)
-		case <-timer.C:
-			if w.fired.CompareAndSwap(false, true) {
-				// Best effort: the dialog is being torn down regardless, and a BYE
-				// error on a dying dialog is not actionable here.
-				_ = sendBye(ctx)
-			}
-			return
 		}
 	}
+	return false
 }
 
-// Reset rearms the watchdog to its full negotiatedSE plus grace window. It is
-// called on an inbound refresh re-INVITE and is safe to call from any goroutine.
-// A reset that races a pending one is coalesced, since the window is rearmed
-// either way.
-func (w *peerRefreshWatchdog) Reset() {
+// retryAfter returns the delta-seconds of res's Retry-After header, which may
+// be followed by a comment and parameters (RFC 3261 section 20.33), and
+// whether it has one.
+func retryAfter(res *sip.Response) (time.Duration, bool) {
+	h := res.GetHeader("Retry-After")
+	if h == nil {
+		return 0, false
+	}
+	value := h.Value()
+	if i := strings.IndexAny(value, " \t;("); i >= 0 {
+		value = value[:i]
+	}
+	v, err := parseDeltaSeconds(value)
+	if err != nil {
+		return 0, false
+	}
+	return time.Duration(v) * time.Second, true
+}
+
+// sessionTimerState is a dialog's RFC 4028 session-timer state.
+type sessionTimerState struct {
+	// active is true while the session has an interval: from the 2xx that
+	// answered the INVITE until a 2xx to a re-INVITE of ours carries no
+	// Session-Expires (RFC 4028 section 7.2).
+	active bool
+	// expires is the session interval the most recent 2xx named (RFC 4028
+	// section 9).
+	expires time.Duration
+	// weRefresh is true when we are the refresher, false when the peer is.
+	weRefresh bool
+	// minSE is the largest Min-SE a request of the peer's or a 422 to a
+	// refresh of ours carried, zero while none has.
+	minSE time.Duration
+}
+
+// sessionTimer is a dialog's running RFC 4028 session timer. Its state changes
+// only with a 2xx: one that answers a re-INVITE of ours (answered) and one we
+// send to a re-INVITE of the peer's (answerPeer); a 422 raises its Min-SE. run
+// refreshes the session while we are the refresher, and ends the dialog when
+// the peer is and lets the session expire. Each change restarts run's wait, so
+// the refreshing and the watch on the peer's refreshing are one goroutine and
+// never run together.
+type sessionTimer struct {
+	policy SessionTimerPolicy
+	// changed is signalled, without blocking, on every change of state that
+	// moves run's wait.
+	changed chan struct{}
+	// done is closed when run returns.
+	done chan struct{}
+
+	mu    sync.Mutex
+	state sessionTimerState
+}
+
+func newSessionTimer(policy SessionTimerPolicy, state sessionTimerState) *sessionTimer {
+	return &sessionTimer{policy: policy, changed: make(chan struct{}, 1), done: make(chan struct{}), state: state}
+}
+
+// snapshot returns the state.
+func (t *sessionTimer) snapshot() sessionTimerState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.state
+}
+
+// setLocked replaces the state and signals run. Called with mu held.
+func (t *sessionTimer) setLocked(state sessionTimerState) {
+	t.state = state
 	select {
-	case w.resetCh <- struct{}{}:
+	case t.changed <- struct{}{}:
 	default:
 	}
 }
 
-// Stop tears the watchdog down without firing a BYE. It is idempotent and safe
-// to call alongside ctx cancellation.
-func (w *peerRefreshWatchdog) Stop() {
-	w.stopOne.Do(func() { close(w.stopCh) })
+// requestHeaders returns the session-timer headers of a re-INVITE of ours,
+// none while the timer is off, and whether they name us the refresher (RFC
+// 4028 sections 7.1 and 7.4): Supported: timer; Session-Expires with the larger
+// of the Min-SE seen and the current interval, and refresher=uac when we
+// refresh or uas when the peer does; and Min-SE once one was seen.
+func (t *sessionTimer) requestHeaders() ([]sip.Header, bool) {
+	st := t.snapshot()
+	if !st.active {
+		return nil, false
+	}
+	refresher := refresherUAS
+	if st.weRefresh {
+		refresher = refresherUAC
+	}
+	hdrs := []sip.Header{
+		sip.NewHeader("Supported", "timer"),
+		sip.NewHeader("Session-Expires", secondsOf(max(st.minSE, st.expires))+";refresher="+refresher),
+	}
+	if st.minSE > 0 {
+		hdrs = append(hdrs, sip.NewHeader("Min-SE", secondsOf(st.minSE)))
+	}
+	return hdrs, st.weRefresh
+}
+
+// answered sets the state from res, the 2xx to a re-INVITE of ours whose
+// session-timer headers named us the refresher when weRefresh (RFC 4028
+// section 7.2): its Session-Expires gives the interval and the refresher, the
+// one we named when it names none; a 2xx without Session-Expires turns the
+// timer off. A 2xx while the timer is off changes nothing: our re-INVITE
+// asked for no timer.
+func (t *sessionTimer) answered(res *sip.Response, weRefresh bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.state
+	if !st.active {
+		return
+	}
+	offer, ok := parseSessionTimerOffer(res)
+	if !ok {
+		st.active = false
+		t.setLocked(st)
+		return
+	}
+	st.expires = time.Duration(*offer.SE) * time.Second
+	switch offer.Refresher {
+	case refresherUAC:
+		st.weRefresh = true
+	case refresherUAS:
+		st.weRefresh = false
+	default:
+		st.weRefresh = weRefresh
+	}
+	t.setLocked(st)
+}
+
+// raiseMinSE records the Min-SE of a 422 to a refresh of ours, so the retry
+// asks for at least it (RFC 4028 section 7.3).
+func (t *sessionTimer) raiseMinSE(minSE time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state.minSE = max(t.state.minSE, minSE)
+}
+
+// answerPeer returns the session-timer headers of the 2xx to req, a re-INVITE
+// of the peer's, none while the timer is off, and sets the state that 2xx
+// names (RFC 4028 section 9): the interval req's Session-Expires carries, else
+// the current one; the refresher req names, else the current one when req
+// lists timer in Supported, else us; Supported: timer; and Require: timer when
+// the peer is to refresh. It is called as the 2xx is sent, as the session
+// interval is the one "in the most recent 2xx response".
+func (t *sessionTimer) answerPeer(req *sip.Request) []sip.Header {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.state
+	if !st.active {
+		return nil
+	}
+	offer, ok := parseSessionTimerOffer(req)
+	if ok {
+		st.expires = time.Duration(*offer.SE) * time.Second
+	}
+	if minSE, ok := parseMinSE(req); ok {
+		st.minSE = max(st.minSE, time.Duration(minSE)*time.Second)
+	}
+	switch {
+	case offer.Refresher == refresherUAC:
+		st.weRefresh = false
+	case offer.Refresher == refresherUAS:
+		st.weRefresh = true
+	case !supportsTimer(req):
+		// RFC 4028 section 9: a UAC that does not support the timer cannot
+		// refresh, so we do.
+		st.weRefresh = true
+	}
+	refresher := refresherUAS
+	if !st.weRefresh {
+		refresher = refresherUAC
+	}
+	hdrs := []sip.Header{
+		sip.NewHeader("Session-Expires", secondsOf(st.expires)+";refresher="+refresher),
+		sip.NewHeader("Supported", "timer"),
+	}
+	if refresher == refresherUAC {
+		hdrs = append(hdrs, sip.NewHeader("Require", "timer"))
+	}
+	t.setLocked(st)
+	return hdrs
+}
+
+// refreshOutcome is what a session refresh leaves the timer to do.
+type refreshOutcome int
+
+const (
+	// refreshGoesOn: the next refresh is due a cadence later.
+	refreshGoesOn refreshOutcome = iota
+	// refreshStopped: no refresh is sent until the state changes, and the
+	// peer's own timer decides (RFC 4028 section 10).
+	refreshStopped
+	// refreshEnded: the dialog is ending.
+	refreshEnded
+)
+
+// run keeps the session timer until ctx ends. While we refresh it calls
+// refresh a refresh cadence after the last change, and refresh says what
+// follows; while the peer refreshes it calls expire once the session interval
+// plus the policy's grace passes with no change, and returns. A change of
+// state restarts the wait, and one after a stopped refresh resumes refreshing.
+// It closes done when it returns.
+func (t *sessionTimer) run(ctx context.Context, refresh func(context.Context) refreshOutcome, expire func(context.Context)) {
+	defer close(t.done)
+	refreshing := true
+	for {
+		select {
+		case <-t.changed:
+			refreshing = true
+		default:
+		}
+		st := t.snapshot()
+
+		var due time.Duration
+		switch {
+		case !st.active || (st.weRefresh && !refreshing):
+			// Nothing is due until the state changes.
+		case st.weRefresh:
+			due = t.policy.wall(refreshCadence(st.expires))
+		default:
+			due = t.policy.wall(st.expires + watchdogGrace(t.policy))
+		}
+
+		switch t.wait(ctx, due) {
+		case wakeDone:
+			return
+		case wakeChanged:
+			refreshing = true
+			continue
+		case wakeDue:
+		}
+
+		if !st.weRefresh {
+			expire(ctx)
+			return
+		}
+		switch refresh(ctx) {
+		case refreshGoesOn:
+		case refreshStopped:
+			refreshing = false
+		case refreshEnded:
+			return
+		}
+	}
+}
+
+// wakeReason is why wait returned.
+type wakeReason int
+
+const (
+	wakeDue wakeReason = iota
+	wakeChanged
+	wakeDone
+)
+
+// wait waits until due has passed, the state changes or ctx ends. A zero due
+// waits for the change or the end only.
+func (t *sessionTimer) wait(ctx context.Context, due time.Duration) wakeReason {
+	var fire <-chan time.Time
+	if due > 0 {
+		timer := time.NewTimer(due)
+		defer timer.Stop()
+		fire = timer.C
+	}
+	select {
+	case <-ctx.Done():
+		return wakeDone
+	case <-t.changed:
+		return wakeChanged
+	case <-fire:
+		return wakeDue
+	}
 }

@@ -5,171 +5,184 @@ package diago
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
 )
 
-// errRefresh is a stand-in session-refresh failure returned by the fake refresh.
-var errRefresh = errors.New("session refresh failed")
-
 // u32 returns a pointer to the given uint32, for building offered header values.
 func u32(v uint32) *uint32 { return &v }
 
-// --- sessionRefreshLoop ------------------------------------------------------
+// --- sessionTimer.run ---------------------------------------------------------
 
-// TestSessionRefreshLoop_EscalatesOnFirstRefreshError verifies the loop returns
-// the refresh error immediately on the first failure. There is no failure
-// counter: a failed re-INVITE means the dialog is at risk, unlike a tolerated
-// liveness blip.
-func TestSessionRefreshLoop_EscalatesOnFirstRefreshError(t *testing.T) {
-	calls := 0
-	refresh := func(context.Context) error {
-		calls++
-		return errRefresh
-	}
+// runClock runs session-timer time a thousand times faster: a 90 second
+// interval lasts 90ms and a refresh is due every 45ms.
+const runClock = time.Millisecond
 
-	err := sessionRefreshLoop(context.Background(), time.Millisecond, refresh)
+// startTimer runs a session timer in the given state on its own goroutine and
+// returns what it did: each call of refresh, which answers with the outcomes
+// in order and then with refreshGoesOn, each call of expire, and a channel
+// closed when run returns.
+func startTimer(t *testing.T, ctx context.Context, state sessionTimerState, outcomes ...refreshOutcome) (*sessionTimer, <-chan struct{}, <-chan struct{}, <-chan struct{}) {
+	t.Helper()
+	timer := newSessionTimer(SessionTimerPolicy{Enabled: true, clock: runClock}, state)
+	refreshes := make(chan struct{}, 64)
+	expires := make(chan struct{}, 64)
+	done := make(chan struct{})
+	var mu sync.Mutex
+	go func() {
+		defer close(done)
+		timer.run(ctx, func(context.Context) refreshOutcome {
+			refreshes <- struct{}{}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(outcomes) == 0 {
+				return refreshGoesOn
+			}
+			o := outcomes[0]
+			outcomes = outcomes[1:]
+			return o
+		}, func(context.Context) {
+			expires <- struct{}{}
+		})
+	}()
+	return timer, refreshes, expires, done
+}
 
-	if !errors.Is(err, errRefresh) {
-		t.Fatalf("err = %v, want errRefresh", err)
-	}
-	if calls != 1 {
-		t.Fatalf("refresh called %d times, want exactly 1 (escalate on first error)", calls)
+func awaitSignal(t *testing.T, ch <-chan struct{}, within time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(within):
+		t.Fatalf("%s did not happen within %s", what, within)
 	}
 }
 
-// TestSessionRefreshLoop_ExitsOnContextCancel verifies the loop returns the
-// context error rather than a refresh escalation when ctx is cancelled, such as
-// on dialog Close or Bye, and that the goroutine exits.
-func TestSessionRefreshLoop_ExitsOnContextCancel(t *testing.T) {
-	refresh := func(context.Context) error { return nil }
+func expectNoSignal(t *testing.T, ch <-chan struct{}, within time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("%s happened", what)
+	case <-time.After(within):
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+// peerRefresh is a re-INVITE of the peer's carrying Session-Expires se.
+func peerRefresh(se string) *sip.Request {
+	req := sip.NewRequest(sip.INVITE, sip.Uri{User: "dg", Host: "127.0.0.1"})
+	req.AppendHeader(sip.NewHeader("Supported", "timer"))
+	req.AppendHeader(sip.NewHeader("Session-Expires", se))
+	return req
+}
+
+// TestSessionTimer_RefreshesAtTheCadenceUntilCancelled verifies that while we
+// refresh, run refreshes every half interval for as long as each refresh goes
+// on, and returns once its ctx is cancelled, the end of the dialog.
+func TestSessionTimer_RefreshesAtTheCadenceUntilCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- sessionRefreshLoop(ctx, time.Millisecond, refresh) }()
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("err = %v, want context.DeadlineExceeded", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("loop did not exit within 2s of context cancel")
+	_, refreshes, expires, done := startTimer(t, ctx, sessionTimerState{active: true, expires: 90 * time.Second, weRefresh: true})
+	for range 3 {
+		awaitSignal(t, refreshes, time.Second, "a refresh")
 	}
-}
-
-// TestSessionRefreshLoop_ContextCancelDuringRefreshTakesPrecedence verifies that
-// a refresh failing because its ctx was cancelled mid-call is surfaced as the
-// context error, never the refresh error. Clean shutdown takes precedence.
-func TestSessionRefreshLoop_ContextCancelDuringRefreshTakesPrecedence(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	refresh := func(context.Context) error {
-		cancel()
-		return errRefresh
-	}
-
-	err := sessionRefreshLoop(ctx, time.Millisecond, refresh)
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled (ctx error precedence)", err)
-	}
-}
-
-// --- armPeerRefreshWatchdog ---------------------------------------------------
-
-// TestPeerRefreshWatchdog_FiresByeOnExpiry verifies a watchdog with no reset
-// hangs up exactly once within the expiry window and then its goroutine exits.
-func TestPeerRefreshWatchdog_FiresByeOnExpiry(t *testing.T) {
-	byeCh := make(chan struct{}, 2)
-	sendBye := func(context.Context) error {
-		byeCh <- struct{}{}
-		return nil
-	}
-
-	w := armPeerRefreshWatchdog(context.Background(), 20*time.Millisecond, 20*time.Millisecond, sendBye)
-	defer w.Stop()
-
-	select {
-	case <-byeCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog did not BYE within 2s of expiry")
-	}
-
-	// Single shot: it must not fire a second BYE.
-	select {
-	case <-byeCh:
-		t.Fatal("watchdog fired BYE more than once")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	select {
-	case <-w.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog goroutine did not exit after firing")
-	}
-}
-
-// TestPeerRefreshWatchdog_ResetPreventsBye verifies that periodic Reset before
-// expiry keeps the dialog alive, so sendBye is never called during the window.
-func TestPeerRefreshWatchdog_ResetPreventsBye(t *testing.T) {
-	var byes atomic.Int32
-	sendBye := func(context.Context) error {
-		byes.Add(1)
-		return nil
-	}
-
-	// expiry 100ms, resetting every 25ms must keep it armed.
-	w := armPeerRefreshWatchdog(context.Background(), 100*time.Millisecond, 0, sendBye)
-
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		w.Reset()
-		time.Sleep(25 * time.Millisecond)
-	}
-
-	if got := byes.Load(); got != 0 {
-		t.Fatalf("watchdog fired %d BYEs during the reset window, want 0", got)
-	}
-
-	w.Stop()
-	select {
-	case <-w.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog goroutine did not exit after Stop")
-	}
-}
-
-// TestPeerRefreshWatchdog_ExitsOnContextCancel verifies the watchdog exits on ctx
-// cancel without firing a BYE, covering a dialog torn down before the
-// peer-refresh window elapses.
-func TestPeerRefreshWatchdog_ExitsOnContextCancel(t *testing.T) {
-	var byes atomic.Int32
-	sendBye := func(context.Context) error {
-		byes.Add(1)
-		return nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// Long expiry so only ctx cancel can end the watchdog.
-	w := armPeerRefreshWatchdog(ctx, 10*time.Second, 0, sendBye)
 	cancel()
+	awaitSignal(t, done, time.Second, "run returning on cancel")
+	expectNoSignal(t, expires, 0, "an expiry while we refresh")
+}
 
-	select {
-	case <-w.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog did not exit within 2s of context cancel")
-	}
+// TestSessionTimer_AStoppedRefreshWaitsForAChange verifies that a refresh that
+// stopped refreshing sends no further refresh until the state changes, which
+// resumes refreshing. There is no retry counter: RFC 4028 section 10 leaves
+// the session to the peer's own timer.
+func TestSessionTimer_AStoppedRefreshWaitsForAChange(t *testing.T) {
+	timer, refreshes, _, _ := startTimer(t, t.Context(), sessionTimerState{active: true, expires: 90 * time.Second, weRefresh: true}, refreshStopped)
+	awaitSignal(t, refreshes, time.Second, "the first refresh")
+	expectNoSignal(t, refreshes, 150*time.Millisecond, "a refresh after refreshing stopped")
+	timer.answerPeer(peerRefresh("90;refresher=uas"))
+	awaitSignal(t, refreshes, time.Second, "a refresh after the peer's refresh named us")
+}
 
-	if got := byes.Load(); got != 0 {
-		t.Fatalf("watchdog fired %d BYEs on ctx-cancel, want 0", got)
+// TestSessionTimer_AnEndedRefreshReturns verifies that run returns once a
+// refresh ended the call.
+func TestSessionTimer_AnEndedRefreshReturns(t *testing.T) {
+	_, refreshes, _, done := startTimer(t, t.Context(), sessionTimerState{active: true, expires: 90 * time.Second, weRefresh: true}, refreshEnded)
+	awaitSignal(t, refreshes, time.Second, "the refresh")
+	awaitSignal(t, done, time.Second, "run returning after the call ended")
+}
+
+// TestSessionTimer_ExitsOnContextCancel verifies run returns without a refresh
+// or an expiry when its ctx is cancelled before it starts, and while it waits
+// on either side.
+func TestSessionTimer_ExitsOnContextCancel(t *testing.T) {
+	for _, weRefresh := range []bool{true, false} {
+		t.Run(fmt.Sprintf("we refresh %v, cancelled before the start", weRefresh), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			_, refreshes, expires, done := startTimer(t, ctx, sessionTimerState{active: true, expires: 90 * time.Second, weRefresh: weRefresh})
+			awaitSignal(t, done, time.Second, "run returning")
+			expectNoSignal(t, refreshes, 0, "a refresh")
+			expectNoSignal(t, expires, 0, "an expiry")
+		})
+		t.Run(fmt.Sprintf("we refresh %v, cancelled while waiting", weRefresh), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			_, refreshes, expires, done := startTimer(t, ctx, sessionTimerState{active: true, expires: 1800 * time.Second, weRefresh: weRefresh})
+			cancel()
+			awaitSignal(t, done, time.Second, "run returning")
+			expectNoSignal(t, refreshes, 0, "a refresh")
+			expectNoSignal(t, expires, 0, "an expiry")
+		})
 	}
+}
+
+// TestSessionTimer_ExpiresOnceWhenThePeerStopsRefreshing verifies that while
+// the peer refreshes, run ends the call once, the session interval plus the
+// grace after the last change, and returns.
+func TestSessionTimer_ExpiresOnceWhenThePeerStopsRefreshing(t *testing.T) {
+	_, refreshes, expires, done := startTimer(t, t.Context(), sessionTimerState{active: true, expires: 90 * time.Second})
+	awaitSignal(t, expires, time.Second, "the expiry")
+	awaitSignal(t, done, time.Second, "run returning after the expiry")
+	expectNoSignal(t, expires, 0, "a second expiry")
+	expectNoSignal(t, refreshes, 0, "a refresh while the peer refreshes")
+}
+
+// TestSessionTimer_APeerRefreshResetsTheExpiry verifies that each 2xx to a
+// peer's refresh restarts the wait for the next, so a peer that keeps
+// refreshing is never cut, and one that stops is, an interval plus the grace
+// after its last refresh.
+func TestSessionTimer_APeerRefreshResetsTheExpiry(t *testing.T) {
+	timer, _, expires, done := startTimer(t, t.Context(), sessionTimerState{active: true, expires: 90 * time.Second})
+	tick := time.NewTicker(30 * time.Millisecond)
+	defer tick.Stop()
+	for range 10 {
+		select {
+		case <-expires:
+			t.Fatal("the session expired while the peer kept refreshing")
+		case <-tick.C:
+			timer.answerPeer(peerRefresh("90;refresher=uac"))
+		}
+	}
+	awaitSignal(t, expires, time.Second, "the expiry after the peer stopped")
+	awaitSignal(t, done, time.Second, "run returning after the expiry")
+}
+
+// TestSessionTimer_ARefresherChangeMovesTheRefreshing verifies that the 2xx
+// to a peer's refresh naming us the refresher has run refresh where it
+// watched, and the 2xx to our refresh naming the peer has it watch where it
+// refreshed; one goroutine does either, never both.
+func TestSessionTimer_ARefresherChangeMovesTheRefreshing(t *testing.T) {
+	timer, refreshes, expires, _ := startTimer(t, t.Context(), sessionTimerState{active: true, expires: 90 * time.Second})
+	timer.answerPeer(peerRefresh("90;refresher=uas"))
+	awaitSignal(t, refreshes, time.Second, "our refresh")
+	expectNoSignal(t, expires, 0, "an expiry once we refresh")
+
+	res := sip.NewResponseFromRequest(peerRefresh("90"), sip.StatusOK, "OK", nil)
+	res.AppendHeader(sip.NewHeader("Session-Expires", "90;refresher=uas"))
+	timer.answered(res, true)
+	awaitSignal(t, expires, time.Second, "the expiry once the peer refreshes")
 }
 
 // TestPeerRefreshWatchdog_GraceResolvesViaPolicy verifies the grace source: the
@@ -463,45 +476,42 @@ func answerHeader(hdrs []sip.Header, name string) (string, bool) {
 // TestTimerAnswer pins the answer-path decision over the pure buildTimerAnswer
 // helper: honor the peer's offered refresher, advertise Supported: timer and
 // never Require: timer, reject below-floor with 422 plus Min-SE, no-op
-// gracefully for a timer-unaware peer, and elect loop versus watchdog.
+// gracefully for a timer-unaware peer, and elect who refreshes.
 func TestTimerAnswer(t *testing.T) {
 	tests := []struct {
-		name            string
-		se              string
-		policy          SessionTimerPolicy
-		wantStatus      int
-		wantSE          string // expected Session-Expires value, "" means none expected
-		wantSupported   bool
-		wantMinSE       string // expected Min-SE value on a 422, "" means none
-		wantAnswer      bool
-		wantWeRefresh   bool
-		wantArmWatchdog bool
+		name          string
+		se            string
+		policy        SessionTimerPolicy
+		wantStatus    int
+		wantSE        string // expected Session-Expires value, "" means none expected
+		wantSupported bool
+		wantMinSE     string // expected Min-SE value on a 422, "" means none
+		wantAnswer    bool
+		wantWeRefresh bool
 	}{
 		{
 			// Peer offered refresher=uac: the answer honors uac rather than forcing
-			// uas, we are not the refresher, so the decision is to arm the watchdog.
-			name:            "honor peer refresher=uac -> arm watchdog",
-			se:              "1800;refresher=uac",
-			policy:          SessionTimerPolicy{Enabled: true, PreferUASRefresher: true},
-			wantStatus:      200,
-			wantSE:          "1800;refresher=uac",
-			wantSupported:   true,
-			wantAnswer:      true,
-			wantWeRefresh:   false,
-			wantArmWatchdog: true,
+			// uas, we are not the refresher, so the peer refreshes and we watch.
+			name:          "honor peer refresher=uac -> arm watchdog",
+			se:            "1800;refresher=uac",
+			policy:        SessionTimerPolicy{Enabled: true, PreferUASRefresher: true},
+			wantStatus:    200,
+			wantSE:        "1800;refresher=uac",
+			wantSupported: true,
+			wantAnswer:    true,
+			wantWeRefresh: false,
 		},
 		{
 			// Peer omitted the refresher: the PreferUASRefresher tiebreaker elects
-			// uas, we are the refresher, so the decision is to start the loop.
-			name:            "omitted refresher, PreferUAS -> refresher=uas, start loop",
-			se:              "1800",
-			policy:          SessionTimerPolicy{Enabled: true, PreferUASRefresher: true},
-			wantStatus:      200,
-			wantSE:          "1800;refresher=uas",
-			wantSupported:   true,
-			wantAnswer:      true,
-			wantWeRefresh:   true,
-			wantArmWatchdog: false,
+			// uas, we are the refresher, so we refresh.
+			name:          "omitted refresher, PreferUAS -> refresher=uas, start loop",
+			se:            "1800",
+			policy:        SessionTimerPolicy{Enabled: true, PreferUASRefresher: true},
+			wantStatus:    200,
+			wantSE:        "1800;refresher=uas",
+			wantSupported: true,
+			wantAnswer:    true,
+			wantWeRefresh: true,
 		},
 		{
 			// Below the 90s floor: 422 Session Interval Too Small plus Min-SE 90,
@@ -548,9 +558,6 @@ func TestTimerAnswer(t *testing.T) {
 			if ta != nil {
 				if ta.weRefresh != tt.wantWeRefresh {
 					t.Fatalf("weRefresh = %v, want %v", ta.weRefresh, tt.wantWeRefresh)
-				}
-				if ta.armWatchdog != tt.wantArmWatchdog {
-					t.Fatalf("armWatchdog = %v, want %v", ta.armWatchdog, tt.wantArmWatchdog)
 				}
 			}
 
