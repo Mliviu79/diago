@@ -472,17 +472,18 @@ func (d *DialogMedia) beginReferAttempt() *referAttempt {
 	return a
 }
 
-// setReferAttemptCSeq records the sent REFER's CSeq: on the dialog's high-water
-// mark whatever a's state, and on a only while a is registered.
+// setReferAttemptCSeq records the sent REFER's CSeq on the dialog's high-water
+// mark and on a, whatever a's state: a NOTIFY that raced ahead of the REFER's
+// response may already have ended and retired a, and the CSeq still belongs to
+// what a observed. Routing reads registered attempts only, so a retired one's
+// CSeq takes no NOTIFY.
 func (d *DialogMedia) setReferAttemptCSeq(a *referAttempt, cseq uint32) {
 	d.referMu.Lock()
 	if cseq > d.referHighestCSeq {
 		d.referHighestCSeq = cseq
 	}
-	if a.registered {
-		a.cseq = cseq
-		a.cseqKnown = true
-	}
+	a.cseq = cseq
+	a.cseqKnown = true
 	d.referMu.Unlock()
 }
 

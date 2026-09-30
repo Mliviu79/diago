@@ -287,7 +287,8 @@ func TestReferAttemptRegistry(t *testing.T) {
 
 		m.recordReferNotify(final)
 		assert.Equal(t, []ReferNotify{final}, newer.notifies)
-		assert.False(t, older.cseqKnown, "a retired attempt's CSeq is not recorded")
+		assert.Empty(t, older.notifies)
+		assert.False(t, newer.cseqKnown, "the older attempt's CSeq was recorded on the newer one")
 	})
 
 	t.Run("delivery never blocks", func(t *testing.T) {
@@ -545,6 +546,39 @@ func TestReferObserveEnds(t *testing.T) {
 				assert.True(t, obs.CSeqKnown, "the sent REFER's CSeq is recorded")
 				assert.Equal(t, uint32(1), obs.CSeq)
 			}
+		})
+	}
+}
+
+// TestReferObserveKeepsTheCSeqOfAnOutcomeThatRacedAhead checks a REFER whose
+// terminal NOTIFY arrives before its own response (RFC 3515 section 2.4.4) still
+// reports its CSeq: that NOTIFY ends and retires the attempt while the REFER is
+// in flight, and the CSeq recorded once the REFER returns belongs to the
+// observation all the same.
+func TestReferObserveKeepsTheCSeqOfAnOutcomeThatRacedAhead(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		state string
+		want  ReferEnd
+	}{
+		{name: "a final NOTIFY", body: "SIP/2.0 200 OK", state: "terminated;reason=noresource", want: ReferEndFinalNotify},
+		{name: "a NOTIFY terminating the subscription", body: "SIP/2.0 100 Trying", state: "terminated;reason=noresource", want: ReferEndSubscriptionEnded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newReferObserveDialog(t, 202, "Accepted")
+			d.nextCSeq = 3
+			var answered int
+			d.onDo = func(*sip.Request) { answered = sendReferNotify(t, d, tc.body, "refer", tc.state) }
+
+			obs, _, err := observeRefer(t.Context(), d)
+			require.NoError(t, err)
+			assert.Equal(t, sip.StatusOK, answered)
+			assert.Equal(t, tc.want, obs.End)
+			assert.True(t, obs.CSeqKnown, "the REFER's CSeq was lost")
+			assert.Equal(t, uint32(3), obs.CSeq)
+			assert.True(t, obs.ResponseReceived)
+			assert.Zero(t, registeredReferAttempts(d.media))
 		})
 	}
 }
