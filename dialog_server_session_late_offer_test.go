@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"strings"
@@ -172,4 +173,164 @@ func TestDialogServerLateOfferAckIsAnswer(t *testing.T) {
 	assert.True(t, sess.RemoteSDPIsAnswer, "the ACK's SDP answers our offer")
 	require.NotEmpty(t, sess.CommonCodecs())
 	assert.Equal(t, "PCMA", sess.CommonCodecs()[0].Name, "the order the peer answered with is the negotiation result")
+}
+
+// newLateOfferTimerDialog builds the dialog newLateOfferDialog does, with the
+// session-timer policy enabled and inviteHeaders on its INVITE. When the answer
+// started a session timer, its cleanup ends the call and waits for the timer.
+func newLateOfferTimerDialog(t *testing.T, inviteHeaders ...sip.Header) (*DialogServerSession, *firstResponseTx, <-chan *sip.Request) {
+	t.Helper()
+	d, inviteTx, sent := newLateOfferDialog(t, MediaConfig{
+		Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+		bindIP: net.IPv4(127, 0, 0, 1),
+	})
+	d.sessionTimers = SessionTimerPolicy{Enabled: true, PreferUASRefresher: true}
+	for _, h := range inviteHeaders {
+		d.InviteRequest.AppendHeader(h)
+	}
+	t.Cleanup(func() {
+		timer := d.timer.Load()
+		if timer == nil {
+			return
+		}
+		// t.Context() is done by the time cleanups run.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.Hangup(ctx)
+		select {
+		case <-timer.done:
+		case <-time.After(5 * time.Second):
+			t.Error("the session timer did not return after the call ended")
+		}
+	})
+	return d, inviteTx, sent
+}
+
+// startAnswerLate runs AnswerLate on another goroutine and returns the first
+// response it sends, with the channel AnswerLate reports on.
+func startAnswerLate(t *testing.T, d *DialogServerSession, inviteTx *firstResponseTx) (*sip.Response, <-chan error) {
+	t.Helper()
+	answered := make(chan error, 1)
+	go func() { answered <- d.AnswerLate() }()
+	select {
+	case res := <-inviteTx.first:
+		return res, answered
+	case <-time.After(5 * time.Second):
+		t.Fatal("no response was sent")
+	}
+	return nil, nil
+}
+
+// peerAnswer is the answer a peer puts in its ACK to offer.
+func peerAnswer(t *testing.T, offer []byte) []byte {
+	t.Helper()
+	peer, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	peer.Codecs = []media.Codec{media.CodecAudioAlaw}
+	require.NoError(t, peer.RemoteSDP(offer))
+	return peer.LocalSDP()
+}
+
+// awaitAnswerLate waits for AnswerLate to report.
+func awaitAnswerLate(t *testing.T, answered <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-answered:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("AnswerLate did not return")
+	}
+	return nil
+}
+
+// TestDialogServerLateOfferNegotiatesTheSessionTimer pins that the answer to an
+// INVITE without an offer negotiates the session timer as the answer to one
+// with an offer does (RFC 4028 section 9): the 2xx carrying our offer carries
+// the timer headers, a Session-Expires below our Min-SE is refused 422 with
+// Min-SE and no 2xx (section 6), and an INVITE with no Session-Expires gets no
+// timer headers. An INVITE requiring timer is accepted (RFC 3261 section
+// 8.2.2.3) on the understanding that every answer does this.
+func TestDialogServerLateOfferNegotiatesTheSessionTimer(t *testing.T) {
+	t.Run("the caller refreshes", func(t *testing.T) {
+		d, inviteTx, _ := newLateOfferTimerDialog(t,
+			sip.NewHeader("Supported", "timer"),
+			sip.NewHeader("Session-Expires", "1800;refresher=uac"),
+		)
+		res, answered := startAnswerLate(t, d, inviteTx)
+
+		require.Equal(t, sip.StatusOK, res.StatusCode)
+		assert.Contains(t, string(res.Body()), "m=audio ", "the 2xx carries our offer")
+		assert.Equal(t, "1800;refresher=uac", headerValue(res, "Session-Expires"))
+		assert.Equal(t, "timer", headerValue(res, "Require"), "the 2xx naming the caller the refresher requires timer")
+		assert.Equal(t, "timer", headerValue(res, "Supported"))
+
+		assert.NoError(t, d.ReadAck(newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
+		assert.NoError(t, awaitAnswerLate(t, answered))
+		assert.NotNil(t, d.timer.Load(), "the 2xx started the session timer")
+	})
+
+	t.Run("a Session-Expires below our Min-SE", func(t *testing.T) {
+		d, inviteTx, _ := newLateOfferTimerDialog(t,
+			sip.NewHeader("Supported", "timer"),
+			sip.NewHeader("Session-Expires", "60"),
+		)
+		res, answered := startAnswerLate(t, d, inviteTx)
+
+		assert.Equal(t, statusSessionIntervalTooSmall, res.StatusCode, "the first response is the 422, no 2xx")
+		assert.Equal(t, "90", headerValue(res, "Min-SE"), "the 422 carries our Min-SE")
+		// The INVITE transaction ends, as it does once the peer acknowledges
+		// the 422.
+		close(inviteTx.done)
+		select {
+		case err := <-answered:
+			assert.ErrorIs(t, err, errSessionIntervalTooSmall, "AnswerLate returns what Answer returns")
+		case <-time.After(5 * time.Second):
+			t.Error("AnswerLate did not return after the 422")
+		}
+	})
+
+	t.Run("no Session-Expires", func(t *testing.T) {
+		d, inviteTx, _ := newLateOfferTimerDialog(t, sip.NewHeader("Supported", "timer"))
+		res, answered := startAnswerLate(t, d, inviteTx)
+
+		require.Equal(t, sip.StatusOK, res.StatusCode)
+		assert.Empty(t, headerValue(res, "Session-Expires"))
+		assert.Empty(t, headerValue(res, "Require"))
+
+		assert.NoError(t, d.ReadAck(newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
+		assert.NoError(t, awaitAnswerLate(t, answered))
+		assert.Nil(t, d.timer.Load(), "no session timer runs")
+	})
+}
+
+// TestDialogServerLateOfferAckWithoutAnswerEndsTheCall pins RFC 3261 section
+// 13.2.1: when the 2xx carries the offer, "the answer MUST be in the
+// acknowledgement for that message". An ACK bringing none leaves the call with
+// no remote media to send to. An ACK cannot be refused, so the call is ended
+// with our BYE, as it is for an answer we cannot apply, and AnswerLate reports
+// the missing answer.
+func TestDialogServerLateOfferAckWithoutAnswerEndsTheCall(t *testing.T) {
+	d, inviteTx, sent := newLateOfferTimerDialog(t)
+	res, answered := startAnswerLate(t, d, inviteTx)
+	require.Equal(t, sip.StatusOK, res.StatusCode)
+
+	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
+	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
+	acked := make(chan error, 1)
+	go func() { acked <- d.ReadAck(ack, newByeServerTx()) }()
+
+	assert.ErrorIs(t, awaitAnswerLate(t, answered), errAckCarriesNoAnswer)
+	select {
+	case req := <-sent:
+		assert.Equal(t, sip.BYE, req.Method, "the call is ended")
+	case <-time.After(5 * time.Second):
+		t.Error("no BYE was sent")
+	}
+	select {
+	case err := <-acked:
+		assert.ErrorIs(t, err, errAckCarriesNoAnswer)
+	case <-time.After(5 * time.Second):
+		t.Error("ReadAck did not return")
+	}
 }

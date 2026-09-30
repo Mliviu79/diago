@@ -53,6 +53,10 @@ type DialogServerSession struct {
 	// the dialog, for the answer waiting on that ACK to report. Guarded by
 	// d.mu.
 	ackAnswerErr error
+	// ackCarriesAnswer is set by AnswerLate before its 2xx, which carries our
+	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
+	// section 13.2.1). Guarded by d.mu.
+	ackCarriesAnswer bool
 	// earlyAnswerSDP is the answer the 183 of ProgressMedia carried, which the
 	// 200 repeats: RFC 3261 section 13.2.1 has the answer placed in a
 	// provisional response be that same exact answer. LocalSDP would change it,
@@ -256,6 +260,11 @@ const statusSessionIntervalTooSmall = 422
 // errSessionIntervalTooSmall aborts the answer when the offered Session-Expires
 // is below the Min-SE floor. A 422 has already been sent to the peer.
 var errSessionIntervalTooSmall = errors.New("session interval too small")
+
+// errAckCarriesNoAnswer ends a call whose 2xx carried our offer when the ACK
+// confirming the dialog brings no answer to it: RFC 3261 section 13.2.1 has the
+// answer in that ACK.
+var errAckCarriesNoAnswer = errors.New("the ACK to the 2xx carrying our offer carries no answer")
 
 // timerAnswer is the negotiated RFC 4028 outcome for a single answer: the
 // headers to append to the 200 OK and the session timer it starts. It is
@@ -696,8 +705,19 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 	return rtpSess.MonitorBackground()
 }
 
-// AnswerLate does answer with Late offer.
+// AnswerLate answers an INVITE that carried no offer: its 2xx carries our
+// offer, and the ACK the answer (RFC 3261 section 13.2.1), which ReadAck
+// applies. It negotiates the session timer as Answer does. An ACK that brings
+// no answer ends the call with a BYE, and AnswerLate returns
+// errAckCarriesNoAnswer.
 func (d *DialogServerSession) AnswerLate() error {
+	// RFC 4028: as Answer, negotiate session timers before the 2xx. A
+	// below-floor offer is refused 422 here, and RespondSDP adds the timer
+	// headers to the 2xx and starts the timer once it is sent.
+	if err := d.prepareSessionTimers(); err != nil {
+		return err
+	}
+
 	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
 		return err
 	}
@@ -713,6 +733,7 @@ func (d *DialogServerSession) AnswerLate() error {
 	// })
 	answering := make(chan struct{})
 	d.answering = answering
+	d.ackCarriesAnswer = true
 	d.mu.Unlock()
 	defer close(answering)
 
@@ -733,8 +754,9 @@ func (d *DialogServerSession) AnswerLate() error {
 // fork that made the offer, which is then installed, since the media session
 // carries the media meanwhile.
 //
-// An ACK cannot be refused, so an answer that cannot be applied, or a handshake
-// that fails, ends the call with a BYE once the ACK has confirmed the dialog:
+// An ACK cannot be refused, so an answer that cannot be applied, an answer
+// missing from the ACK to the 2xx of AnswerLate, or a handshake that fails,
+// ends the call with a BYE once the ACK has confirmed the dialog:
 // RFC 3261 section 13.2.2.4 has a UAC do the same with an offer it cannot
 // accept, and RFC 5763 section 5 has the media session torn down on a
 // fingerprint mismatch. An answer waiting for this ACK sends the BYE and
@@ -773,32 +795,36 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		if d.LoadState() != sip.DialogStateEstablished {
 			return nil
 		}
+		if d.answering != nil {
+			select {
+			case <-d.answering:
+			default:
+				answerWaiting = true
+			}
+		}
 		contentType := req.ContentType()
-		if contentType == nil {
+		body := req.Body()
+		if contentType == nil || body == nil || contentType.Value() != "application/sdp" {
+			if d.ackCarriesAnswer {
+				// Our 2xx carried the offer, and this ACK, the one place the
+				// answer may be, has none: the session has no remote media.
+				d.ackAnswerErr = errAckCarriesNoAnswer
+				return errAckCarriesNoAnswer
+			}
 			return nil
 		}
-		body := req.Body()
-		if body != nil && contentType.Value() == "application/sdp" {
-			if d.answering != nil {
-				select {
-				case <-d.answering:
-				default:
-					answerWaiting = true
-				}
-			}
 
-			// This is Late offer response
-			sess.RemoteSDPIsAnswer = true
-			if err := sess.RemoteSDP(body); err != nil {
-				d.ackAnswerErr = err
-				return err
-			}
+		// This is Late offer response
+		sess.RemoteSDPIsAnswer = true
+		if err := sess.RemoteSDP(body); err != nil {
+			d.ackAnswerErr = err
+			return err
+		}
 
-			// Finalize session. The handshake ends with the call.
-			if err := sess.FinalizeContext(d.Context()); err != nil {
-				d.ackAnswerErr = err
-				return err
-			}
+		// Finalize session. The handshake ends with the call.
+		if err := sess.FinalizeContext(d.Context()); err != nil {
+			d.ackAnswerErr = err
+			return err
 		}
 		return nil
 	}()
@@ -1290,7 +1316,7 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 }
 
 // hangupNoMedia ends a call left without usable media by an answer that could
-// not be applied or by a failed DTLS handshake. The offer/answer exchange was
+// not be applied or never came, or by a failed DTLS handshake. The offer/answer exchange was
 // complete by then, so the peer has moved to the new session. RFC 5763 section
 // 5 has the media session torn down at once on a fingerprint mismatch, and with
 // a single audio stream that is the call.
