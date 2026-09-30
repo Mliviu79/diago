@@ -611,7 +611,7 @@ func TestDialogNotifyForNoRefer(t *testing.T) {
 
 			t.Run("tracked REFER", func(t *testing.T) {
 				d := side.newLive(t)
-				attempt := d.Media().beginReferAttempt(nil)
+				attempt := d.Media().beginReferAttempt()
 				d.Media().setReferAttemptCSeq(attempt, 7)
 				tx := newByeServerTx()
 				d.handleReferNotify(newNotify(), tx)

@@ -52,6 +52,13 @@ type DialogClientSession struct {
 	// cancel all leave it nil, which is the truthful "the peer stated no cause".
 	terminatingBye atomic.Pointer[sip.Request]
 
+	// uncache removes the dialog from its Diago's dialog cache, and Close runs
+	// it. An ended dialog stays findable until its owner closes it, as an
+	// inbound one does until its serve handler returns, so a NOTIFY for a REFER
+	// subscription that outlived the BYE still reaches it (RFC 5057 section
+	// 5.5). Nil for a dialog no Diago made.
+	uncache func() error
+
 	closed atomic.Uint32
 }
 
@@ -60,8 +67,12 @@ func (d *DialogClientSession) Close() error {
 		return nil
 	}
 	e1 := d.DialogMedia.Close()
-	e2 := d.DialogClientSession.Close()
-	return errors.Join(e1, e2)
+	var e2 error
+	if d.uncache != nil {
+		e2 = d.uncache()
+	}
+	e3 := d.DialogClientSession.Close()
+	return errors.Join(e1, e2, e3)
 }
 
 // TerminatingBye returns the BYE request that ended this dialog, or nil when the
@@ -785,7 +796,8 @@ func (d *DialogClientSession) reInviteKeepAlive(ctx context.Context) error {
 // Refer tries todo refer (blind transfer) on call. For more control use ReferOptions
 //
 // It blocks until the transfer outcome is known: the terminal sipfrag NOTIFY, or
-// a 30s deadline. A transfer that did not succeed returns *ReferFailureError.
+// the end of the refer subscription, or of ctx, without one. A transfer that did
+// not succeed returns *ReferFailureError.
 //
 // NOTE: It is expected that after calling this you are hanguping call to send BYE
 func (d *DialogClientSession) Refer(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
@@ -820,10 +832,11 @@ func (d *DialogClientSession) ReferOptions(ctx context.Context, referTo sip.Uri,
 
 // ReferAndObserve sends a blind REFER for referTo and returns what the far end
 // sent back: the REFER's final response, the status line of each NOTIFY and how
-// the wait ended. The wait for a final NOTIFY is bounded by opts.Deadline; a
-// terminal NOTIFY that arrives after the wait goes to opts.OnLate. Neither this
-// method nor any NOTIFY ends the dialog, so what follows the outcome is the
-// caller's decision. Referred-By names this side: the Contact of the INVITE we
+// the attempt ended. The attempt lives as long as the refer subscription the
+// REFER created, past a BYE on the dialog, or until ctx ends (see ReferEnd); a
+// NOTIFY after that is answered 481 and reported through
+// DialogMedia.OnReferNotifyUnmatched. Neither this method nor any NOTIFY ends
+// the dialog, so what follows the outcome is the caller's decision. Referred-By names this side: the Contact of the INVITE we
 // sent. It installs no callback on the dialog, so it does not change what a
 // later Refer or ReferOptions call reports.
 func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {

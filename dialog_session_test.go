@@ -177,7 +177,7 @@ func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
 	notified := -1
 	d := &referNotifyDialog{media: &DialogMedia{}}
 	d.media.onReferNotify = func(statusCode int) { notified = statusCode }
-	attempt := d.media.beginReferAttempt(nil)
+	attempt := d.media.beginReferAttempt()
 
 	req := newReferNotifyRequest(t, "", "SIP/2.0 200 OK")
 	require.Nil(t, req.ContentType(), "the NOTIFY must reach the handler without Content-Type")
@@ -205,11 +205,9 @@ func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
 }
 
 // TestDialogHandleReferNotifyLeavesTheDialogAlone checks a REFER NOTIFY hands
-// the result on and never ends the dialog, whoever sent it and whenever it
-// arrives. Each row has a REFER whose wait ended on its deadline and no
-// OnNotify callback, which is the shape of a NOTIFY arriving after Refer
-// stopped waiting: what follows a transfer result is the dialog owner's
-// decision.
+// the result on and never ends the dialog, whoever sent it. Each row has an
+// open REFER attempt and no OnNotify callback: what follows a transfer result
+// is the dialog owner's decision.
 func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -226,7 +224,7 @@ func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &referNotifyDialog{media: &DialogMedia{}}
-			d.media.finishReferAttempt(d.media.beginReferAttempt(nil), ReferEndDeadline)
+			d.media.beginReferAttempt()
 
 			req := newReferNotifyRequest(t, "message/sipfrag", tc.body)
 			for _, h := range tc.headers {
@@ -534,7 +532,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 
 			t.Run("NOTIFY for a tracked REFER", func(t *testing.T) {
 				d, _ := side.newEnded(t, nil)
-				attempt := d.Media().beginReferAttempt(nil)
+				attempt := d.Media().beginReferAttempt()
 				d.Media().setReferAttemptCSeq(attempt, 7)
 
 				req := newPeerInDialogRequest(sip.NOTIFY, 500)

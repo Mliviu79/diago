@@ -26,17 +26,10 @@ type DialogSession interface {
 	Close() error
 }
 
-// referAnswerDeadline is the budget of the upstream Refer, and of ReferOptions
-// without an OnNotify callback: how long they wait for the final sipfrag NOTIFY
-// once the REFER is accepted. An accepted REFER only acknowledges that the
-// recipient took it for processing; the transfer outcome arrives asynchronously.
-// Package var so tests can shrink it.
-var referAnswerDeadline = 30 * time.Second
-
 // maxReferNotifies bounds how many NOTIFYs one REFER attempt records. A peer may
-// send any number of NOTIFYs inside the deadline, so the list is capped; the
-// rest are counted in ReferObservation.NotifiesDropped and a terminal NOTIFY is
-// always kept as the last entry.
+// send any number of NOTIFYs while the subscription lives, so the list is
+// capped; the rest are counted in ReferObservation.NotifiesDropped and a
+// terminal NOTIFY is always kept as the last entry.
 const maxReferNotifies = 32
 
 // ReferFailureError is returned by a waiting Refer when a blind transfer does not
@@ -47,8 +40,9 @@ const maxReferNotifies = 32
 // of leaking SIP internals.
 type ReferFailureError struct {
 	// Status is the SIP status from the terminal sipfrag (e.g. 486). It is 0 when
-	// no final sipfrag was received: the wait timed out, the context was
-	// cancelled, or the subscription ended without one. Reason says which.
+	// no final sipfrag was received: the refer subscription's own timer ended
+	// it, the context was cancelled, or the notifier ended the subscription
+	// without one. Reason says which.
 	Status int
 	// Reason is a short, non-sensitive phrase from the sipfrag status line
 	// (e.g. "Busy Here"), or "timeout", "cancelled" or "subscription ended" when
@@ -113,9 +107,16 @@ func referCarryClass(err error) error {
 	return nil
 }
 
-// ReferEnd is how an observed REFER attempt ended. Its zero value is not a kind.
-// Deadline, cancellation and an ended subscription are kinds of their own and
-// never a SIP status.
+// ReferEnd is how an observed REFER attempt ended. Its zero value is not a kind,
+// and no kind is a SIP status.
+//
+// An attempt lives exactly as long as the refer subscription its REFER created
+// (RFC 3515 section 2.4.4; RFC 6665 section 4.1.3): from the REFER's 2xx, or a
+// NOTIFY that raced ahead of it, to the first of a NOTIFY carrying a final
+// status, a NOTIFY terminating the subscription, the subscription's own timer,
+// or the caller giving the attempt up. A refused REFER creates none. A BYE on
+// the dialog ends none of these (RFC 5057 section 5.5), and no deadline of the
+// caller's applies.
 type ReferEnd int
 
 const (
@@ -125,15 +126,21 @@ const (
 	// ReferEndRefused means the REFER's final response was not 2xx.
 	// ReferObservation.Response holds it.
 	ReferEndRefused
-	// ReferEndDeadline means the REFER was accepted and no final NOTIFY arrived
-	// within ReferObserveOptions.Deadline. It is not a SIP status.
-	ReferEndDeadline
-	// ReferEndCancelled means the caller's context ended. The REFER's response
-	// may be absent (ReferObservation.ResponseReceived is false).
+	// ReferEndCancelled means the caller's context ended, and the attempt was
+	// given up then: a NOTIFY for it afterwards is answered 481. The REFER's
+	// response may be absent (ReferObservation.ResponseReceived is false).
 	ReferEndCancelled
 	// ReferEndSubscriptionEnded means a NOTIFY with Subscription-State terminated
 	// and a 1xx sipfrag ended the implicit subscription without a final status.
 	ReferEndSubscriptionEnded
+	// ReferEndSubscriptionExpired means the subscription's duration passed with
+	// no NOTIFY ending it: the expires the last active or pending NOTIFY gave
+	// (RFC 6665 sections 4.1.3 and 4.2.1.4), or 64×T1 from a NOTIFY that gave
+	// none this package can read.
+	ReferEndSubscriptionExpired
+	// ReferEndNoNotify means the REFER was accepted and no NOTIFY arrived within
+	// Timer N, 64×T1 from its 2xx (RFC 6665 section 4.1.2.4).
+	ReferEndNoNotify
 )
 
 // String returns the kind as a lowercase slug, or ReferEnd(<n>) for a value that
@@ -144,12 +151,14 @@ func (e ReferEnd) String() string {
 		return "final_notify"
 	case ReferEndRefused:
 		return "refused"
-	case ReferEndDeadline:
-		return "deadline"
 	case ReferEndCancelled:
 		return "cancelled"
 	case ReferEndSubscriptionEnded:
 		return "subscription_ended"
+	case ReferEndSubscriptionExpired:
+		return "subscription_expired"
+	case ReferEndNoNotify:
+		return "no_notify"
 	}
 	return fmt.Sprintf("ReferEnd(%d)", int(e))
 }
@@ -220,31 +229,10 @@ func (o ReferObservation) LastNotify() (ReferNotify, bool) {
 	return o.Notifies[len(o.Notifies)-1], true
 }
 
-// ReferLateNotify is a terminal NOTIFY that arrived after its attempt's wait
-// ended on the deadline or on cancellation, with the attempt's REFER CSeq. It
-// carries only status codes, reason phrases, subscription state and
-// correlation, never Via, Contact, host or URI.
-type ReferLateNotify struct {
-	CSeq      uint32
-	CSeqKnown bool
-	Notify    ReferNotify
-}
-
-// ReferObserveOptions configures an observed REFER attempt. Like the other REFER
-// observation types it carries only status codes, reason phrases, subscription
-// state and correlation, never Via, Contact, host or URI.
-type ReferObserveOptions struct {
-	// Deadline is the bounded wait for a final NOTIFY once the REFER is
-	// accepted. It must be positive and is the caller's budget: no default is
-	// applied.
-	Deadline time.Duration
-	// OnLate receives, at most once per attempt, a terminal NOTIFY (final
-	// status, or Subscription-State terminated) that arrives after the wait
-	// ended on the deadline or on cancellation. It runs on the SIP transaction
-	// goroutine after the 200 has been sent, outside every lock, and must not
-	// block or panic. Nil means such a NOTIFY is answered and dropped.
-	OnLate func(ReferLateNotify)
-}
+// ReferObserveOptions configures an observed REFER attempt. It has no field:
+// the attempt's lifetime is its refer subscription's (see ReferEnd), and a
+// NOTIFY after that is reported through DialogMedia.OnReferNotifyUnmatched.
+type ReferObserveOptions struct{}
 
 // parseSipfragStatus parses the status code and reason phrase from a
 // message/sipfrag status line of the form "SIP/2.0 <code> <reason>" (the shape
@@ -316,6 +304,40 @@ func referSubscriptionTerminated(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(state), "terminated")
 }
 
+// referSubscriptionBound is how long a refer subscription lives after a NOTIFY
+// that did not end it. The expires parameter of its Subscription-State is "the
+// authoritative subscription duration" (RFC 6665 section 4.1.3), and the
+// notifier's alone to set (section 4.2.2), so each such NOTIFY replaces the
+// bound with it. A NOTIFY carrying no expires this package can read, or no
+// Subscription-State at all, breaks that section's MUST; it bounds the
+// subscription at 64×T1 from its arrival, so no attempt lives unbounded.
+func referSubscriptionBound(n ReferNotify) time.Duration {
+	if n.HasSubscriptionState {
+		if seconds, ok := referSubscriptionExpires(n.SubscriptionState); ok {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 64 * sip.T1
+}
+
+// referSubscriptionExpires returns the expires parameter of a Subscription-State
+// value in seconds, and whether it carried one that parses as delta-seconds.
+func referSubscriptionExpires(value string) (uint32, bool) {
+	_, params, _ := strings.Cut(value, ";")
+	for _, param := range strings.Split(params, ";") {
+		name, v, ok := strings.Cut(param, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "expires") {
+			continue
+		}
+		seconds, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		if err != nil {
+			return 0, false
+		}
+		return uint32(seconds), true
+	}
+	return 0, false
+}
+
 //
 // Here are many common functions built for dialog
 //
@@ -348,21 +370,18 @@ func dialogReferSend(ctx context.Context, d DialogSession, recipient, referTo, r
 	return req, res, err
 }
 
-// dialogReferObserve sends a REFER and observes it until it ends: a final
-// NOTIFY, a refused REFER, the deadline, the context ending, or a subscription
-// ended without a final status. It never ends the dialog. The returned response
-// is the REFER's final response when one arrived.
+// dialogReferObserve sends a REFER and observes it for as long as its refer
+// subscription lives (see ReferEnd), or until the caller's context ends, which
+// gives the attempt up. It never ends the dialog. The returned response is the
+// REFER's final response when one arrived.
 //
 // A context that ends before the REFER's final response is reported as
 // ReferEndCancelled with a nil error. The error return is for a REFER that could
-// not be carried for any other reason: a non-positive deadline, a dialog that is
-// not confirmed, a bad header or a transport failure. A transport failure comes
-// back as an error that keeps its class for errors.Is and none of sipgo's text,
-// which carries the REFER's request line and socket addresses.
-func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, opts ReferObserveOptions, headers ...sip.Header) (ReferObservation, *sip.Response, error) {
-	if opts.Deadline <= 0 {
-		return ReferObservation{}, nil, fmt.Errorf("refer deadline must be positive, got %s", opts.Deadline)
-	}
+// not be carried for any other reason: a dialog that is not confirmed, a bad
+// header or a transport failure. A transport failure comes back as an error that
+// keeps its class for errors.Is and none of sipgo's text, which carries the
+// REFER's request line and socket addresses.
+func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, _ ReferObserveOptions, headers ...sip.Header) (ReferObservation, *sip.Response, error) {
 	if d.DialogSIP().LoadState() != sip.DialogStateConfirmed {
 		return ReferObservation{}, nil, fmt.Errorf("can only be called on answered dialog")
 	}
@@ -373,11 +392,12 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 	// Register the attempt BEFORE sending, so a NOTIFY that races ahead of the
 	// REFER's response is recorded on it rather than lost.
 	med := d.Media()
-	attempt := med.beginReferAttempt(opts.OnLate)
+	attempt := med.beginReferAttempt()
 
 	req, res, err := dialogReferSend(ctx, d, recipient, referTo, referredBy, headers)
-	// The dialog assigns the CSeq during Do. Record it even when Do failed, so
-	// a late NOTIFY carrying an Event id still finds this attempt.
+	// The dialog assigns the CSeq during Do. Record it even when Do failed:
+	// the dialog's highest REFER CSeq keeps a NOTIFY for this REFER from being
+	// given to a later attempt.
 	if req != nil {
 		if cseq := req.CSeq(); cseq != nil {
 			med.setReferAttemptCSeq(attempt, cseq.SeqNo)
@@ -385,8 +405,8 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 	}
 	if err != nil {
 		if req != nil && ctx.Err() != nil {
-			// The context ended before the REFER's final response. The attempt
-			// stays registered for a late NOTIFY.
+			// The context ended before the REFER's final response: the caller
+			// gave the attempt up.
 			return med.finishReferAttempt(attempt, ReferEndCancelled), nil, nil
 		}
 		med.dropReferAttempt(attempt)
@@ -404,17 +424,13 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 		return obs, res, nil
 	}
 
-	// The deadline is a timer beside the caller's context rather than a context
-	// derived from it, so which arm fired is the kind: deadline or cancelled.
-	// On wake the NOTIFY handler has already ended the attempt, and finishing
-	// with the zero end keeps what it recorded.
-	timer := time.NewTimer(opts.Deadline)
-	defer timer.Stop()
+	// The attempt ends on its own, by a NOTIFY or its subscription's timer,
+	// which have recorded the end before done closes, and finishing with the
+	// zero end keeps it; or the caller gives it up.
+	med.startReferSubscription(attempt)
 	var end ReferEnd
 	select {
-	case <-attempt.wake:
-	case <-timer.C:
-		end = ReferEndDeadline
+	case <-attempt.done:
 	case <-ctx.Done():
 		end = ReferEndCancelled
 	}
@@ -424,8 +440,8 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 }
 
 // dialogRefer sends a REFER and returns once it is accepted. When wait is true it
-// additionally waits for the final sipfrag NOTIFY (bounded by
-// referAnswerDeadline) and reports the real transfer outcome as a
+// additionally waits, for as long as the refer subscription lives or until ctx
+// ends, for the final sipfrag NOTIFY and reports the real transfer outcome as a
 // *ReferFailureError, rather than reporting the acceptance as success. Callers
 // that supply an OnNotify callback observe the outcome asynchronously instead
 // and pass wait=false.
@@ -444,7 +460,7 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 		return nil
 	}
 
-	obs, res, err := dialogReferObserve(ctx, d, recipient, referTo, refferedBy, ReferObserveOptions{Deadline: referAnswerDeadline}, headers...)
+	obs, res, err := dialogReferObserve(ctx, d, recipient, referTo, refferedBy, ReferObserveOptions{}, headers...)
 	if err != nil {
 		return err
 	}
@@ -457,7 +473,7 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 			return nil
 		}
 		return &ReferFailureError{Status: last.Status, Reason: last.Reason}
-	case ReferEndDeadline:
+	case ReferEndSubscriptionExpired, ReferEndNoNotify:
 		return &ReferFailureError{Status: 0, Reason: "timeout"}
 	case ReferEndCancelled:
 		return &ReferFailureError{Status: 0, Reason: "cancelled"}
@@ -514,73 +530,83 @@ func respondDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransact
 	return true, tx.Respond(res)
 }
 
-// respondNotifyDialogEnded answers a NOTIFY as respondDialogEnded does, unless
-// it is for a REFER d still tracks, and reports whether it did. A BYE ends the
-// INVITE usage of a dialog, not the subscription usage a REFER created, and
-// the dialog lives on until its last usage ends (RFC 5057 sections 2 and 4.1),
-// so a transfer outcome is still taken after the call has ended.
-func respondNotifyDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) bool {
-	if d.DialogSIP().LoadState() != sip.DialogStateEnded || d.Media().referNotifyExpected(req) {
-		return false
-	}
-	ended, _ := respondDialogEnded(d, req, tx)
-	return ended
-}
-
-func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
+// parseReferNotify reads a refer NOTIFY: its message/sipfrag status line, its
+// Subscription-State and its Event id. ok is false when the body is not a
+// sipfrag carrying a valid status line, so an untrusted body is never mistaken
+// for an outcome.
+func parseReferNotify(req *sip.Request) (n ReferNotify, ok bool) {
 	// TODO how to know this is refer
 	contentType := req.ContentType()
 	// For now very basic check
 	if contentType == nil || !strings.HasPrefix(contentType.Value(), "message/sipfrag") {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
-		return
+		return ReferNotify{}, false
 	}
-
 	frag := string(req.Body())
 	if len(frag) < len("SIP/2.0 100 xx") {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
-		return
+		return ReferNotify{}, false
 	}
-
-	// A sipfrag whose status line does not parse is not a usable outcome. Rejecting
-	// it here extends the short-body guard above rather than letting a malformed
-	// body through as status 0.
-	code, reason, ok := parseSipfragStatus(frag)
+	n.Status, n.Reason, ok = parseSipfragStatus(frag)
 	if !ok {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
-		return
+		return ReferNotify{}, false
 	}
-
-	// A NOTIFY for no REFER sent on this dialog matches none of its
-	// subscriptions, which RFC 6665 section 4.1.3 has answered 481.
-	if !d.Media().referNotifyExpected(req) {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
-		return
-	}
-
-	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
-
-	// Every parsed NOTIFY, 1xx progress included, goes to the REFER attempt it
-	// belongs to. A terminal one arriving after that attempt stopped waiting
-	// comes back as the attempt's late callback, which is called here, after
-	// the registry lock is released. The dialog is left to its owner: what
-	// follows a transfer result, success or failure, is the caller's decision.
-	n := ReferNotify{Status: code, Reason: reason}
 	n.SubscriptionState, n.HasSubscriptionState = parseReferSubscriptionState(req)
 	n.EventID, n.HasEventID = parseReferNotifyEventID(req)
+	return n, true
+}
 
+// respondNotifyDialogEnded answers a NOTIFY as respondDialogEnded does, unless
+// an open REFER attempt of d holds it, and reports whether it did. A BYE ends
+// the INVITE usage of a dialog, not the subscription usage a REFER created, and
+// the dialog lives on until its last usage ends (RFC 5057 sections 2, 4.1 and
+// 5.5), so a transfer outcome is still taken after the call has ended. A refer
+// NOTIFY answered here is one no subscription holds, and is reported to the
+// function DialogMedia.OnReferNotifyUnmatched set.
+func respondNotifyDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) bool {
 	med := d.Media()
-	if onLate, late := med.observeReferNotify(n); onLate != nil {
-		onLate(late)
+	if d.DialogSIP().LoadState() != sip.DialogStateEnded || med.referNotifyExpected(req) {
+		return false
+	}
+	ended, _ := respondDialogEnded(d, req, tx)
+	if n, parsed := parseReferNotify(req); ended && parsed {
+		med.reportUnmatchedReferNotify(n)
+	}
+	return ended
+}
+
+// dialogHandleReferNotify answers a refer NOTIFY and routes it. A NOTIFY that
+// an open REFER attempt of d holds is recorded on it and answered 200, and one
+// that ends the attempt retires it after that 200 (RFC 6665 section 4.4.1). A
+// NOTIFY no open attempt holds matches none of d's subscriptions: it is answered
+// 481 (section 4.1.3), never applied, and reported to the function
+// DialogMedia.OnReferNotifyUnmatched set. A body that is not a sipfrag status
+// line is answered 400. The dialog is left to its owner: what follows a
+// transfer result, success or failure, is the caller's decision.
+func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
+	n, parsed := parseReferNotify(req)
+	if !parsed {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+		return
 	}
 
+	med := d.Media()
+	attempt := med.recordReferNotify(n)
 	// TODO: We need find better way to store this on refer.
 	// best case this would be dialogSIP
 	med.mu.Lock()
 	onNot := med.onReferNotify
 	med.mu.Unlock()
+	if attempt == nil && onNot == nil {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
+		med.reportUnmatchedReferNotify(n)
+		return
+	}
+
+	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+	if attempt != nil {
+		med.retireEndedReferAttempt(attempt)
+	}
 	if onNot != nil {
-		onNot(code)
+		onNot(n.Status)
 	}
 }
 

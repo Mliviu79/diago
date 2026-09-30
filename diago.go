@@ -902,9 +902,9 @@ func (dg *Diago) newSipDialog(recipient sip.Uri, tran *Transport, opts NewDialog
 		}
 	})
 
-	d.OnClose(func() error {
+	d.uncache = func() error {
 		return dg.cache.client.DialogDelete(context.Background(), d.ID)
-	})
+	}
 	return d, nil
 }
 
