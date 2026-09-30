@@ -380,6 +380,15 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return errors.Join(fmt.Errorf("%w: %s", errInviteMissingHeader, reason), tx.Respond(res))
 		}
 
+		if tags := unsupportedRequiredExtensions(req, dg.sessionTimers); len(tags) > 0 {
+			// RFC 3261 section 8.2.2.3: a UAS that does not understand an
+			// option tag in Require MUST answer 420 listing it in Unsupported.
+			unsupported := strings.Join(tags, ", ")
+			res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
+			res.AppendHeader(sip.NewHeader("Unsupported", unsupported))
+			return errors.Join(fmt.Errorf("%w: %s", errInviteRequiresUnsupportedExtension, unsupported), tx.Respond(res))
+		}
+
 		tran, _ := dg.getTransport(req.Transport())
 
 		// Proceed as new call
@@ -596,6 +605,26 @@ func (dg *Diago) handleReInvite(req *sip.Request, tx sip.ServerTransaction, id s
 }
 
 var errInviteMissingHeader = errors.New("new INVITE rejected with 400 Bad Request")
+
+var errInviteRequiresUnsupportedExtension = errors.New("new INVITE rejected with 420 Bad Extension")
+
+// unsupportedRequiredExtensions returns the option tags of the request's
+// Require headers that diago does not support, in the order they appear. The
+// only extension diago supports is timer (RFC 4028), and only while the
+// session-timer policy is enabled.
+func unsupportedRequiredExtensions(req *sip.Request, timers SessionTimerPolicy) []string {
+	var tags []string
+	for _, h := range req.GetHeaders("Require") {
+		for _, tag := range strings.Split(h.Value(), ",") {
+			tag = strings.TrimSpace(tag)
+			if tag == "" || (timers.Enabled && strings.EqualFold(tag, "timer")) {
+				continue
+			}
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
 
 // describeMissingInviteHeader returns the reason phrase for the first header a
 // new INVITE lacks among those sipgo.DialogUA.ReadInvite needs: From, the From
