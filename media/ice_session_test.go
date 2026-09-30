@@ -153,7 +153,7 @@ func TestGenerateSDPWithICE(t *testing.T) {
 	}
 	out := string(generateSDPForAudio(1, 1, "UDP/TLS/RTP/SAVP",
 		net.IPv4(192, 0, 2, 1), net.IPv4(192, 0, 2, 1), 10000,
-		sdp.ModeSendrecv, []Codec{CodecAudioUlaw}, sdesInline{}, nil, iceSet))
+		sdp.ModeSendrecv, []Codec{CodecAudioUlaw}, sdesInline{}, nil, iceSet, offeredStreams{}))
 
 	assert.Contains(t, out, "a=ice-ufrag:abcd1234")
 	assert.Contains(t, out, "a=ice-pwd:0123456789abcdef012345")
@@ -173,7 +173,7 @@ func TestGenerateSDPWithICE(t *testing.T) {
 func TestGenerateSDPWithoutICEHasNoICEAttrs(t *testing.T) {
 	out := string(generateSDPForAudio(1, 1, "RTP/AVP",
 		net.IPv4(192, 0, 2, 1), net.IPv4(192, 0, 2, 1), 10000,
-		sdp.ModeSendrecv, []Codec{CodecAudioUlaw}, sdesInline{}, nil, nil))
+		sdp.ModeSendrecv, []Codec{CodecAudioUlaw}, sdesInline{}, nil, nil, offeredStreams{}))
 
 	assert.NotContains(t, out, "a=ice-ufrag")
 	assert.NotContains(t, out, "a=ice-pwd")

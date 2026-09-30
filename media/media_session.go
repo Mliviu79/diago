@@ -245,6 +245,12 @@ type MediaSession struct {
 	ReadRTPFromAddr net.Addr
 	// remoteProto is the media protocol from the remote SDP offer (e.g. "RTP/AVP", "RTP/SAVP")
 	remoteProto string
+	// offeredStreams is the stream list of the last offer RemoteSDP applied.
+	// LocalSDP writes one m= line for each of its streams, in the answer to
+	// that offer and in every later SDP of ours (RFC 3264 sections 6 and 8).
+	// Its zero value, before any offer, has LocalSDP write the audio stream
+	// alone.
+	offeredStreams offeredStreams
 
 	// srtpAuthFailures counts packets discarded for failing SRTP authentication
 	// (RFC 3711 section 3.3). They are normal in small numbers -- media in flight
@@ -562,16 +568,18 @@ func (s *MediaSession) String() string {
 // InitWithSDP allows creating media session with own SDP and bypassing other needs
 func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 	s.sdp = localSDP
-	sd := sdp.SessionDescription{}
-	if err := sdp.Unmarshal(localSDP, &sd); err != nil {
+	sections, err := sdp.UnmarshalSections(localSDP)
+	if err != nil {
 		return fmt.Errorf("fail to parse received SDP: %w", err)
 	}
+	audio := audioStream(sections.Media)
+	if audio < 0 {
+		return fmt.Errorf("%w: no audio media description", ErrNoCommonMedia)
+	}
+	sd := sections.Description(audio)
+	md := sections.Media[audio].Media
 
 	ci, err := sd.ConnectionInformation()
-	if err != nil {
-		return err
-	}
-	md, err := sd.MediaDescription("audio")
 	if err != nil {
 		return err
 	}
@@ -690,6 +698,11 @@ func (s *MediaSession) Fork() *MediaSession {
 		// answer as a downgrade attack and drop the call.
 		SecureRTP: s.SecureRTP,
 		SRTPAlg:   s.SRTPAlg,
+		// Every later SDP of ours keeps the streams of the offer, the rejected
+		// ones included (RFC 3264 section 8), until a new offer is applied.
+		// RemoteSDP replaces the list rather than changing it, so the two
+		// sessions can share it.
+		offeredStreams: s.offeredStreams,
 	}
 
 	cp.establishedICE = s.establishedICE
@@ -917,7 +930,7 @@ func (s *MediaSession) LocalSDP() []byte {
 		mode = s.Mode
 	}
 
-	return generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet, iceSet)
+	return generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet, iceSet, s.offeredStreams)
 }
 
 // RemoteSDP applies remote SDP.
@@ -988,10 +1001,19 @@ func sdpHasFingerprint(attrs []string) bool {
 }
 
 func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
-	sd := sdp.SessionDescription{}
-	if err := sdp.Unmarshal(sdpReceived, &sd); err != nil {
+	sections, err := sdp.UnmarshalSections(sdpReceived)
+	if err != nil {
 		return fmt.Errorf("fail to parse received SDP: %w", err)
 	}
+	audio := audioStream(sections.Media)
+	if audio < 0 {
+		return fmt.Errorf("%w: no audio media description", ErrNoCommonMedia)
+	}
+	// Everything below reads the session level and the audio stream's own
+	// section, never a line of another stream: a c=, a=rtpmap or
+	// a=fingerprint of a video section says nothing of the audio.
+	sd := sections.Description(audio)
+	md := sections.Media[audio].Media
 
 	si, err := sd.SessionInformation()
 	if err != nil {
@@ -1013,15 +1035,6 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		s.sessionID = si.SessionID
 		s.sessionVersion = si.SessionVersion + 1
 	}
-	// TODO: check below. For now we expect and handle only single audio media
-	// For each "m=" line in the offer, there MUST be a corresponding "m="
-	//    line in the answer.  The answer MUST contain exactly the same number
-	//    of "m=" lines as the offer.
-	md, err := sd.MediaDescription("audio")
-	if err != nil {
-		return err
-	}
-
 	attrs := sd.Values("a")
 
 	// Confirm it is supported profile.
@@ -1052,6 +1065,19 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	// perfectly legal SDP rather than a property of any one peer.
 	secureRequest := prof.secure && !prof.dtls && !sdpHasFingerprint(attrs)
 	s.remoteProto = md.Proto
+
+	// RFC 3264 section 6: "For each "m=" line in the offer, there MUST be a
+	// corresponding "m=" line in the answer. The answer MUST contain exactly
+	// the same number of "m=" lines as the offer." An offer's stream list is
+	// what our answer, and every later SDP of ours, is written around. An
+	// answer to our own offer keeps the list that offer was written from.
+	if answerer {
+		streams := make([]sdp.MediaDescription, len(sections.Media))
+		for i, sec := range sections.Media {
+			streams[i] = sec.Media
+		}
+		s.offeredStreams = offeredStreams{media: streams, audio: audio}
+	}
 
 	codecs := make([]Codec, len(md.Formats))
 	n, err := CodecsFromSDPRead(md.Formats, attrs, codecs)
@@ -2723,7 +2749,9 @@ func formatRTPMap(codec Codec) []string {
 	return []string{fmt.Sprintf("a=rtpmap:%d %s/%d/%d", codec.PayloadType, codec.Name, codec.SampleRate, codec.NumChannels)}
 }
 
-func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile string, originIP net.IP, connectionIP net.IP, rtpPort int, mode string, codecs []Codec, sdes sdesInline, dtlsSet *dtlsSetup, iceSet *iceSetup) []byte {
+// generateSDPForAudio writes our SDP: the session level and the audio stream,
+// with every other stream of streams rejected in its place around it.
+func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile string, originIP net.IP, connectionIP net.IP, rtpPort int, mode string, codecs []Codec, sdes sdesInline, dtlsSet *dtlsSetup, iceSet *iceSetup, streams offeredStreams) []byte {
 	// ntpTime := GetCurrentNTPTimestamp()
 
 	fmts := make([]string, len(codecs))
@@ -2748,6 +2776,8 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 		// agent (section 4.2.1.4).
 		s = append(s, "a=ice-lite")
 	}
+	rejectedBefore, rejectedAfter := streams.rejected()
+	s = append(s, rejectedBefore...)
 	s = append(s, fmt.Sprintf("m=audio %d %s %s", rtpPort, rtpProfile, strings.Join(fmts, " ")))
 
 	s = append(s, formatsMap...)
@@ -2789,6 +2819,7 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 			s = append(s, "a=rtcp-mux")
 		}
 	}
+	s = append(s, rejectedAfter...)
 
 	// s := []string{
 	// 	"v=0",
@@ -2815,6 +2846,55 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 
 	res := strings.Join(s, "\r\n") + "\r\n"
 	return []byte(res)
+}
+
+// offeredStreams is the stream list of an offer: its m= lines in order, and
+// audio, the index of the one that carries the call.
+type offeredStreams struct {
+	media []sdp.MediaDescription
+	audio int
+}
+
+// rejected returns the m= lines rejecting every stream but the audio one: those
+// before it and those after it. RFC 3264 section 6: "To reject an offered
+// stream, the port number in the corresponding stream in the answer MUST be
+// set to zero. Any media formats listed are ignored. At least one MUST be
+// present". The line keeps the offered transport and formats and carries no
+// attribute.
+func (o offeredStreams) rejected() (before, after []string) {
+	for i, md := range o.media {
+		if i == o.audio {
+			continue
+		}
+		line := (&sdp.MediaDescription{MediaType: md.MediaType, Proto: md.Proto, Formats: md.Formats}).String()
+		if i < o.audio {
+			before = append(before, line)
+		} else {
+			after = append(after, line)
+		}
+	}
+	return before, after
+}
+
+// audioStream returns the index of the media section that carries the call:
+// the first audio stream on a transport this media stack carries and on a port
+// other than 0, since an offered stream on port 0 "MUST NOT be used" (RFC 3264
+// section 5.1). With no such stream it is the first audio stream, whose use
+// then fails as the unusable stream it is, and with no audio stream at all -1.
+func audioStream(sections []sdp.MediaSection) int {
+	first := -1
+	for i, sec := range sections {
+		if sec.Media.MediaType != "audio" {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		if _, ok := parseRTPProfile(sec.Media.Proto); ok && sec.Media.Port > 0 {
+			return i
+		}
+	}
+	return first
 }
 
 func generateMasterKeySalt(profile srtp.ProtectionProfile) ([]byte, int, error) {

@@ -103,9 +103,12 @@ func TestUnmarshalMalformedNoPanic(t *testing.T) {
 		"empty c=":          []byte("v=0\r\nc=\r\nm=audio 5004 RTP/AVP 8\r\n"),
 		"media truncated c=": []byte("v=0\r\nc=IN IP4 203.0.113.1\r\n" +
 			"m=audio 5004 RTP/AVP 8\r\nc=IN IP4\r\n"),
-		"empty body": {},
-		"lone LF":    []byte("\n"),
-		"lone CR":    []byte("\r"),
+		"second media truncated": []byte("v=0\r\nm=audio 5004 RTP/AVP 8\r\n" +
+			"m=video 5006 RTP/AVP\r\n"),
+		"media line alone": []byte("m=\r\n"),
+		"empty body":       {},
+		"lone LF":          []byte("\n"),
+		"lone CR":          []byte("\r"),
 	}
 
 	for name, body := range bodies {
@@ -115,6 +118,13 @@ func TestUnmarshalMalformedNoPanic(t *testing.T) {
 			_ = Unmarshal(body, &sd)
 			_, _ = sd.ConnectionInformation()
 			_, _ = sd.MediaDescription("audio")
+
+			sections, err := UnmarshalSections(body)
+			if err == nil {
+				for i := range sections.Media {
+					_, _ = sections.Description(i).ConnectionInformation()
+				}
+			}
 		})
 	}
 }

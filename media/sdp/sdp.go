@@ -91,8 +91,14 @@ func (sd SessionDescription) MediaDescription(mediaType string) (MediaDescriptio
 		return md, fmt.Errorf("Media not found for %q", mediaType)
 	}
 
+	return parseMediaLine(v)
+}
+
+// parseMediaLine parses the value of an m= line. RFC 4566 section 5.14 gives it
+// a media type, a port, a transport protocol and at least one format.
+func parseMediaLine(v string) (MediaDescription, error) {
+	md := MediaDescription{}
 	fields := strings.Fields(v)
-	// TODO: is this really a must
 	if len(fields) < 4 {
 		return md, fmt.Errorf("Not enough fields in media description")
 	}
@@ -227,14 +233,84 @@ func (sd SessionDescription) MediaDirection() string {
 // Validation of values needs to be seperate
 // NOT OPTIMIZED
 func Unmarshal(data []byte, sdptr *SessionDescription) error {
+	sd := *sdptr
+	return readLines(data, func(key, value string) error {
+		sd[key] = append(sd[key], value)
+		return nil
+	})
+}
+
+// Line is one <type>=<value> line of an SDP body.
+type Line struct {
+	Type  string
+	Value string
+}
+
+// MediaSection is one media description of an SDP body: its m= line and the
+// lines after it up to the next m= line (RFC 4566 section 5).
+type MediaSection struct {
+	Media MediaDescription
+	// Lines are the section's lines, its m= line first.
+	Lines []Line
+}
+
+// Sections is an SDP body read section by section: the session-level lines,
+// which come before the first m= line, and every media description in the
+// order of the body.
+type Sections struct {
+	Session []Line
+	Media   []MediaSection
+}
+
+// UnmarshalSections reads data section by section, line by line as Unmarshal
+// does. An m= line that does not parse is an error, since the answer to an
+// offer has one m= line for each of the offer's (RFC 3264 section 6).
+func UnmarshalSections(data []byte) (Sections, error) {
+	var s Sections
+	err := readLines(data, func(key, value string) error {
+		l := Line{Type: key, Value: value}
+		if key == "m" {
+			md, err := parseMediaLine(value)
+			if err != nil {
+				return fmt.Errorf("media description %d: %w", len(s.Media), err)
+			}
+			s.Media = append(s.Media, MediaSection{Media: md, Lines: []Line{l}})
+			return nil
+		}
+		if n := len(s.Media); n > 0 {
+			s.Media[n-1].Lines = append(s.Media[n-1].Lines, l)
+			return nil
+		}
+		s.Session = append(s.Session, l)
+		return nil
+	})
+	return s, err
+}
+
+// Description returns the session-level lines and the lines of media section i
+// as one SessionDescription. It describes that stream alone: a line of another
+// section, a c= or an a=rtpmap of another stream, is never read as one of its
+// own.
+func (s Sections) Description(i int) SessionDescription {
+	sd := SessionDescription{}
+	for _, l := range s.Session {
+		sd[l.Type] = append(sd[l.Type], l.Value)
+	}
+	for _, l := range s.Media[i].Lines {
+		sd[l.Type] = append(sd[l.Type], l.Value)
+	}
+	return sd
+}
+
+// readLines calls line with the type and value of each line of data, in order.
+func readLines(data []byte, line func(key, value string) error) error {
 	reader := bufReader.Get().(*bytes.Buffer)
 	defer bufReader.Put(reader)
 	reader.Reset()
 	reader.Write(data)
 
-	sd := *sdptr
 	for {
-		line, err := nextLine(reader)
+		l, err := nextLine(reader)
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -242,20 +318,18 @@ func Unmarshal(data []byte, sdptr *SessionDescription) error {
 			return err
 		}
 
-		if len(line) < 2 {
+		if len(l) < 2 {
 			continue
 		}
 
-		ind := strings.Index(line, "=")
+		ind := strings.Index(l, "=")
 		if ind < 1 {
-			return fmt.Errorf("Not a type=value line found. line=%q", line)
+			return fmt.Errorf("Not a type=value line found. line=%q", l)
 		}
-		key := line[:ind]
-		value := line[ind+1:]
-
-		sd[key] = append(sd[key], value)
+		if err := line(l[:ind], l[ind+1:]); err != nil {
+			return err
+		}
 	}
-
 }
 
 func nextLine(reader *bytes.Buffer) (line string, err error) {

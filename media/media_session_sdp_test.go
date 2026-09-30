@@ -15,7 +15,7 @@ import (
 
 func sdpForCodecs(codecs ...Codec) string {
 	ip := net.IPv4(127, 0, 0, 1)
-	return string(generateSDPForAudio(1, 1, "RTP/AVP", ip, ip, 5004, sdp.ModeSendrecv, codecs, sdesInline{}, nil, nil))
+	return string(generateSDPForAudio(1, 1, "RTP/AVP", ip, ip, 5004, sdp.ModeSendrecv, codecs, sdesInline{}, nil, nil, offeredStreams{}))
 }
 
 // opusAt returns opus as it looks after negotiation with a peer that numbered it
