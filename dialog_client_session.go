@@ -41,6 +41,17 @@ type DialogClientSession struct {
 	// sets the media up once the handshake has keyed it. Guarded by d.mu.
 	earlyUnkeyed bool
 
+	// terminatingBye holds the BYE request that ended this dialog, captured by
+	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
+	// ReadBye answers 200 and drops the request, so an application observes the
+	// ending only as a Context() cancel and cannot tell the peer's BYE from our
+	// own, nor see a cause the peer stated for itself, such as an RFC 3326
+	// Reason header.
+	//
+	// nil until a remote BYE arrives. A local Hangup, a transport death or a
+	// cancel all leave it nil, which is the truthful "the peer stated no cause".
+	terminatingBye atomic.Pointer[sip.Request]
+
 	closed atomic.Uint32
 }
 
@@ -51,6 +62,16 @@ func (d *DialogClientSession) Close() error {
 	e1 := d.DialogMedia.Close()
 	e2 := d.DialogClientSession.Close()
 	return errors.Join(e1, e2)
+}
+
+// TerminatingBye returns the BYE request that ended this dialog, or nil when the
+// dialog was not ended by a remote BYE or has not ended yet. The request is
+// read-only; callers must not mutate it.
+//
+// Safe to call from any goroutine. The store happens before the dialog moves to
+// DialogStateEnded, so an observer that reacts to Context() being done sees it.
+func (d *DialogClientSession) TerminatingBye() *sip.Request {
+	return d.terminatingBye.Load()
 }
 
 func (d *DialogClientSession) Id() string {
@@ -850,10 +871,20 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 // BYE that ended the dialog. A BYE the embedded session refuses as out of
 // order, with sipgo.ErrDialogInvalidCseq, is answered 500 once, as
 // DialogServerSession.ReadBye describes, and the dialog goes on.
+//
+// The BYE is stashed for TerminatingBye before the embedded session ends the
+// dialog, and rolled back when it was refused or did not end the dialog, as
+// DialogServerSession.ReadBye does.
 func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
+	d.terminatingBye.Store(req)
 	if err := readByeOnce(req, tx, d.DialogClientSession.ReadBye); err != nil {
+		// Not this dialog's ending: leave no cause planted on it. A BYE
+		// taken whose 200 could not be sent may still have ended it.
+		if errors.Is(err, sipgo.ErrDialogInvalidCseq) || d.LoadState() != sip.DialogStateEnded {
+			d.terminatingBye.CompareAndSwap(req, nil)
+		}
 		return err
 	}
 	return d.terminatePeerReInviteLocked()
