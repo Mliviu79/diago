@@ -393,10 +393,13 @@ func (d *DialogServerSession) callID() string {
 }
 
 // expireSession ends the call whose peer let the session expire without a
-// refresh (RFC 4028 section 10).
+// refresh (RFC 4028 section 10). Our BYE ends ctx, the dialog's context, once
+// it is sent and its answer is awaited past that end, so a failure is logged
+// whatever ctx's state; only ctx's cancellation, which means the dialog ended
+// before our BYE went out, is not a failure of ours.
 func (d *DialogServerSession) expireSession(ctx context.Context) {
 	d.logger().Warn("The peer did not refresh the session, ending the call", "call_id", d.callID())
-	if err := d.Hangup(ctx); err != nil && ctx.Err() == nil {
+	if err := d.Hangup(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		d.logger().Warn("Ending the call whose session expired failed", "call_id", d.callID(), "error", err)
 	}
 }

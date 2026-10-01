@@ -587,6 +587,21 @@ func TestSessionRefreshAnswersThePeersRefreshAsRFC4028(t *testing.T) {
 		}
 	})
 
+	t.Run("a failed BYE ending an expired session is reported", func(t *testing.T) {
+		p := newRefreshPeer(t, nil)
+		d := p.call(t, peerRefreshesCall...)
+		bye, from := p.await(t, sip.BYE, refreshWall+time.Second)
+		p.answer(t, bye, from, sip.StatusInternalServerError, "Server Internal Error", nil)
+		select {
+		case <-d.Context().Done():
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the dialog did not end with our BYE")
+		}
+		require.Eventually(t, func() bool {
+			return p.warned("Ending the call whose session expired failed", map[string]string{"call_id": p.callID})
+		}, 2*time.Second, 10*time.Millisecond, "the BYE's failure was not logged")
+	})
+
 	t.Run("a refresh naming us the refresher moves the refreshing to us", func(t *testing.T) {
 		p := newRefreshPeer(t, nil)
 		p.call(t, peerRefreshesCall...)
