@@ -942,6 +942,21 @@ func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return d.terminatePeerReInviteLocked()
 }
 
+// NewByeRequest returns a BYE to the dialog's remote target, RemoteContact,
+// over the INVITE's transport (RFC 3261 section 12.2.1.1). WriteBye fills in
+// the dialog's headers.
+func (d *DialogServerSession) NewByeRequest() *sip.Request {
+	bye := sip.NewRequest(sip.BYE, *d.RemoteContact().Address.Clone())
+	bye.SetTransport(d.InviteRequest.Transport())
+	return bye
+}
+
+// Bye sends NewByeRequest and waits within ctx for its final answer, see
+// WriteBye.
+func (d *DialogServerSession) Bye(ctx context.Context) error {
+	return d.WriteBye(ctx, d.NewByeRequest())
+}
+
 // Hangup ends the call: it declines one not answered yet with 480, and ends an
 // answered one with a BYE. Once our 2xx is sent the INVITE transaction takes no
 // other final response, so a call whose 2xx awaits its ACK is ended with a BYE

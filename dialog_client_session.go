@@ -93,6 +93,29 @@ func (d *DialogClientSession) Hangup(ctx context.Context) error {
 	return d.Bye(ctx)
 }
 
+// NewByeRequest returns a BYE to the dialog's remote target, RemoteContact,
+// or to the INVITE's Request-URI when the answer carried no Contact, over the
+// INVITE's transport (RFC 3261 section 12.2.1.1). It needs the INVITE's
+// answer. WriteBye fills in the dialog's headers.
+func (d *DialogClientSession) NewByeRequest() *sip.Request {
+	target := d.InviteRequest.Recipient
+	if contact := d.RemoteContact(); contact != nil {
+		target = contact.Address
+	}
+	bye := sip.NewRequest(sip.BYE, *target.Clone())
+	bye.SetTransport(d.InviteRequest.Transport())
+	return bye
+}
+
+// Bye sends NewByeRequest once the INVITE has an answer, and waits within ctx
+// for its final answer, see WriteBye.
+func (d *DialogClientSession) Bye(ctx context.Context) error {
+	if d.InviteResponse == nil {
+		return fmt.Errorf("bye: can not send as no invite response present")
+	}
+	return d.WriteBye(ctx, d.NewByeRequest())
+}
+
 func (d *DialogClientSession) FromUser() string {
 	return d.InviteRequest.From().Address.User
 }

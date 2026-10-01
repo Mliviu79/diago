@@ -398,6 +398,12 @@ func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Res
 	if p.on2xx != nil {
 		p.on2xx(res)
 	}
+	// The re-INVITE is a target refresh request, which moves the remote
+	// target as its 2xx is sent, and never when it is refused (RFC 6141
+	// section 4.6).
+	d.mu.Lock()
+	d.remoteContactTarget = p.req.Contact().Clone()
+	d.mu.Unlock()
 	// Made before the 2xx goes out, which its ACK can follow at once.
 	p.acked = make(chan struct{})
 	if err := tx.Respond(res); err != nil {
@@ -965,7 +971,6 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 		d.mu.Unlock()
 		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
-	d.remoteContactTarget = req.Contact().Clone()
 
 	// When body is not present this can mean client is doing keep alive
 	// Still offer needs to be responded.
