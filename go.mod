@@ -4,6 +4,8 @@ go 1.24.0
 
 toolchain go1.24.2
 
+replace github.com/emiago/sipgo => ../sipgo
+
 require (
 	github.com/emiago/sipgo v1.6.0
 	github.com/go-audio/riff v1.0.0
