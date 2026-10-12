@@ -135,16 +135,31 @@ func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 	// A failed Init never reaches Close, so the port has to go back right away
 	// or it leaks out of the pool for the life of the process.
 	t.Run("ReleasesWhenInitFails", func(t *testing.T) {
-		alloc := &fakePortAllocator{ports: []int{0}}
+		// The test holds the port open, so the session's bind fails on every
+		// host. An address that is not local is refused on some hosts and
+		// accepted on others, so it cannot be the failing bind.
+		var taken *net.UDPConn
+		for taken == nil {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP})
+			require.NoError(t, err)
+			if c.LocalAddr().(*net.UDPAddr).Port%2 == 0 {
+				taken = c
+			} else {
+				require.NoError(t, c.Close())
+			}
+		}
+		t.Cleanup(func() { _ = taken.Close() })
+		port := taken.LocalAddr().(*net.UDPAddr).Port
+
+		alloc := &fakePortAllocator{ports: []int{port}}
 		d := &DialogMedia{}
 		err := d.initMediaSessionFromConf(MediaConfig{
-			Codecs: []media.Codec{media.CodecAudioUlaw},
-			// TEST-NET-3, assigned to no interface, so the bind always fails.
-			bindIP:           net.IPv4(203, 0, 113, 1),
+			Codecs:           []media.Codec{media.CodecAudioUlaw},
+			bindIP:           bindIP,
 			RTPPortAllocator: alloc,
 		})
 		require.Error(t, err)
-		require.Equal(t, []int{0}, alloc.released)
+		require.Equal(t, []int{port}, alloc.released)
 	})
 
 	// An allocator with nothing left fails the call rather than silently falling
