@@ -6,6 +6,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -1098,4 +1099,29 @@ func TestDialogClientOutOfOrderBye(t *testing.T) {
 	assert.Equal(t, sip.StatusInternalServerError, tx.responses[0].StatusCode)
 	assert.ErrorIs(t, err, sipgo.ErrDialogInvalidCseq)
 	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+}
+
+// TestDialogClientInviteAllocatesOnTheInviteCtx pins that Invite makes its port
+// allocation on the ctx it was called with. The allocator refuses, so Invite
+// returns before it sends anything.
+func TestDialogClientInviteAllocatesOnTheInviteCtx(t *testing.T) {
+	type ctxKey struct{}
+	ctx := context.WithValue(t.Context(), ctxKey{}, "invite")
+	errRefused := errors.New("port allocator refused")
+	var got any
+	alloc := &funcPortAllocator{alloc: func(allocCtx context.Context) (int, error) {
+		got = allocCtx.Value(ctxKey{})
+		return 0, errRefused
+	}}
+
+	d := newTestClientDialog(t, sip.DialogStateEstablished)
+	d.mediaConfig = MediaConfig{
+		Codecs:           []media.Codec{media.CodecAudioUlaw},
+		bindIP:           net.IPv4(127, 0, 0, 1),
+		RTPPortAllocator: alloc,
+	}
+
+	err := d.Invite(ctx, InviteClientOptions{})
+	require.ErrorIs(t, err, errRefused)
+	require.Equal(t, "invite", got, "Invite did not hand the allocator its ctx")
 }

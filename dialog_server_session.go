@@ -182,7 +182,7 @@ var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has no
 
 func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) error {
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
-	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
 	}
 	sess := d.mediaSession
@@ -544,7 +544,7 @@ func (d *DialogServerSession) Answer() error {
 		return d.answerEarlyMedia()
 	}
 
-	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
 	}
 
@@ -593,7 +593,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 	}
 
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
-	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
 	}
 	rtpSess := media.NewRTPSession(d.mediaSession)
@@ -721,7 +721,7 @@ func (d *DialogServerSession) AnswerLate() error {
 		return err
 	}
 
-	if err := d.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
 	}
 	sess := d.mediaSession

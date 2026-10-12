@@ -865,7 +865,7 @@ func (d *DialogMedia) initRTPSessionUnsafe(m *media.MediaSession, rtpSess *media
 	d.RTPPacketWriter = media.NewRTPPacketWriterSession(rtpSess)
 }
 
-func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
+func (d *DialogMedia) initMediaSessionFromConf(ctx context.Context, conf MediaConfig) error {
 	if d.mediaSession != nil {
 		// To allow testing or customizing current underhood session, this may be
 		// precreated, so we want to return if already initialized.
@@ -888,7 +888,7 @@ func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
 	rtpPort := 0
 	var releasePort func()
 	if alloc := conf.RTPPortAllocator; alloc != nil {
-		port, err := alloc.AllocateRTPPort()
+		port, err := alloc.AllocateRTPPort(ctx)
 		if err != nil {
 			return err
 		}

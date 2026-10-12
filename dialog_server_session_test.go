@@ -735,3 +735,107 @@ func TestDialogServerAnswerRepeatsEarlyAnswer(t *testing.T) {
 		t.Fatal("Answer did not return")
 	}
 }
+
+// TestDialogServerMediaAllocatesOnTheDialogCtx pins that each server entry point
+// that sets up media makes its port allocation on the dialog's own ctx: live
+// while the dialog is, and ended once the dialog ends.
+func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// late is an INVITE without an offer, whose 2xx carries ours.
+		late bool
+		run  func(d *DialogServerSession) error
+		// complete is the caller's side, run once the first response is sent.
+		// Nil where the entry point does not wait for an ACK.
+		complete func(t *testing.T, d *DialogServerSession, res *sip.Response)
+	}{
+		{
+			name: "ProgressMedia",
+			run:  func(d *DialogServerSession) error { return d.ProgressMedia() },
+		},
+		{
+			name:     "Answer",
+			run:      func(d *DialogServerSession) error { return d.Answer() },
+			complete: func(t *testing.T, d *DialogServerSession, _ *sip.Response) { confirm(t, d) },
+		},
+		{
+			name:     "AnswerOptions",
+			run:      func(d *DialogServerSession) error { return d.AnswerOptions(AnswerOptions{}) },
+			complete: func(t *testing.T, d *DialogServerSession, _ *sip.Response) { confirm(t, d) },
+		},
+		{
+			name: "AnswerLate",
+			late: true,
+			run:  func(d *DialogServerSession) error { return d.AnswerLate() },
+			complete: func(t *testing.T, d *DialogServerSession, res *sip.Response) {
+				peer := newMediaSessionForTest(t)
+				require.NoError(t, peer.RemoteSDP(res.Body()))
+				require.NoError(t, d.ReadAck(newLateAck(d, peer.LocalSDP()), newByeServerTx()))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				calls    int
+				live     bool
+				allocCtx context.Context
+			)
+			alloc := &funcPortAllocator{alloc: func(ctx context.Context) (int, error) {
+				calls++
+				live = ctx.Err() == nil
+				allocCtx = ctx
+				return 0, nil // 0 lets the OS pick, so the session still binds
+			}}
+			conf := MediaConfig{
+				Codecs:           []media.Codec{media.CodecAudioUlaw},
+				bindIP:           net.IPv4(127, 0, 0, 1),
+				RTPPortAllocator: alloc,
+			}
+
+			var (
+				d        *DialogServerSession
+				inviteTx *firstResponseTx
+			)
+			if tc.late {
+				d, inviteTx, _ = newLateOfferDialog(t, conf)
+			} else {
+				peer := newMediaSessionForTest(t)
+				inviteTx = &firstResponseTx{byeServerTx: newByeServerTx(), first: make(chan *sip.Response, 1)}
+				d = newTestDialogOver(t, inviteTx)
+				d.InviteRequest.SetBody(peer.LocalSDP())
+				d.mediaConf = conf
+			}
+			t.Cleanup(func() { _ = d.DialogMedia.Close() })
+
+			// The entry point may wait for the caller's ACK of its first response,
+			// so it runs on its own goroutine while the caller answers.
+			entered := make(chan error, 1)
+			go func() { entered <- tc.run(d) }()
+			select {
+			case res := <-inviteTx.first:
+				if tc.complete != nil {
+					tc.complete(t, d, res)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("no response was sent")
+			}
+			select {
+			case err := <-entered:
+				require.NoError(t, err)
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s did not return within 10s of its SIP exchange", tc.name)
+			}
+
+			require.Equal(t, 1, calls, "the allocator was consulted once")
+			require.True(t, live, "the allocation was made on an ended ctx")
+			require.NoError(t, allocCtx.Err(), "the dialog's ctx was ended while the dialog was live")
+
+			require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+			select {
+			case <-allocCtx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the dialog's ctx did not end with the dialog")
+			}
+		})
+	}
+}

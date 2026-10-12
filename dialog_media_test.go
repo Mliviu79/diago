@@ -63,7 +63,10 @@ type fakePortAllocator struct {
 	released []int
 }
 
-func (a *fakePortAllocator) AllocateRTPPort() (int, error) {
+func (a *fakePortAllocator) AllocateRTPPort(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, context.Cause(ctx)
+	}
 	if a.err != nil {
 		return 0, a.err
 	}
@@ -97,6 +100,20 @@ func freeEvenPort(t *testing.T, ip net.IP) int {
 	return 0
 }
 
+// funcPortAllocator hands each allocation's ctx to alloc and records every port
+// released to it. It keeps no ctx itself: a test that needs the ctx of an
+// allocation captures it inside alloc.
+type funcPortAllocator struct {
+	alloc    func(ctx context.Context) (int, error)
+	released []int
+}
+
+func (a *funcPortAllocator) AllocateRTPPort(ctx context.Context) (int, error) {
+	return a.alloc(ctx)
+}
+
+func (a *funcPortAllocator) ReleaseRTPPort(port int) { a.released = append(a.released, port) }
+
 func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 	bindIP := net.IPv4(127, 0, 0, 1)
 
@@ -110,7 +127,7 @@ func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 			port = freeEvenPort(t, bindIP)
 			alloc = &fakePortAllocator{ports: []int{port}}
 			d = &DialogMedia{}
-			err := d.initMediaSessionFromConf(MediaConfig{
+			err := d.initMediaSessionFromConf(t.Context(), MediaConfig{
 				Codecs:           []media.Codec{media.CodecAudioUlaw},
 				bindIP:           bindIP,
 				RTPPortAllocator: alloc,
@@ -153,7 +170,7 @@ func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 
 		alloc := &fakePortAllocator{ports: []int{port}}
 		d := &DialogMedia{}
-		err := d.initMediaSessionFromConf(MediaConfig{
+		err := d.initMediaSessionFromConf(t.Context(), MediaConfig{
 			Codecs:           []media.Codec{media.CodecAudioUlaw},
 			bindIP:           bindIP,
 			RTPPortAllocator: alloc,
@@ -167,7 +184,7 @@ func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 	t.Run("AllocationErrorFailsInit", func(t *testing.T) {
 		alloc := &fakePortAllocator{err: errors.New("pool exhausted")}
 		d := &DialogMedia{}
-		err := d.initMediaSessionFromConf(MediaConfig{
+		err := d.initMediaSessionFromConf(t.Context(), MediaConfig{
 			Codecs:           []media.Codec{media.CodecAudioUlaw},
 			bindIP:           bindIP,
 			RTPPortAllocator: alloc,
@@ -177,10 +194,53 @@ func TestInitMediaSessionRTPPortAllocator(t *testing.T) {
 		require.Empty(t, alloc.released, "nothing was allocated, so nothing to release")
 	})
 
+	// The allocation is made on the ctx the caller passed, so a probe or a bind
+	// the allocator makes is bounded by the call that asked for the port.
+	t.Run("the caller's ctx reaches the allocator", func(t *testing.T) {
+		type ctxKey struct{}
+		ctx := context.WithValue(t.Context(), ctxKey{}, "caller")
+		var got any
+		alloc := &funcPortAllocator{alloc: func(allocCtx context.Context) (int, error) {
+			got = allocCtx.Value(ctxKey{})
+			return 0, nil // 0 lets the OS pick, so the session still binds
+		}}
+		d := &DialogMedia{}
+		require.NoError(t, d.initMediaSessionFromConf(ctx, MediaConfig{
+			Codecs:           []media.Codec{media.CodecAudioUlaw},
+			bindIP:           bindIP,
+			RTPPortAllocator: alloc,
+		}))
+		t.Cleanup(func() { _ = d.Close() })
+		require.Equal(t, "caller", got, "the allocator was not handed the caller's ctx")
+	})
+
+	// An allocator that honours an ended ctx fails the init with its cause, and
+	// nothing is bound or released.
+	t.Run("an allocation on an ended ctx fails the init", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		alloc := &funcPortAllocator{alloc: func(allocCtx context.Context) (int, error) {
+			if err := allocCtx.Err(); err != nil {
+				return 0, context.Cause(allocCtx)
+			}
+			return 0, nil
+		}}
+		d := &DialogMedia{}
+		err := d.initMediaSessionFromConf(ctx, MediaConfig{
+			Codecs:           []media.Codec{media.CodecAudioUlaw},
+			bindIP:           bindIP,
+			RTPPortAllocator: alloc,
+		})
+		t.Cleanup(func() { _ = d.Close() })
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, d.mediaSession)
+		require.Empty(t, alloc.released, "nothing was allocated, so nothing to release")
+	})
+
 	// Nil allocator keeps the historical OS/globals behaviour.
 	t.Run("NilAllocatorLeavesPortToOS", func(t *testing.T) {
 		d := &DialogMedia{}
-		require.NoError(t, d.initMediaSessionFromConf(MediaConfig{
+		require.NoError(t, d.initMediaSessionFromConf(t.Context(), MediaConfig{
 			Codecs: []media.Codec{media.CodecAudioUlaw},
 			bindIP: bindIP,
 		}))

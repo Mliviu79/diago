@@ -234,15 +234,18 @@ func (dg *Diago) dtlsConfForTransport(tran *Transport) *media.DTLSConfig {
 
 // RTPPortAllocator hands out and takes back local RTP ports for media sessions.
 //
-// AllocateRTPPort returns an even port whose RTCP companion, port+1, the
-// allocator must consider taken as well, as MediaSession binds the pair. An
-// error surfaces as the media session init failure.
+// AllocateRTPPort receives the context of the call the port is for: the dialog's
+// own context on a server dialog, and the context of Invite on a client dialog.
+// It returns an even port whose RTCP companion, port+1, the allocator must
+// consider taken as well, as MediaSession binds the pair. An ended context must
+// fail the allocation, with context.Cause(ctx) or an error wrapping it, and
+// allocate nothing. The error surfaces as the media session init failure.
 //
 // ReleaseRTPPort is called exactly once per successful allocation, from
 // DialogMedia.Close, after the sockets are closed. It must tolerate a port it
 // does not recognise, as it runs on teardown and so on error paths.
 type RTPPortAllocator interface {
-	AllocateRTPPort() (int, error)
+	AllocateRTPPort(ctx context.Context) (int, error)
 	ReleaseRTPPort(port int)
 }
 

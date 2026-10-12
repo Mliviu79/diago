@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"testing"
 
 	"github.com/emiago/diago/media"
@@ -16,7 +17,10 @@ type countingAllocator struct {
 	released  int
 }
 
-func (a *countingAllocator) AllocateRTPPort() (int, error) {
+func (a *countingAllocator) AllocateRTPPort(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, context.Cause(ctx)
+	}
 	a.allocated++
 	return 0, nil // 0 lets the OS pick, so the session still binds
 }

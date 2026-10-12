@@ -210,7 +210,7 @@ func (o *InviteClientOptions) WithCaller(displayName string, callerID string, ho
 // NOTE: It updates internal invite request so NOT THREAD SAFE.
 // If you pass originator it will use originator to set correct from header and avoid media transcoding
 func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptions) error {
-	if err := d.initMediaSessionFromConf(d.mediaConfig); err != nil {
+	if err := d.initMediaSessionFromConf(ctx, d.mediaConfig); err != nil {
 		return err
 	}
 	return d.invite(ctx, &d.DialogMedia, opts)

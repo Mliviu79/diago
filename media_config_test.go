@@ -47,7 +47,7 @@ func initSessionFor(t *testing.T, dg *Diago, tran *Transport) *media.MediaSessio
 	t.Helper()
 
 	d := &DialogMedia{}
-	require.NoError(t, d.initMediaSessionFromConf(dg.mediaConfForTransport(tran)))
+	require.NoError(t, d.initMediaSessionFromConf(t.Context(), dg.mediaConfForTransport(tran)))
 	t.Cleanup(func() { _ = d.Close() })
 	return d.mediaSession
 }
