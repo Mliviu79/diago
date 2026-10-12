@@ -856,8 +856,9 @@ func (d *DialogClientSession) ReferOptions(ctx context.Context, referTo sip.Uri,
 // ReferAndObserve sends a blind REFER for referTo and returns what the far end
 // sent back: the REFER's final response, the status line of each NOTIFY and how
 // the attempt ended. The attempt lives as long as the refer subscription the
-// REFER created, past a BYE on the dialog, or until ctx ends (see ReferEnd); a
-// NOTIFY after that is answered 481 and reported through
+// REFER created, at most 64×T1 plus one hour from the REFER's 2xx (see ReferEnd),
+// past a BYE on the dialog, or until ctx ends; a NOTIFY after that is answered 481
+// and reported through
 // DialogMedia.OnReferNotifyUnmatched. Neither this method nor any NOTIFY ends
 // the dialog, so what follows the outcome is the caller's decision. Referred-By names this side: the Contact of the INVITE we
 // sent. It installs no callback on the dialog, so it does not change what a

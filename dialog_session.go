@@ -110,13 +110,19 @@ func referCarryClass(err error) error {
 // ReferEnd is how an observed REFER attempt ended. Its zero value is not a kind,
 // and no kind is a SIP status.
 //
-// An attempt lives exactly as long as the refer subscription its REFER created
-// (RFC 3515 section 2.4.4; RFC 6665 section 4.1.3): from the REFER's 2xx, or a
-// NOTIFY that raced ahead of it, to the first of a NOTIFY carrying a final
-// status, a NOTIFY terminating the subscription, the subscription's own timer,
-// or the caller giving the attempt up. A refused REFER creates none. A BYE on
-// the dialog ends none of these (RFC 5057 section 5.5), and no deadline of the
-// caller's applies.
+// An attempt lives as long as the refer subscription its REFER created (RFC 3515
+// section 2.4.4; RFC 6665 section 4.1.3): from the REFER's 2xx, or a NOTIFY that
+// raced ahead of it, to the first of a NOTIFY carrying a final status, a NOTIFY
+// terminating the subscription, the subscription's deadline, or the caller
+// giving the attempt up. Before the first NOTIFY the deadline is 64×T1 from the
+// 2xx. The first NOTIFY that does not end the subscription sets it to the
+// expires that NOTIFY gave, counted from the NOTIFY's arrival and held to at most
+// one hour (a local limit, see referSubscriptionMaxBound). A NOTIFY that gives no
+// expires this package can read sets it to 64×T1 from that NOTIFY's arrival
+// instead. A later NOTIFY can only bring the deadline earlier, never later (RFC
+// 6665 section 4.2.2). So the attempt ends at most 64×T1 plus one hour after the
+// 2xx. A refused REFER creates none. A BYE on the dialog ends none of these (RFC
+// 5057 section 5.5), and no deadline of the caller's applies.
 type ReferEnd int
 
 const (
@@ -133,10 +139,13 @@ const (
 	// ReferEndSubscriptionEnded means a NOTIFY with Subscription-State terminated
 	// and a 1xx sipfrag ended the implicit subscription without a final status.
 	ReferEndSubscriptionEnded
-	// ReferEndSubscriptionExpired means the subscription's duration passed with
-	// no NOTIFY ending it: the expires the last active or pending NOTIFY gave
-	// (RFC 6665 sections 4.1.3 and 4.2.1.4), or 64×T1 from a NOTIFY that gave
-	// none this package can read.
+	// ReferEndSubscriptionExpired means the subscription's deadline passed with
+	// no NOTIFY ending it. The first NOTIFY that does not end the subscription
+	// sets the deadline, whatever its state token: to the expires it gave (RFC
+	// 6665 sections 4.1.3 and 4.2.1.4), at most one hour from that NOTIFY's
+	// arrival. A NOTIFY that gave no expires this package can read counts 64×T1
+	// from its arrival instead. A later NOTIFY can only bring the deadline
+	// earlier.
 	ReferEndSubscriptionExpired
 	// ReferEndNoNotify means the REFER was accepted and no NOTIFY arrived within
 	// Timer N, 64×T1 from its 2xx (RFC 6665 section 4.1.2.4).
@@ -304,17 +313,35 @@ func referSubscriptionTerminated(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(state), "terminated")
 }
 
-// referSubscriptionBound is how long a refer subscription lives after a NOTIFY
-// that did not end it. The expires parameter of its Subscription-State is "the
-// authoritative subscription duration" (RFC 6665 section 4.1.3), and the
-// notifier's alone to set (section 4.2.2), so each such NOTIFY replaces the
-// bound with it. A NOTIFY carrying no expires this package can read, or no
-// Subscription-State at all, breaks that section's MUST; it bounds the
-// subscription at 64×T1 from its arrival, so no attempt lives unbounded.
+// referSubscriptionMaxBound is the longest a refer subscription may run after
+// the first NOTIFY that does not end it. It is our local limit, not a value RFC
+// 6665 sets: the notifier owns the duration it sends (section 4.1.3), but a
+// duration longer than this is cut to it and ended on our side, the same way an
+// expired deadline ends the attempt. Because a later NOTIFY can only shorten the
+// deadline (section 4.2.2), the subscription ends at most this long after its
+// first NOTIFY, however many NOTIFYs follow. A REFER subscription only reports
+// transfer progress, and a final NOTIFY ends it, so the limit is reached only
+// when no final NOTIFY comes. A notifier that keeps the subscription alive for up
+// to an hour is not cut short.
+const referSubscriptionMaxBound = time.Hour
+
+// referSubscriptionBound is the duration a NOTIFY that did not end the
+// subscription gives it, counted from that NOTIFY's arrival. The expires
+// parameter of its Subscription-State is "the authoritative subscription
+// duration" (RFC 6665 section 4.1.3), so it is used as given, up to
+// referSubscriptionMaxBound. recordReferNotify turns this into the attempt's
+// deadline: the first such NOTIFY sets the deadline to it, replacing the 64×T1
+// wait for a first NOTIFY (section 4.1.2.4), and a later one can only bring the
+// deadline earlier (section 4.2.2). A NOTIFY that is active or pending and
+// carries no expires this package can read breaks section 4.2.2's MUST that the
+// expires be present; one with no Subscription-State at all breaks section
+// 4.1.3's MUST that NOTIFY carry it. Either gives 64×T1 from its arrival, so no
+// attempt lives unbounded.
 func referSubscriptionBound(n ReferNotify) time.Duration {
 	if n.HasSubscriptionState {
 		if seconds, ok := referSubscriptionExpires(n.SubscriptionState); ok {
-			return time.Duration(seconds) * time.Second
+			// A uint32 count of seconds fits a Duration, so the product cannot overflow.
+			return min(time.Duration(seconds)*time.Second, referSubscriptionMaxBound)
 		}
 	}
 	return 64 * sip.T1

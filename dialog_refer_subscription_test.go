@@ -424,11 +424,12 @@ func pace(d time.Duration) {
 }
 
 // TestReferAttemptLivesAsItsSubscription checks our REFER's attempt ends where
-// its refer subscription does and nowhere else: on the expires the last active
-// NOTIFY gave (RFC 6665 section 4.1.3), on Timer N when no NOTIFY comes
-// (section 4.1.2.4), on a final or terminating NOTIFY, and at once when the
-// caller gives it up. T1 is shortened, in a child process of its own because
-// sipgo's timers are package state, so Timer N, 64×T1, is 1.28s.
+// its refer subscription does and nowhere else: on the expires the first active
+// NOTIFY gave (RFC 6665 section 4.1.3), which a later NOTIFY can only shorten
+// (section 4.2.2), on Timer N when no NOTIFY comes (section 4.1.2.4), on a final
+// or terminating NOTIFY, and at once when the caller gives it up. T1 is
+// shortened, in a child process of its own because sipgo's timers are package
+// state, so Timer N, 64×T1, is 1.28s.
 func TestReferAttemptLivesAsItsSubscription(t *testing.T) {
 	if diagoRunInChildProcess(t) {
 		return
@@ -457,21 +458,42 @@ func TestReferAttemptLivesAsItsSubscription(t *testing.T) {
 				requireEndedAtItsBound(t, sent, r, time.Second)
 			})
 
-			t.Run("a later active NOTIFY's expires replaces the bound", func(t *testing.T) {
+			t.Run("a later active NOTIFY's larger expires cannot lengthen the attempt", func(t *testing.T) {
 				t.Parallel()
 				p := role.dial(t)
 				out, refer, from := p.startRefer(t, t.Context())
 				id := p.accept(t, refer, from)
+				first := time.Now()
 				require.Equal(t, sip.StatusOK, p.notify(t, id, "active;expires=1", "SIP/2.0 100 Trying"))
 				pace(500 * time.Millisecond)
-				second := time.Now()
 				require.Equal(t, sip.StatusOK, p.notify(t, id, "active;expires=2", "SIP/2.0 180 Ringing"))
 
 				r := awaitReferResult(t, out, 5*time.Second)
 				require.NoError(t, r.err)
 				assert.Equal(t, ReferEndSubscriptionExpired, r.obs.End)
 				assert.Equal(t, []int{100, 180}, notifyStatuses(r.obs))
-				requireEndedAtItsBound(t, second, r, 2*time.Second)
+				requireEndedAtItsBound(t, first, r, time.Second)
+			})
+
+			t.Run("a later active NOTIFY's smaller expires shortens the attempt", func(t *testing.T) {
+				t.Parallel()
+				p := role.dial(t)
+				out, refer, from := p.startRefer(t, t.Context())
+				id := p.accept(t, refer, from)
+				// The first NOTIFY's deadline is 3s from it. The second, 0.5s later
+				// with expires=1, brings the end to 1s after itself, 1.5s after the
+				// first. Had the second been ignored, the end would be 3s after the
+				// first, 2.5s after the second, outside the window checked below.
+				require.Equal(t, sip.StatusOK, p.notify(t, id, "active;expires=3", "SIP/2.0 100 Trying"))
+				pace(500 * time.Millisecond)
+				second := time.Now()
+				require.Equal(t, sip.StatusOK, p.notify(t, id, "active;expires=1", "SIP/2.0 180 Ringing"))
+
+				r := awaitReferResult(t, out, 5*time.Second)
+				require.NoError(t, r.err)
+				assert.Equal(t, ReferEndSubscriptionExpired, r.obs.End)
+				assert.Equal(t, []int{100, 180}, notifyStatuses(r.obs))
+				requireEndedAtItsBound(t, second, r, time.Second)
 			})
 
 			t.Run("no NOTIFY after the 202 ends the attempt at Timer N", func(t *testing.T) {
@@ -707,38 +729,6 @@ func TestReferNotifyNoSubscriptionHoldsIsReported(t *testing.T) {
 				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, p.notify(t, id, "terminated;reason=noresource", "SIP/2.0 486 Busy Here"))
 				assert.Equal(t, sip.DialogStateConfirmed, p.dialog.DialogSIP().LoadState(), "the unmatched NOTIFY ended the dialog")
 			})
-		})
-	}
-}
-
-// TestReferSubscriptionBound checks the duration a NOTIFY that did not end the
-// subscription gives it: its Subscription-State's expires (RFC 6665 section
-// 4.1.3), or 64×T1 when it carries none that parses as delta-seconds, so a
-// malformed or missing value never leaves an attempt unbounded.
-func TestReferSubscriptionBound(t *testing.T) {
-	timerN := 64 * sip.T1
-	for _, tt := range []struct {
-		name  string
-		state string
-		has   bool
-		want  time.Duration
-	}{
-		{name: "active with expires", state: "active;expires=60", has: true, want: 60 * time.Second},
-		{name: "pending with expires", state: "pending;expires=5", has: true, want: 5 * time.Second},
-		{name: "expires among other parameters", state: "active;reason=probation;expires=30", has: true, want: 30 * time.Second},
-		{name: "expires in capitals with spaces", state: "active; EXPIRES = 30", has: true, want: 30 * time.Second},
-		{name: "an expires of zero", state: "active;expires=0", has: true, want: 0},
-		{name: "no expires", state: "active", has: true, want: timerN},
-		{name: "an empty expires", state: "active;expires=", has: true, want: timerN},
-		{name: "a negative expires", state: "active;expires=-1", has: true, want: timerN},
-		{name: "a non-numeric expires", state: "active;expires=soon", has: true, want: timerN},
-		{name: "an expires past 32 bits", state: "active;expires=4294967296", has: true, want: timerN},
-		{name: "an unknown state without expires", state: "waiting", has: true, want: timerN},
-		{name: "no Subscription-State", has: false, want: timerN},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			n := ReferNotify{Status: 100, SubscriptionState: tt.state, HasSubscriptionState: tt.has}
-			assert.Equal(t, tt.want, referSubscriptionBound(n))
 		})
 	}
 }

@@ -1142,3 +1142,41 @@ func TestDialogReInvite2xxRetransmission(t *testing.T) {
 		})
 	}
 }
+
+// TestReferSubscriptionBound checks the duration referSubscriptionBound gives a
+// NOTIFY that did not end the subscription: its Subscription-State's expires (RFC
+// 6665 section 4.1.3), capped at one hour, or 64×T1 when it carries none that
+// parses as delta-seconds, so a missing or malformed value never leaves an
+// attempt unbounded.
+func TestReferSubscriptionBound(t *testing.T) {
+	timerN := 64 * sip.T1
+	for _, tt := range []struct {
+		name  string
+		state string
+		has   bool
+		want  time.Duration
+	}{
+		{name: "active with expires", state: "active;expires=60", has: true, want: 60 * time.Second},
+		{name: "pending with expires", state: "pending;expires=5", has: true, want: 5 * time.Second},
+		{name: "expires among other parameters", state: "active;reason=probation;expires=30", has: true, want: 30 * time.Second},
+		{name: "expires in capitals with spaces", state: "active; EXPIRES = 30", has: true, want: 30 * time.Second},
+		{name: "an expires of zero", state: "active;expires=0", has: true, want: 0},
+		{name: "an expires one second below the cap", state: "active;expires=3599", has: true, want: 3599 * time.Second},
+		{name: "an expires at the cap", state: "active;expires=3600", has: true, want: time.Hour},
+		{name: "an expires one second above the cap", state: "active;expires=3601", has: true, want: time.Hour},
+		{name: "the largest 32-bit expires", state: "active;expires=4294967295", has: true, want: time.Hour},
+		{name: "no expires", state: "active", has: true, want: timerN},
+		{name: "an empty expires", state: "active;expires=", has: true, want: timerN},
+		{name: "a negative expires", state: "active;expires=-1", has: true, want: timerN},
+		{name: "a non-numeric expires", state: "active;expires=soon", has: true, want: timerN},
+		{name: "an expires past 32 bits", state: "active;expires=4294967296", has: true, want: timerN},
+		{name: "an unknown state without expires", state: "waiting", has: true, want: timerN},
+		{name: "no Subscription-State", has: false, want: timerN},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			n := ReferNotify{Status: 100, SubscriptionState: tt.state, HasSubscriptionState: tt.has}
+			assert.Equal(t, tt.want, referSubscriptionBound(n))
+		})
+	}
+}
