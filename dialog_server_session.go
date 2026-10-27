@@ -347,13 +347,16 @@ func buildTimerAnswer(invite *sip.Request, policy SessionTimerPolicy) (ta *timer
 // prepareSessionTimers negotiates RFC 4028 session timers for the answer. On a
 // below-floor offer it sends 422 with Min-SE and returns
 // errSessionIntervalTooSmall so the caller aborts before any media, loop or
-// watchdog. Otherwise it stashes the timer headers, which RespondSDP appends to
+// watchdog; the 422 waits for its ACK within ctx, see answerWithin. Otherwise it stashes the timer headers, which RespondSDP appends to
 // the 200 OK, along with the launch parameters. A timer-unaware peer or a
 // disabled policy leaves d.timerAnswer nil, a graceful no-op.
-func (d *DialogServerSession) prepareSessionTimers() error {
+func (d *DialogServerSession) prepareSessionTimers(ctx context.Context) error {
 	ta, hdrs, status := buildTimerAnswer(d.InviteRequest, d.sessionTimers)
 	if status == statusSessionIntervalTooSmall {
-		if err := d.Respond(statusSessionIntervalTooSmall, "Session Interval Too Small", nil, hdrs...); err != nil {
+		err := d.answerWithin(ctx, make(chan struct{}), func() error {
+			return d.Respond(statusSessionIntervalTooSmall, "Session Interval Too Small", nil, hdrs...)
+		})
+		if err != nil {
 			return err
 		}
 		return errSessionIntervalTooSmall
@@ -555,6 +558,10 @@ func (d *DialogServerSession) Answer() error {
 // too, which then returns why it was not confirmed. A ctx that has ended
 // before the 2xx is sent leaves the INVITE unanswered.
 //
+// A refusal the answer makes instead, a 422 to a Session-Expires below our
+// Min-SE or a 488 to a DTLS handshake that failed, waits for its ACK within
+// ctx too; its transaction ends it on its own.
+//
 // A 2xx once sent is the INVITE's final response, and its exchange goes on
 // without the caller: the dialog retransmits it until its ACK is read or 64*T1
 // has passed (RFC 3261 section 13.3.1.4). Nobody is then left to use the
@@ -566,7 +573,7 @@ func (d *DialogServerSession) AnswerContext(ctx context.Context) error {
 	// RFC 4028: negotiate session timers before the 200 OK. A below-floor offer is
 	// rejected here with 422 and aborts the answer. The timer headers are stashed
 	// for RespondSDP, which launches the loop or watchdog once the 200 OK is sent.
-	if err := d.prepareSessionTimers(); err != nil {
+	if err := d.prepareSessionTimers(ctx); err != nil {
 		return err
 	}
 
@@ -583,8 +590,9 @@ func (d *DialogServerSession) AnswerContext(ctx context.Context) error {
 	return d.answerSession(ctx, rtpSess)
 }
 
-// answerWithin runs complete, the part of an answer from its 2xx on, on a
-// goroutine of the dialog's, and waits for it within ctx. answering is the
+// answerWithin runs complete, the part of an answer from its final response
+// on, a 2xx or a refusal, on a goroutine of the dialog's, and waits for it
+// within ctx. answering is the
 // answer's in-progress mark, which the goroutine closes once complete has
 // returned, so in-dialog requests wait for the whole answer (awaitAnswer),
 // and an ACK whose answer cannot be applied leaves the BYE to complete
@@ -696,7 +704,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 	d.mu.Unlock()
 
 	// RFC 4028: mirror Answer and negotiate session timers before the 200 OK.
-	if err := d.prepareSessionTimers(); err != nil {
+	if err := d.prepareSessionTimers(d.Context()); err != nil {
 		return err
 	}
 
@@ -772,8 +780,10 @@ func (d *DialogServerSession) answerUnkeyedEarlyMedia(ctx context.Context, sess 
 	d.mu.Unlock()
 
 	if err := sess.FinalizeWithin(d.Context(), 0); err != nil && !errors.Is(err, media.ErrFinalizeInProgress) {
-		close(answering)
-		return errors.Join(err, d.Respond(sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+		// The 488 waits for its ACK within ctx, as the 200 would.
+		return errors.Join(err, d.answerWithin(ctx, answering, func() error {
+			return d.Respond(sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
+		}))
 	}
 	return d.answerWithin(ctx, answering, func() error {
 		if err := d.respondSDP(earlyAnswer); err != nil {
@@ -847,7 +857,7 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) error {
 	// RFC 4028: as Answer, negotiate session timers before the 2xx. A
 	// below-floor offer is refused 422 here, and RespondSDP adds the timer
 	// headers to the 2xx and starts the timer once it is sent.
-	if err := d.prepareSessionTimers(); err != nil {
+	if err := d.prepareSessionTimers(ctx); err != nil {
 		return err
 	}
 

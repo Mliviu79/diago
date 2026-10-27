@@ -998,3 +998,40 @@ func TestDialogServerAnswerLateContextCut(t *testing.T) {
 	requireByeEndsDialog(t, d, sent, 5*time.Second)
 	requireCloseJoins(t, d)
 }
+
+// TestDialogServerAnswerContextCutWhileRefusing is an answer that refuses the
+// INVITE 422, its Session-Expires being below our Min-SE (RFC 4028 section 6),
+// cut while that final awaits its ACK: AnswerLateContext returns at the cut,
+// and the INVITE's transaction ends the refusal on its own, at the latest at
+// Timer H (RFC 3261 section 17.2.1).
+func TestDialogServerAnswerContextCutWhileRefusing(t *testing.T) {
+	d, inviteTx, _ := newLateOfferTimerDialog(t,
+		sip.NewHeader("Supported", "timer"),
+		sip.NewHeader("Session-Expires", "60"),
+	)
+	ctx, cut := context.WithCancelCause(t.Context())
+	defer cut(nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.AnswerLateContext(ctx) }()
+	select {
+	case res := <-inviteTx.first:
+		require.Equal(t, statusSessionIntervalTooSmall, res.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no 422 was sent")
+	}
+
+	cutAt := time.Now()
+	cut(errAnswerCut)
+	select {
+	case err := <-answered:
+		require.ErrorIs(t, err, errAnswerCut)
+		require.Less(t, time.Since(cutAt), sip.T1, "the answer must return at its context's end")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer outlived its context while its 422 awaited the ACK")
+	}
+
+	// The INVITE transaction ends, as it does once the peer acknowledges
+	// the 422.
+	close(inviteTx.done)
+	requireCloseJoins(t, d)
+}
