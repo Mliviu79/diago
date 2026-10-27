@@ -209,14 +209,26 @@ func (o *InviteClientOptions) WithCaller(displayName string, callerID string, ho
 //
 // NOTE: It updates internal invite request so NOT THREAD SAFE.
 // If you pass originator it will use originator to set correct from header and avoid media transcoding
+//
+// When ctx ends before the final response, the INVITE is CANCELled as
+// sipgo's WaitAnswer CANCELs it; see InviteWithCancelContext to have the
+// CANCEL's wait end with a context of the caller's.
 func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptions) error {
+	return d.InviteWithCancelContext(ctx, context.WithoutCancel(ctx), opts)
+}
+
+// InviteWithCancelContext is Invite, sending the CANCEL that ctx's end makes
+// before the final response on cancelCtx, which outlives ctx, such as the
+// context of the owner of the call the INVITE attempts. See sipgo's
+// WaitAnswerWithCancelContext.
+func (d *DialogClientSession) InviteWithCancelContext(ctx, cancelCtx context.Context, opts InviteClientOptions) error {
 	if err := d.initMediaSessionFromConf(ctx, d.mediaConfig); err != nil {
 		return err
 	}
-	return d.invite(ctx, &d.DialogMedia, opts)
+	return d.invite(ctx, cancelCtx, &d.DialogMedia, opts)
 }
 
-func (d *DialogClientSession) invite(ctx context.Context, med *DialogMedia, opts InviteClientOptions) error {
+func (d *DialogClientSession) invite(ctx, cancelCtx context.Context, med *DialogMedia, opts InviteClientOptions) error {
 	sess := med.mediaSession
 	inviteReq := d.InviteRequest
 	originator := opts.Originator
@@ -337,19 +349,25 @@ func (d *DialogClientSession) invite(ctx context.Context, med *DialogMedia, opts
 	}
 
 	if opts.EarlyMediaDetect {
-		return d.waitAnswerEarly(ctx, med, ansOpts, opts.EarlyMediaKeyTimeout)
+		return d.waitAnswerEarly(ctx, cancelCtx, med, ansOpts, opts.EarlyMediaKeyTimeout)
 	}
 
-	return d.waitAnswer(ctx, med, ansOpts)
+	return d.waitAnswer(ctx, cancelCtx, med, ansOpts)
 }
 
 // WaitAnswer waits dialog on answer. It should only be used if you have error Invite but still want to continue
 // ex. ErrClientEarlyMedia was returned but you want to proceed with answering
 func (d *DialogClientSession) WaitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error {
-	return d.waitAnswer(ctx, &d.DialogMedia, opts)
+	return d.WaitAnswerWithCancelContext(ctx, context.WithoutCancel(ctx), opts)
 }
 
-func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, keyTimeout time.Duration) error {
+// WaitAnswerWithCancelContext is WaitAnswer, sending the CANCEL that ctx's end
+// makes on cancelCtx, as InviteWithCancelContext does.
+func (d *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context.Context, opts sipgo.AnswerOptions) error {
+	return d.waitAnswer(ctx, cancelCtx, &d.DialogMedia, opts)
+}
+
+func (d *DialogClientSession) waitAnswerEarly(ctx, cancelCtx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, keyTimeout time.Duration) error {
 	sess := med.mediaSession
 	onResps := opts.OnResponse
 	if keyTimeout <= 0 {
@@ -428,7 +446,7 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 
 		return ErrClientEarlyMedia
 	}
-	return d.waitAnswer(ctx, med, opts)
+	return d.waitAnswer(ctx, cancelCtx, med, opts)
 }
 
 // awaitEarlyKeys runs the negotiation the answer in a 183 armed on sess, and
@@ -454,8 +472,8 @@ func (d *DialogClientSession) awaitEarlyKeys(ctx context.Context, sess *media.Me
 	}
 }
 
-func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
-	if err := d.DialogClientSession.WaitAnswer(ctx, opts); err != nil {
+func (d *DialogClientSession) waitAnswer(ctx, cancelCtx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
+	if err := d.DialogClientSession.WaitAnswerWithCancelContext(ctx, cancelCtx, opts); err != nil {
 		return err
 	}
 

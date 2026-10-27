@@ -1125,3 +1125,85 @@ func TestDialogClientInviteAllocatesOnTheInviteCtx(t *testing.T) {
 	require.ErrorIs(t, err, errRefused)
 	require.Equal(t, "invite", got, "Invite did not hand the allocator its ctx")
 }
+
+// TestDialogClientInviteCancelContextCut has a callee that rings and then
+// answers neither our CANCEL nor the INVITE. The INVITE's context ends after
+// the 180, which sends the CANCEL, and the context passed for the CANCEL ends
+// while it waits: InviteWithCancelContext returns at that end, with its cause,
+// instead of after the CANCEL's Timer F.
+func TestDialogClientInviteCancelContextCut(t *testing.T) {
+	peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	cancels := make(chan struct{}, 4)
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := peer.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			msg, err := sip.ParseMessage(append([]byte(nil), buf[:n]...))
+			if err != nil {
+				continue
+			}
+			req, ok := msg.(*sip.Request)
+			if !ok {
+				continue
+			}
+			switch req.Method {
+			case sip.INVITE:
+				res := sip.NewResponseFromRequest(req, sip.StatusRinging, "Ringing", nil)
+				res.To().Params.Add("tag", "callee-tag")
+				_, _ = peer.WriteTo([]byte(res.String()), src)
+			case sip.CANCEL:
+				cancels <- struct{}{}
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = peer.Close(); <-peerDone })
+
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := newDialer(ua)
+	require.NoError(t, serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {}))
+
+	d, err := dg.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: peer.LocalAddr().(*net.UDPAddr).Port}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	ctx, giveUp := context.WithCancel(t.Context())
+	defer giveUp()
+	cancelCtx, stop := context.WithCancelCause(t.Context())
+	defer stop(nil)
+	invited := make(chan error, 1)
+	go func() {
+		invited <- d.InviteWithCancelContext(ctx, cancelCtx, InviteClientOptions{
+			OnResponse: func(res *sip.Response) error {
+				if res.StatusCode == sip.StatusRinging {
+					giveUp()
+				}
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case <-cancels:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CANCEL was sent after the 180")
+	}
+	errOwnerStopped := errors.New("the call's owner stopped")
+	stopAt := time.Now()
+	stop(errOwnerStopped)
+	select {
+	case err := <-invited:
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, errOwnerStopped)
+		assert.Less(t, time.Since(stopAt), sip.T1, "the CANCEL's wait must end with its context")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the CANCEL's wait outlived its context")
+	}
+}
