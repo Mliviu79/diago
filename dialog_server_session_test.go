@@ -6,10 +6,12 @@ package diago
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -838,4 +840,161 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 			}
 		})
 	}
+}
+
+// errAnswerCut is the cause a test cuts an answer's context with.
+var errAnswerCut = errors.New("the answer's owner stopped waiting")
+
+// newAnswerContextDialog builds an inbound dialog whose INVITE carries the
+// offer of a peer, over a fake transaction that hands its first response to a
+// channel and drops its retransmissions. The requests the dialog sends, such as
+// a BYE, are answered 200 and handed to the returned channel.
+func newAnswerContextDialog(t *testing.T) (*DialogServerSession, *firstResponseTx, <-chan *sip.Request) {
+	t.Helper()
+	peer := newMediaSessionForTest(t)
+	inviteTx := &firstResponseTx{byeServerTx: newByeServerTx(), first: make(chan *sip.Response, 1)}
+	d, sent := newRecordingServerDialog(t, inviteTx, peer.LocalSDP(), MediaConfig{
+		Codecs: []media.Codec{media.CodecAudioUlaw},
+		bindIP: net.IPv4(127, 0, 0, 1),
+	})
+	return d, inviteTx, sent
+}
+
+// cutWhileAwaitingAck runs answer on another goroutine with a context the test
+// cuts once the 2xx is sent, and requires answer to return at that cut, with
+// an error carrying its cause, while the 2xx still awaits its ACK.
+func cutWhileAwaitingAck(t *testing.T, d *DialogServerSession, inviteTx *firstResponseTx, answer func(ctx context.Context) error) *sip.Response {
+	t.Helper()
+	ctx, cut := context.WithCancelCause(t.Context())
+	defer cut(nil)
+	answered := make(chan error, 1)
+	go func() { answered <- answer(ctx) }()
+
+	var res *sip.Response
+	select {
+	case res = <-inviteTx.first:
+		require.Equal(t, sip.StatusOK, res.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no 2xx was sent")
+	}
+
+	cutAt := time.Now()
+	cut(errAnswerCut)
+	select {
+	case err := <-answered:
+		require.ErrorIs(t, err, errAnswerCut, "the answer must report why its wait was cut")
+		require.Less(t, time.Since(cutAt), sip.T1, "the answer must return at its context's end, not with the ACK wait")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer outlived its context")
+	}
+	require.Equal(t, sip.DialogStateEstablished, d.LoadState(), "the 2xx still awaits its ACK")
+	return res
+}
+
+// requireNoRequest requires that the dialog sent no request, such as a BYE,
+// within window.
+func requireNoRequest(t *testing.T, sent <-chan *sip.Request, window time.Duration, why string) {
+	t.Helper()
+	select {
+	case req := <-sent:
+		t.Fatalf("%s: %s was sent", why, req.Method)
+	case <-time.After(window):
+	}
+}
+
+// requireByeEndsDialog requires that the dialog itself sends a BYE within
+// within and ends with it, and returns the instant the dialog ended.
+func requireByeEndsDialog(t *testing.T, d *DialogServerSession, sent <-chan *sip.Request, within time.Duration) time.Time {
+	t.Helper()
+	select {
+	case req := <-sent:
+		require.Equal(t, sip.BYE, req.Method, "the dialog must end the call it answered for nobody")
+	case <-time.After(within):
+		t.Fatal("the dialog sent no BYE")
+	}
+	select {
+	case <-d.Context().Done():
+		return time.Now()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dialog did not end with its BYE")
+	}
+	return time.Time{}
+}
+
+// requireCloseJoins requires that Close returns, which joins the rest of an
+// answer whose wait was cut.
+func requireCloseJoins(t *testing.T, d *DialogServerSession) {
+	t.Helper()
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not join the answer")
+	}
+}
+
+// TestDialogServerAnswerContextLateAck is an answer whose context is cut while
+// its 2xx awaits the ACK, and whose ACK arrives after the cut. AnswerContext
+// returns at the cut. The dialog goes on retransmitting the 2xx and reads the
+// late ACK, which cannot be refused (RFC 3261 section 13.3.1.4). Nobody is left
+// to use the answer, so the dialog itself ends the call with a BYE as soon as
+// the ACK has confirmed it, and never before (RFC 3261 section 15): the
+// dialog's release completes at the ACK.
+func TestDialogServerAnswerContextLateAck(t *testing.T) {
+	d, inviteTx, sent := newAnswerContextDialog(t)
+	cutWhileAwaitingAck(t, d, inviteTx, d.AnswerContext)
+
+	requireNoRequest(t, sent, 2*sip.T1, "a BYE before the ACK")
+	require.Equal(t, sip.DialogStateEstablished, d.LoadState())
+
+	ackAt := time.Now()
+	readAck(t, d)
+	endedAt := requireByeEndsDialog(t, d, sent, 5*time.Second)
+	assert.Less(t, endedAt.Sub(ackAt), sip.T1, "the release must complete at the late ACK")
+	requireCloseJoins(t, d)
+}
+
+// TestDialogServerAnswerContextNoAck is an answer whose context is cut while
+// its 2xx awaits the ACK, and whose ACK never comes. The dialog retransmits
+// the 2xx for 64*T1, and then ends the call with a BYE (RFC 3261 section
+// 13.3.1.4): the dialog's release completes at 64*T1 from the 2xx.
+func TestDialogServerAnswerContextNoAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, inviteTx, sent := newAnswerContextDialog(t)
+		start := time.Now()
+		cutWhileAwaitingAck(t, d, inviteTx, d.AnswerContext)
+
+		synctest.Wait()
+		select {
+		case req := <-sent:
+			t.Fatalf("a %s was sent before the ACK wait ended", req.Method)
+		default:
+		}
+
+		endedAt := requireByeEndsDialog(t, d, sent, 64*sip.T1+5*time.Second)
+		assert.Equal(t, 64*sip.T1, endedAt.Sub(start), "the release must complete when the ACK wait ends")
+		requireCloseJoins(t, d)
+	})
+}
+
+// TestDialogServerAnswerLateContextCut is AnswerLateContext, whose 2xx
+// carries our offer, cut while that 2xx awaits the ACK that carries the
+// answer: it returns at the cut, and the late ACK is still read, and followed
+// by the dialog's BYE.
+func TestDialogServerAnswerLateContextCut(t *testing.T) {
+	d, inviteTx, sent := newLateOfferDialog(t, MediaConfig{
+		Codecs: []media.Codec{media.CodecAudioUlaw},
+		bindIP: net.IPv4(127, 0, 0, 1),
+	})
+	res := cutWhileAwaitingAck(t, d, inviteTx, d.AnswerLateContext)
+
+	requireNoRequest(t, sent, 2*sip.T1, "a BYE before the ACK")
+
+	peer := newMediaSessionForTest(t)
+	require.NoError(t, peer.RemoteSDP(res.Body()))
+	require.NoError(t, d.ReadAck(newLateAck(d, peer.LocalSDP()), newByeServerTx()))
+	requireByeEndsDialog(t, d, sent, 5*time.Second)
+	requireCloseJoins(t, d)
 }

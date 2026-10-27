@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,6 +78,10 @@ type DialogServerSession struct {
 	// cancel all leave it nil, which is the truthful "the peer stated no cause".
 	terminatingBye atomic.Pointer[sip.Request]
 
+	// answers counts the answers still running from their 2xx on, each on a
+	// goroutine of the dialog's (answerWithin). Close waits for them.
+	answers sync.WaitGroup
+
 	closed atomic.Uint32
 }
 
@@ -94,10 +99,16 @@ func (d *DialogServerSession) Id() string {
 	return d.ID
 }
 
+// Close releases the dialog's media and the dialog. It first waits for an
+// answer still running from its 2xx on, which an answer whose caller stopped
+// waiting leaves (AnswerContext): that wait is bounded by the ACK wait of
+// 64*T1, the media setup that follows the ACK, and the BYE that ends such a
+// call, bounded by its transaction's Timer F.
 func (d *DialogServerSession) Close() error {
 	if !d.closed.CompareAndSwap(0, 1) {
 		return nil
 	}
+	d.answers.Wait()
 	e1 := d.DialogMedia.Close()
 	e2 := d.DialogServerSession.Close()
 	return errors.Join(e1, e2)
@@ -530,8 +541,28 @@ func (d *DialogServerSession) respondSDP(body []byte) error {
 
 // Answer creates media session and answers
 // After this new AudioReader and AudioWriter are created for audio manipulation
+// It waits for the ACK to its 2xx for as long as the dialog lives; see
+// AnswerContext for an answer whose wait a caller ends.
 // NOTE: Not final API
 func (d *DialogServerSession) Answer() error {
+	return d.AnswerContext(d.Context())
+}
+
+// AnswerContext is Answer, whose wait ends with ctx. It returns once the ACK
+// to its 2xx is read and the media set up, with the reason it was not, or,
+// when ctx ends first while the dialog lives, at that end with an error
+// wrapping context.Cause(ctx). The dialog's end ends the answer's exchange
+// too, which then returns why it was not confirmed. A ctx that has ended
+// before the 2xx is sent leaves the INVITE unanswered.
+//
+// A 2xx once sent is the INVITE's final response, and its exchange goes on
+// without the caller: the dialog retransmits it until its ACK is read or 64*T1
+// has passed (RFC 3261 section 13.3.1.4). Nobody is then left to use the
+// answer, so the dialog ends the call itself with a BYE, which goes out once
+// the ACK has confirmed the dialog, or once the ACK wait has passed without
+// one, and never before (RFC 3261 section 15). The dialog has ended once that
+// BYE is handed to its transaction. Close waits for all of it.
+func (d *DialogServerSession) AnswerContext(ctx context.Context) error {
 	// RFC 4028: negotiate session timers before the 200 OK. A below-floor offer is
 	// rejected here with 422 and aborts the answer. The timer headers are stashed
 	// for RespondSDP, which launches the loop or watchdog once the 200 OK is sent.
@@ -541,7 +572,7 @@ func (d *DialogServerSession) Answer() error {
 
 	// Media Exists as early
 	if d.mediaSession != nil {
-		return d.answerEarlyMedia()
+		return d.answerEarlyMedia(ctx)
 	}
 
 	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
@@ -549,7 +580,90 @@ func (d *DialogServerSession) Answer() error {
 	}
 
 	rtpSess := media.NewRTPSession(d.mediaSession)
-	return d.answerSession(rtpSess)
+	return d.answerSession(ctx, rtpSess)
+}
+
+// answerWithin runs complete, the part of an answer from its 2xx on, on a
+// goroutine of the dialog's, and waits for it within ctx. answering is the
+// answer's in-progress mark, which the goroutine closes once complete has
+// returned, so in-dialog requests wait for the whole answer (awaitAnswer),
+// and an ACK whose answer cannot be applied leaves the BYE to complete
+// (ReadAck). When ctx has ended already, complete does not run and no 2xx is
+// sent.
+//
+// When ctx ends while complete runs and the dialog is live, answerWithin
+// returns at once with its cause, and the goroutine goes on to complete's end
+// and then ends the call (endAbandonedAnswer). When the dialog has ended by
+// then, complete ends with it, and its result is returned. The goroutine is bounded by the ACK wait of 64*T1, the
+// media setup that follows the ACK, and that BYE's Timer F; Close joins it.
+func (d *DialogServerSession) answerWithin(ctx context.Context, answering chan struct{}, complete func() error) error {
+	if ctx.Err() != nil {
+		close(answering)
+		return fmt.Errorf("answer: %w", context.Cause(ctx))
+	}
+
+	var (
+		// mu orders the goroutine's report against the caller's leaving, so
+		// complete's result is either reported or acted on by the goroutine.
+		mu        sync.Mutex
+		abandoned bool
+	)
+	result := make(chan error, 1)
+	d.answers.Add(1)
+	go func() {
+		defer d.answers.Done()
+		defer close(answering)
+		err := complete()
+		mu.Lock()
+		if !abandoned {
+			result <- err
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+		d.endAbandonedAnswer(err)
+	}()
+
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+	}
+	if d.Context().Err() != nil {
+		// The dialog has ended, which ends complete's exchange too, as it ends
+		// Answer's own ctx: complete's error says why the answer was not
+		// confirmed.
+		return <-result
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	select {
+	case err := <-result:
+		return err
+	default:
+	}
+	abandoned = true
+	return fmt.Errorf("answer: %w", context.Cause(ctx))
+}
+
+// endAbandonedAnswer ends the call of an answer whose caller stopped waiting,
+// once that answer's exchange is over, err being how it ended. A dialog the
+// ACK, or the ACK wait passing without one, has confirmed is ended with a BYE,
+// whose wait is bounded by its transaction's Timer F (RFC 3261 section
+// 17.1.2.2). A dialog that ended meanwhile, on the peer's BYE, on a CANCEL
+// that took the INVITE's transaction, or on the BYE an answer that could not
+// be applied sends, needs none.
+func (d *DialogServerSession) endAbandonedAnswer(err error) {
+	state := d.LoadState()
+	if state < sip.DialogStateEstablished || state == sip.DialogStateEnded {
+		return
+	}
+	d.logger().Debug("Ending the call of an answer nobody waits for", "call_id", d.callID(), "answer_error", err)
+	ctx, cancel := context.WithTimeout(d.Context(), sip.Timer_F)
+	defer cancel()
+	if byeErr := d.Bye(ctx); byeErr != nil {
+		d.logger().Warn("Ending the call of an answer nobody waits for failed", "call_id", d.callID(), "error", byeErr)
+	}
 }
 
 type AnswerOptions struct {
@@ -589,7 +703,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 	// If media exists as early, only respond 200
 	if d.mediaSession != nil {
 		// Check do codecs match
-		return d.answerEarlyMedia()
+		return d.answerEarlyMedia(d.Context())
 	}
 
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
@@ -597,7 +711,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 		return err
 	}
 	rtpSess := media.NewRTPSession(d.mediaSession)
-	return d.answerSession(rtpSess)
+	return d.answerSession(d.Context(), rtpSess)
 }
 
 func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) {
@@ -612,8 +726,9 @@ func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) 
 // answerEarlyMedia answers a call whose media session exists already: set up
 // by ProgressMedia, whose answer the 200 repeats, or installed by the
 // application. It only sends the 200, unless ProgressMedia left the DTLS
-// handshake of the early media running.
-func (d *DialogServerSession) answerEarlyMedia() error {
+// handshake of the early media running. Its wait ends with ctx, see
+// answerWithin.
+func (d *DialogServerSession) answerEarlyMedia(ctx context.Context) error {
 	d.mu.Lock()
 	sess := d.mediaSession
 	earlyAnswer := d.earlyAnswerSDP
@@ -621,13 +736,18 @@ func (d *DialogServerSession) answerEarlyMedia() error {
 	d.mu.Unlock()
 
 	if unkeyed {
-		return d.answerUnkeyedEarlyMedia(sess, earlyAnswer)
+		return d.answerUnkeyedEarlyMedia(ctx, sess, earlyAnswer)
 	}
 	if earlyAnswer == nil {
 		earlyAnswer = sess.LocalSDP()
 	}
-	// This will now block until ACK received with 64*T1 as max.
-	return d.RespondSDP(earlyAnswer)
+	d.mu.Lock()
+	answering := make(chan struct{})
+	d.answering = answering
+	d.mu.Unlock()
+	return d.answerWithin(ctx, answering, func() error {
+		return d.respondSDP(earlyAnswer)
+	})
 }
 
 // answerUnkeyedEarlyMedia answers a call whose caller did not key the early
@@ -643,34 +763,39 @@ func (d *DialogServerSession) answerEarlyMedia() error {
 // BYE: RFC 3261 section 21.4.26 gives 488 the meaning of 606, a session
 // description the callee cannot support, and RFC 5763 section 5 has the media
 // session torn down on a certificate that does not match its fingerprint.
-func (d *DialogServerSession) answerUnkeyedEarlyMedia(sess *media.MediaSession, earlyAnswer []byte) error {
+//
+// Its wait from the 200 on ends with ctx, see answerWithin.
+func (d *DialogServerSession) answerUnkeyedEarlyMedia(ctx context.Context, sess *media.MediaSession, earlyAnswer []byte) error {
 	d.mu.Lock()
 	answering := make(chan struct{})
 	d.answering = answering
 	d.mu.Unlock()
-	defer close(answering)
 
 	if err := sess.FinalizeWithin(d.Context(), 0); err != nil && !errors.Is(err, media.ErrFinalizeInProgress) {
+		close(answering)
 		return errors.Join(err, d.Respond(sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
 	}
-	if err := d.respondSDP(earlyAnswer); err != nil {
-		return err
-	}
-	if err := sess.FinalizeContext(d.Context()); err != nil {
-		return err
-	}
+	return d.answerWithin(ctx, answering, func() error {
+		if err := d.respondSDP(earlyAnswer); err != nil {
+			return err
+		}
+		if err := sess.FinalizeContext(d.Context()); err != nil {
+			return err
+		}
 
-	rtpSess := media.NewRTPSession(sess)
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	d.mu.Unlock()
-	// Must be called after media and reader writer is setup
-	return rtpSess.MonitorBackground()
+		rtpSess := media.NewRTPSession(sess)
+		d.mu.Lock()
+		d.initRTPSessionUnsafe(sess, rtpSess)
+		d.mu.Unlock()
+		// Must be called after media and reader writer is setup
+		return rtpSess.MonitorBackground()
+	})
 }
 
-// answerSession. It allows answering with custom RTP Session.
+// answerSession. It allows answering with custom RTP Session. Its wait from
+// the 2xx on ends with ctx, see answerWithin.
 // NOTE: Not final API
-func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
+func (d *DialogServerSession) answerSession(ctx context.Context, rtpSess *media.RTPSession) error {
 	sess := rtpSess.Sess
 	sdp := d.InviteRequest.Body()
 	if sdp == nil {
@@ -690,30 +815,35 @@ func (d *DialogServerSession) answerSession(rtpSess *media.RTPSession) error {
 	answering := make(chan struct{})
 	d.answering = answering
 	d.mu.Unlock()
-	defer close(answering)
 
-	// This will now block until ACK received with 64*T1 as max.
-	// How to let caller to cancel this?
-	if err := d.respondSDP(sess.LocalSDP()); err != nil {
-		return err
-	}
-
-	// The handshake ends with the call.
-	if err := sess.FinalizeContext(d.Context()); err != nil {
-		return err
-	}
-	// fmt.Println("--------SErver finalized")
-
-	// Must be called after media and reader writer is setup
-	return rtpSess.MonitorBackground()
+	return d.answerWithin(ctx, answering, func() error {
+		if err := d.respondSDP(sess.LocalSDP()); err != nil {
+			return err
+		}
+		// The handshake ends with the call.
+		if err := sess.FinalizeContext(d.Context()); err != nil {
+			return err
+		}
+		// Must be called after media and reader writer is setup
+		return rtpSess.MonitorBackground()
+	})
 }
 
 // AnswerLate answers an INVITE that carried no offer: its 2xx carries our
 // offer, and the ACK the answer (RFC 3261 section 13.2.1), which ReadAck
 // applies. It negotiates the session timer as Answer does. An ACK that brings
 // no answer ends the call with a BYE, and AnswerLate returns
-// errAckCarriesNoAnswer.
+// errAckCarriesNoAnswer. It waits for the ACK for as long as the dialog lives;
+// see AnswerLateContext for an answer whose wait a caller ends.
 func (d *DialogServerSession) AnswerLate() error {
+	return d.AnswerLateContext(d.Context())
+}
+
+// AnswerLateContext is AnswerLate, whose wait ends with ctx, as AnswerContext
+// describes: when ctx ends first it returns at that end, and the dialog reads
+// the ACK, applies the answer it carries and then ends the call with a BYE,
+// or ends it with a BYE once the ACK wait has passed without one.
+func (d *DialogServerSession) AnswerLateContext(ctx context.Context) error {
 	// RFC 4028: as Answer, negotiate session timers before the 2xx. A
 	// below-floor offer is refused 422 here, and RespondSDP adds the timer
 	// headers to the 2xx and starts the timer once it is sent.
@@ -738,15 +868,14 @@ func (d *DialogServerSession) AnswerLate() error {
 	d.answering = answering
 	d.ackCarriesAnswer = true
 	d.mu.Unlock()
-	defer close(answering)
 
-	// This will now block until ACK received with 64*T1 as max.
-	// How to let caller to cancel this?
-	if err := d.respondSDP(localSDP); err != nil {
-		return err
-	}
-	// Must be called after media and reader writer is setup
-	return rtpSess.MonitorBackground()
+	return d.answerWithin(ctx, answering, func() error {
+		if err := d.respondSDP(localSDP); err != nil {
+			return err
+		}
+		// Must be called after media and reader writer is setup
+		return rtpSess.MonitorBackground()
+	})
 }
 
 // ReadAck reads the ACK to our 2xx. When the 2xx carried an offer, the ACK
