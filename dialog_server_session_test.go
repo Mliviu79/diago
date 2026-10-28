@@ -1035,3 +1035,54 @@ func TestDialogServerAnswerContextCutWhileRefusing(t *testing.T) {
 	close(inviteTx.done)
 	requireCloseJoins(t, d)
 }
+
+// TestEndWhileAckWithheld is an end requested, with Hangup, while our 2xx
+// awaits an ACK that never comes. The BYE cannot leave before the ACK or the end
+// of the ACK wait (RFC 3261 section 15), so the release completes when the wait
+// ends, 64*T1 from the 2xx (the same figure as Timer H, section 17.2.1), plus the
+// BYE's own transaction: the fake peer answers it at once, so nothing else
+// delays it. The end does not wait on the answer's goroutine, the media or the
+// INVITE transaction beyond the ACK wait.
+func TestEndWhileAckWithheld(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, inviteTx, sent := newAnswerContextDialog(t)
+		start := time.Now()
+
+		answered := make(chan error, 1)
+		go func() { answered <- d.AnswerContext(t.Context()) }()
+		select {
+		case res := <-inviteTx.first:
+			require.Equal(t, sip.StatusOK, res.StatusCode)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no 2xx was sent")
+		}
+
+		endCtx, cancel := context.WithTimeout(t.Context(), 64*sip.T1+sip.Timer_F)
+		defer cancel()
+		ended := make(chan error, 1)
+		go func() { ended <- d.Hangup(endCtx) }()
+
+		synctest.Wait()
+		select {
+		case req := <-sent:
+			t.Fatalf("a %s was sent while the ACK was still awaited", req.Method)
+		default:
+		}
+
+		select {
+		case err := <-ended:
+			require.NoError(t, err)
+		case <-time.After(64*sip.T1 + sip.Timer_F + time.Second):
+			t.Fatal("the end outlived the ACK wait and the BYE's Timer F")
+		}
+		assert.Equal(t, 64*sip.T1, time.Since(start), "the release must complete when the ACK wait ends, waiting on nothing else")
+		select {
+		case req := <-sent:
+			require.Equal(t, sip.BYE, req.Method)
+		default:
+			t.Fatal("no BYE was sent")
+		}
+		<-answered
+		requireCloseJoins(t, d)
+	})
+}
