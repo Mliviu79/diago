@@ -181,7 +181,11 @@ type DialogMedia struct {
 	// (RFC 3261 sections 14.1 and 14.2). Guarded by mu.
 	mediaUpdateDone chan struct{}
 
-	closed bool
+	// closed latches the first Close. closeDone is closed once that Close has
+	// released the port, so a Close made after it returns only once the media
+	// is released. Both are guarded by mu.
+	closed    bool
+	closeDone chan struct{}
 }
 
 // ackOffer is an offer we sent in a 2xx to a re-INVITE, awaiting its answer in
@@ -759,10 +763,18 @@ func (d *DialogMedia) Close() error {
 	// Prevent double exec
 	d.mu.Lock()
 	if d.closed {
+		done := d.closeDone
 		d.mu.Unlock()
+		// The first Close is still releasing the media. This one must not report
+		// it closed before the release has run: a caller that acts on the close
+		// (the port pool, the media's owner) would find the port still held.
+		<-done
 		return nil
 	}
 	d.closed = true
+	d.closeDone = make(chan struct{})
+	done := d.closeDone
+	defer close(done)
 
 	onClose := d.onClose
 	d.onClose = nil
