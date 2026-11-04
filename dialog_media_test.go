@@ -628,6 +628,48 @@ func TestDialogMediaCloseJoinsJitterBuffer(t *testing.T) {
 	}
 }
 
+// TestDialogMediaSecondCloseWaitsForTheRelease pins that a Close made while an
+// earlier Close is still releasing the media returns only after that release
+// has run. A caller the peer's end reaches through the second Close is then
+// told the media is closed only once its port is back in the pool.
+func TestDialogMediaSecondCloseWaitsForTheRelease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := &DialogMedia{}
+		inRelease := make(chan struct{})
+		unblock := make(chan struct{})
+		unblockOnce := sync.OnceFunc(func() { close(unblock) })
+		defer unblockOnce() // a failing run must not leave the first Close blocked
+		released := false
+		d.releaseRTPPort = func() {
+			close(inRelease)
+			<-unblock
+			released = true
+		}
+
+		first := make(chan error, 1)
+		go func() { first <- d.Close() }()
+		<-inRelease
+
+		// released is written before the first Close ends and is read only after
+		// the second Close has returned, so the read is ordered after the write.
+		second := make(chan bool, 1)
+		go func() {
+			_ = d.Close()
+			second <- released
+		}()
+		synctest.Wait()
+		select {
+		case <-second:
+			t.Fatal("second Close returned while the first was still releasing the port")
+		default:
+		}
+
+		unblockOnce()
+		require.NoError(t, <-first)
+		require.True(t, <-second, "second Close returned before the port was released")
+	})
+}
+
 // TestDialogMediaRTPControlReadsMediaUnderLock asserts that stopping and
 // starting RTP reads, directly or through the Listen helpers, reads the media
 // session under the dialog lock. A re-INVITE swaps the session for a fork of it
