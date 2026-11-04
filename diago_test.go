@@ -564,6 +564,39 @@ func TestDiagoInfoMatchesDialogFirst(t *testing.T) {
 	}
 }
 
+// TestDiagoByeMatchesNoDialogIsGone pins that a BYE matching no dialog is
+// answered 481 by name. The INFO row of TestDiagoInfoMatchesDialogFirst covers
+// the shared answer; this names the BYE path, so a change to the BYE handler's
+// no-dialog branch fails here.
+func TestDiagoByeMatchesNoDialogIsGone(t *testing.T) {
+	ua, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = ua.Close() })
+	dg := NewDiago(ua)
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	go func() { _ = dg.server.ServeUDP(conn) }()
+
+	clientUA, _ := sipgo.NewUA()
+	t.Cleanup(func() { _ = clientUA.Close() })
+	client, err := sipgo.NewClient(clientUA, sipgo.WithClientHostname("127.0.0.1"))
+	require.NoError(t, err)
+
+	req := sip.NewRequest(sip.BYE, sip.Uri{User: "dg", Host: "127.0.0.1", Port: port})
+	req.AppendHeader(sip.NewHeader("From", "<sip:peer@127.0.0.1>;tag=peer"))
+	req.AppendHeader(sip.NewHeader("To", "<sip:dg@127.0.0.1>;tag=nodialog"))
+	req.AppendHeader(sip.NewHeader("Call-ID", "bye-nodialog"))
+	req.AppendHeader(sip.NewHeader("CSeq", "500 BYE"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := client.Do(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, sip.StatusCallTransactionDoesNotExists, res.StatusCode)
+}
+
 // TestDialogNotifyForNoRefer pins how a NOTIFY on a live dialog is answered
 // when the dialog sent no REFER it belongs to, on either side. It matches none
 // of the dialog's subscriptions, and RFC 6665 section 4.1.3 has it answered
