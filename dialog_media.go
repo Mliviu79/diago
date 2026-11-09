@@ -1036,7 +1036,7 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 			return d.answerNewAssociation(ctx, req, tx, contactHDR, msess)
 		}
 		if err == nil {
-			err = d.replaceRTPSessionUnsafe(msess)
+			err = d.replaceRTPSessionUnsafe(ctx, msess)
 		}
 		if err != nil {
 			d.mu.Unlock()
@@ -1125,7 +1125,7 @@ func (d *DialogMedia) applyAckAnswer(ctx context.Context, req *sip.Request) (boo
 	if msess.FinalizePending() {
 		return true, d.finalizeAndReplaceUnsafe(ctx, msess)
 	}
-	return true, d.replaceRTPSessionUnsafe(msess)
+	return true, d.replaceRTPSessionUnsafe(ctx, msess)
 }
 
 // answerNewAssociation answers a re-INVITE whose offer msess found to ask for
@@ -1168,7 +1168,7 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 	if err != nil {
 		err = errors.Join(err, d.discardForkUnsafe(msess))
 	} else {
-		err = d.replaceRTPSessionUnsafe(msess)
+		err = d.replaceRTPSessionUnsafe(ctx, msess)
 	}
 	onMediaUpdate := d.onMediaUpdate
 	d.mu.Unlock()
@@ -1199,7 +1199,7 @@ func (d *DialogMedia) finalizeAndReplaceUnsafe(ctx context.Context, msess *media
 		err = errMediaClosed
 	}
 	if err == nil {
-		err = d.replaceRTPSessionUnsafe(msess)
+		err = d.replaceRTPSessionUnsafe(ctx, msess)
 	}
 	if err != nil {
 		return errors.Join(err, d.discardForkUnsafe(msess))
@@ -1327,33 +1327,34 @@ func negotiatedOffer(fork, cur *media.MediaSession) []byte {
 	return offer
 }
 
-func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {
+func (d *DialogMedia) checkEarlyMedia(ctx context.Context, remoteSDP []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	// RTP Session is only created when negotiation is finished. We use this to detect existing media
 	if d.rtpSession == nil {
 		return errNoRTPSession
 	}
-	return d.sdpUpdateUnsafe(remoteSDP)
+	return d.sdpUpdateUnsafe(ctx, remoteSDP)
 }
 
-func (d *DialogMedia) sdpUpdateUnsafe(sdp []byte) error {
+func (d *DialogMedia) sdpUpdateUnsafe(ctx context.Context, sdp []byte) error {
 	msess := d.mediaSession.Fork()
 	if err := msess.RemoteSDP(sdp); err != nil {
 		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 	}
 
-	return d.replaceRTPSessionUnsafe(msess)
+	return d.replaceRTPSessionUnsafe(ctx, msess)
 }
 
-func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
-	return d.replaceRTPSessionUnsafe(msess)
+func (d *DialogMedia) mediaUpdateUnsafe(ctx context.Context, msess *media.MediaSession) error {
+	return d.replaceRTPSessionUnsafe(ctx, msess)
 }
 
 // replaceRTPSessionUnsafe replaces the RTP session after the old monitor has
 // fully stopped. A fork preserves statistics and shared connections; a new
-// session is used when media connections were recreated.
-func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
+// session is used when media connections were recreated. The new RTCP monitors
+// run on ctx, the dialog's.
+func (d *DialogMedia) replaceRTPSessionUnsafe(ctx context.Context, msess *media.MediaSession) error {
 	// Close has taken what it closes already, and would not close msess.
 	if d.closed {
 		return errMediaClosed
@@ -1369,7 +1370,7 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 
 	// Same as media, we are forking RTP Session
 	rtpSess := oldRTPSess.Fork(msess)
-	if err := rtpSess.MonitorBackground(); err != nil {
+	if err := rtpSess.MonitorBackground(ctx); err != nil {
 		return errors.Join(err, rtpSess.Close())
 	}
 

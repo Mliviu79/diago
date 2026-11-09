@@ -4,6 +4,7 @@
 package media
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -505,19 +506,30 @@ func (s *RTPSession) Monitor() error {
 	return errors.Join(err, <-errchan)
 }
 
-// MonitorBackground is helper to keep monitoring in background
-// MUST Be called after session REMOTE SDP is parsed
-func (s *RTPSession) MonitorBackground() error {
+// MonitorBackground starts the RTCP reader and writer in the background, plus
+// the goroutine that stops them when ctx ends. All three are joined by
+// MonitorClose; ending ctx stops the monitors the same way MonitorClose does,
+// leaving the RTP/RTCP connections open and the session closed to a new
+// monitor. It must be called after the session's REMOTE SDP is parsed.
+func (s *RTPSession) MonitorBackground(ctx context.Context) error {
 	sess := s.Sess
 	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
 	}
 
-	if err := s.startMonitor(2); err != nil {
+	if err := s.startMonitor(3); err != nil {
 		return err
 	}
 
 	log := DefaultLogger()
+	go func() {
+		defer s.monitorWG.Done()
+		select {
+		case <-ctx.Done():
+			_ = s.close(false)
+		case <-s.rtcpClosed:
+		}
+	}()
 	go func() {
 		defer s.monitorWG.Done()
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())

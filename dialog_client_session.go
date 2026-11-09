@@ -219,7 +219,8 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 
 // InviteWithCancelContext is Invite, sending the CANCEL that ctx's end makes
 // before the final response on cancelCtx, which outlives ctx, such as the
-// context of the owner of the call the INVITE attempts. See sipgo's
+// context of the owner of the call the INVITE attempts. The RTCP monitors of
+// the answered media run on cancelCtx, so they end with it. See sipgo's
 // WaitAnswerWithCancelContext.
 func (d *DialogClientSession) InviteWithCancelContext(ctx, cancelCtx context.Context, opts InviteClientOptions) error {
 	if err := d.initMediaSessionFromConf(ctx, d.mediaConfig); err != nil {
@@ -362,7 +363,8 @@ func (d *DialogClientSession) WaitAnswer(ctx context.Context, opts sipgo.AnswerO
 }
 
 // WaitAnswerWithCancelContext is WaitAnswer, sending the CANCEL that ctx's end
-// makes on cancelCtx, as InviteWithCancelContext does.
+// makes on cancelCtx, as InviteWithCancelContext does; the RTCP monitors run on
+// cancelCtx.
 func (d *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context.Context, opts sipgo.AnswerOptions) error {
 	return d.waitAnswer(ctx, cancelCtx, &d.DialogMedia, opts)
 }
@@ -440,7 +442,7 @@ func (d *DialogClientSession) waitAnswerEarly(ctx, cancelCtx context.Context, me
 		med.mu.Unlock()
 
 		// Must be called after reader and writer setup due to race
-		if err := rtpSess.MonitorBackground(); err != nil {
+		if err := rtpSess.MonitorBackground(cancelCtx); err != nil {
 			return err
 		}
 
@@ -482,7 +484,7 @@ func (d *DialogClientSession) waitAnswer(ctx, cancelCtx context.Context, med *Di
 		return fmt.Errorf("no SDP in response")
 	}
 
-	if err := d.applyRemoteSDP(med, remoteSDP); err != nil {
+	if err := d.applyRemoteSDP(cancelCtx, med, remoteSDP); err != nil {
 		// Terminate call. Call must be ACK before doing BYE
 		if err := d.Ack(ctx); err != nil {
 			return errors.Join(err, d.Ack(ctx))
@@ -493,7 +495,9 @@ func (d *DialogClientSession) waitAnswer(ctx, cancelCtx context.Context, med *Di
 	return nil
 }
 
-func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte) error {
+// applyRemoteSDP applies the answer in a response to the session and starts
+// its RTCP monitors on ctx.
+func (d *DialogClientSession) applyRemoteSDP(ctx context.Context, med *DialogMedia, remoteSDP []byte) error {
 	sess := med.mediaSession
 
 	// The answer in the 183 stands (RFC 3261 section 13.2.1), and its
@@ -511,7 +515,7 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 	sess.RemoteSDPIsAnswer = true
 
 	// Apply SDP on existing (Early) media if it exists
-	if err := med.checkEarlyMedia(remoteSDP); err != errNoRTPSession {
+	if err := med.checkEarlyMedia(ctx, remoteSDP); err != errNoRTPSession {
 		if err == nil {
 			med.runMediaUpdateHooks()
 		}
@@ -532,7 +536,7 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 	med.mu.Unlock()
 
 	// Must be called after reader and writer setup due to race
-	return rtpSess.MonitorBackground()
+	return rtpSess.MonitorBackground(ctx)
 }
 
 // ackTarget is where the ACK to the 2xx goes: the Contact of the 2xx, or the
@@ -602,7 +606,7 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 		d.initRTPSessionUnsafe(msess, rtpSess)
 		d.mu.Unlock()
 		// Must be called after reader and writer setup due to race
-		return rtpSess.MonitorBackground()
+		return rtpSess.MonitorBackground(d.Context())
 	}
 	d.mu.Unlock()
 	return nil
@@ -797,7 +801,7 @@ func (d *DialogClientSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 			}
 			return nil
 		}
-		if err := d.mediaUpdateUnsafe(ms); err != nil {
+		if err := d.mediaUpdateUnsafe(d.Context(), ms); err != nil {
 			return errors.Join(err, d.discardForkUnsafe(ms))
 		}
 		return nil

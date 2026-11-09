@@ -243,7 +243,7 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 	d.initRTPSessionUnsafe(sess, rtpSess)
 	d.earlyAnswerSDP = body
 	d.mu.Unlock()
-	return rtpSess.MonitorBackground()
+	return rtpSess.MonitorBackground(d.Context())
 }
 
 func (d *DialogServerSession) Ringing() error {
@@ -558,6 +558,9 @@ func (d *DialogServerSession) Answer() error {
 // too, which then returns why it was not confirmed. A ctx that has ended
 // before the 2xx is sent leaves the INVITE unanswered.
 //
+// The RTCP monitors of the answered media run on ctx and end with it, so ctx
+// is the call's, not a bound for the answer alone.
+//
 // A refusal the answer makes instead, a 422 to a Session-Expires below our
 // Min-SE or a 488 to a DTLS handshake that failed, waits for its ACK within
 // ctx too; its transaction ends it on its own.
@@ -798,7 +801,7 @@ func (d *DialogServerSession) answerUnkeyedEarlyMedia(ctx context.Context, sess 
 		d.initRTPSessionUnsafe(sess, rtpSess)
 		d.mu.Unlock()
 		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground()
+		return rtpSess.MonitorBackground(ctx)
 	})
 }
 
@@ -835,7 +838,7 @@ func (d *DialogServerSession) answerSession(ctx context.Context, rtpSess *media.
 			return err
 		}
 		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground()
+		return rtpSess.MonitorBackground(ctx)
 	})
 }
 
@@ -884,7 +887,7 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) error {
 			return err
 		}
 		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground()
+		return rtpSess.MonitorBackground(ctx)
 	})
 }
 
@@ -1227,7 +1230,7 @@ func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.M
 			}
 			return nil
 		}
-		if err := d.mediaUpdateUnsafe(ms); err != nil {
+		if err := d.mediaUpdateUnsafe(d.Context(), ms); err != nil {
 			return errors.Join(err, d.discardForkUnsafe(ms))
 		}
 		return nil

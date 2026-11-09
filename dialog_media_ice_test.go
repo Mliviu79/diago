@@ -112,7 +112,7 @@ func newICEDialogMedia(t *testing.T, sess *media.MediaSession) *DialogMedia {
 	d := &DialogMedia{}
 	rtpSess := media.NewRTPSession(sess)
 	d.initRTPSessionUnsafe(sess, rtpSess)
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	t.Cleanup(func() { _ = d.Close() })
 	return d
 }
@@ -135,7 +135,7 @@ func checkEarlyMediaNoPanic(d *DialogMedia, body []byte) (err error) {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
-	return d.checkEarlyMedia(body)
+	return d.checkEarlyMedia(context.Background(), body)
 }
 
 func requireNoRecoveredPanic(t *testing.T, err error) {

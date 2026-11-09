@@ -616,7 +616,7 @@ func TestDialogReInviteRacingBye(t *testing.T) {
 				d.mu.Lock()
 				d.initRTPSessionUnsafe(sess, rtpSess)
 				d.mu.Unlock()
-				require.NoError(t, rtpSess.MonitorBackground())
+				require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 				t.Cleanup(func() { _ = d.DialogMedia.Close() })
 
 				seq := d.InviteRequest.CSeq().SeqNo
@@ -707,7 +707,7 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 				d.mu.Lock()
 				d.initRTPSessionUnsafe(sess, rtpSess)
 				d.mu.Unlock()
-				require.NoError(t, rtpSess.MonitorBackground())
+				require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 				t.Cleanup(func() { _ = d.DialogMedia.Close() })
 
 				return &d.DialogMedia, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), d.handleReInvite,
@@ -856,7 +856,7 @@ func installTestMedia(t *testing.T, m *DialogMedia, sess *media.MediaSession) {
 	if old != nil {
 		require.NoError(t, old.MonitorClose())
 	}
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	t.Cleanup(func() { _ = m.Close() })
 }
 

@@ -342,7 +342,7 @@ func newAnsweredDialogMedia(t *testing.T) (*DialogMedia, *media.MediaSession) {
 	d := &DialogMedia{}
 	d.initRTPSessionUnsafe(ours, rtpSess)
 	d.onCloseUnsafe(rtpSess.Close)
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	return d, offerer
 }
 
@@ -478,7 +478,7 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 		require.NoError(t, ms.RemoteSDP(answerer.LocalSDP()))
 
 		jd.d.mu.Lock()
-		err := jd.d.mediaUpdateUnsafe(ms)
+		err := jd.d.mediaUpdateUnsafe(context.Background(), ms)
 		jd.d.mu.Unlock()
 		require.NoError(t, err)
 		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")

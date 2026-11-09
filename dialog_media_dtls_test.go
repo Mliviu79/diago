@@ -474,7 +474,7 @@ func TestDialogServerReInviteNewAssociationFailureHangsUp(t *testing.T) {
 	d.mu.Lock()
 	d.initRTPSessionUnsafe(answerer, rtpSess)
 	d.mu.Unlock()
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 
 	// The call moves to another peer, whose offer carries the fingerprint of a
 	// certificate other than the one it presents.
@@ -542,7 +542,7 @@ func newNewAssociationReInviteDialog(t *testing.T) (*DialogServerSession, *media
 	d.mu.Lock()
 	d.initRTPSessionUnsafe(answerer, rtpSess)
 	d.mu.Unlock()
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 
 	other, err := selfsign.GenerateSelfSigned()
 	require.NoError(t, err)

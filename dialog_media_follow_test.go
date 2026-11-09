@@ -84,7 +84,7 @@ func (p *followPeer) rebind(t *testing.T) {
 	fork.RemoteSDPIsAnswer = false
 	require.NoError(t, fork.RemoteSDP(teOffer(p.conn.LocalAddr().(*net.UDPAddr).Port, 101, 3)))
 	p.d.mu.Lock()
-	err := p.d.mediaUpdateUnsafe(fork)
+	err := p.d.mediaUpdateUnsafe(context.Background(), fork)
 	p.d.mu.Unlock()
 	require.NoError(t, err)
 }

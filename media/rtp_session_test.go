@@ -5,6 +5,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -386,7 +387,7 @@ func TestRTPSessionFork(t *testing.T) {
 		sampleRate:          CodecAudioUlaw.SampleRate,
 	}
 
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	require.NoError(t, rtpSess.MonitorClose())
 
 	candidate := sess.Fork()
@@ -399,7 +400,7 @@ func TestRTPSessionFork(t *testing.T) {
 	// its first RTCP write succeeds on the shared deadline-aware connection.
 	fork.rtcpTicker.Stop()
 	fork.rtcpTicker = time.NewTicker(10 * time.Millisecond)
-	require.NoError(t, fork.MonitorBackground())
+	require.NoError(t, fork.MonitorBackground(context.Background()))
 	require.NoError(t, rtcpPeer.SetReadDeadline(time.Now().Add(time.Second)))
 	buf := make([]byte, 1500)
 	n, err := rtcpPeer.Read(buf)
@@ -697,4 +698,43 @@ func TestRTPSessionWriteGatesOnNegotiatedCodecs(t *testing.T) {
 	}
 	require.NoError(t, rtpSess.WriteRTP(&pkt), "writing the negotiated payload type must not fail")
 	assert.EqualValues(t, 48000, rtpSess.WriteStats().sampleRate)
+}
+
+// TestRTPSessionMonitorEndsWithCtx pins that the RTCP monitors return when the
+// ctx they run on ends, with no MonitorClose and while the sockets stay open.
+func TestRTPSessionMonitorEndsWithCtx(t *testing.T) {
+	rtpConn, rtpPeer := net.Pipe()
+	rtcpConn, rtcpPeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = rtpConn.Close()
+		_ = rtpPeer.Close()
+		_ = rtcpConn.Close()
+		_ = rtcpPeer.Close()
+	})
+
+	sess := &MediaSession{
+		Codecs:    []Codec{CodecAudioUlaw},
+		Mode:      sdp.ModeSendrecv,
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		Raddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9876},
+		rtcpRaddr: net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9877},
+		rtpConn:   &pipePacketConn{Conn: rtpConn},
+		rtcpConn:  &pipePacketConn{Conn: rtcpConn},
+	}
+	rtpSess := NewRTPSession(sess)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, rtpSess.MonitorBackground(ctx))
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		rtpSess.monitorWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RTCP monitors still running after their ctx ended")
+	}
 }

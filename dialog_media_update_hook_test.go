@@ -78,7 +78,7 @@ func TestDialogMediaUpdateHooks(t *testing.T) {
 			return err
 		}},
 		{name: "AnswerAfterEarlyMedia", replaced: true, update: func(d *DialogClientSession) error {
-			return d.applyRemoteSDP(&d.DialogMedia, peerSDP())
+			return d.applyRemoteSDP(context.Background(), &d.DialogMedia, peerSDP())
 		}},
 		{name: "RefusedReInvite", replaced: false, update: func(d *DialogClientSession) error {
 			status, err := reInvite(d, []byte("v=0\r\n"), nil)
@@ -161,7 +161,7 @@ func TestDialogMediaUpdateHooksAnswerInACKInbound(t *testing.T) {
 	d.mu.Lock()
 	d.initRTPSessionUnsafe(sess, rtpSess)
 	d.mu.Unlock()
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	t.Cleanup(func() { _ = d.DialogMedia.Close() })
 
 	var seen []*media.MediaSession

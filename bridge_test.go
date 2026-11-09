@@ -1523,7 +1523,7 @@ func newAnsweredBridgeTestDialog(t *testing.T, id string) (d *bridgeTestDialog, 
 	m := &DialogMedia{}
 	m.initRTPSessionUnsafe(sess, rtpSess)
 	m.onCloseUnsafe(rtpSess.Close)
-	require.NoError(t, rtpSess.MonitorBackground())
+	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 	t.Cleanup(func() { _ = m.Close() })
 
 	invite := sip.NewRequest(sip.INVITE, sip.Uri{User: id, Host: "127.0.0.1", Port: 5060})
