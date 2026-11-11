@@ -1600,6 +1600,59 @@ func runObservedReferCases(t *testing.T, dial func(t *testing.T) observedReferCa
 		requireDialogStaysConfirmed(t, call.dialog, 750*time.Millisecond)
 	})
 
+	t.Run("the REFER's final response is reported before the subscription ends", func(t *testing.T) {
+		call := dial(t)
+
+		release := transferee.holdNextReferral(t)
+		answering := target
+		answering.User = "responded-" + userSuffix
+		responded := make(chan ReferResponse, 2)
+		ended := make(chan ReferObservation, 1)
+		go func() {
+			obs, err := call.dialog.ReferAndObserve(call.dialog.Context(), answering, ReferObserveOptions{
+				OnResponse: func(r ReferResponse) { responded <- r },
+			})
+			assert.NoError(t, err)
+			ended <- obs
+		}()
+		select {
+		case r := <-responded:
+			assert.True(t, r.Status >= 200 && r.Status < 300, "the REFER was accepted, got %d", r.Status)
+		case <-ended:
+			t.Fatal("the attempt ended before it reported the REFER's response")
+		case <-time.After(5 * time.Second):
+			t.Fatal("the REFER's response was not reported while its referral was held")
+		}
+		select {
+		case <-ended:
+			t.Fatal("the attempt ended while its referral was held")
+		default:
+		}
+
+		release()
+		select {
+		case obs := <-ended:
+			assert.Equal(t, ReferEndFinalNotify, obs.End)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no terminal NOTIFY ended the attempt within 5s of releasing the referral")
+		}
+		assert.Len(t, responded, 0, "the response is reported once")
+	})
+
+	t.Run("the response of a REFER whose referral fails is reported once", func(t *testing.T) {
+		call := dial(t)
+
+		busy := target
+		busy.User = "busy"
+		var got []ReferResponse
+		obs, err := call.dialog.ReferAndObserve(call.dialog.Context(), busy, ReferObserveOptions{
+			OnResponse: func(r ReferResponse) { got = append(got, r) },
+		})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, obs.Response, got[0])
+	})
+
 	t.Run("Referred-By names our own contact", func(t *testing.T) {
 		call := dial(t)
 

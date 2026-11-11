@@ -238,10 +238,16 @@ func (o ReferObservation) LastNotify() (ReferNotify, bool) {
 	return o.Notifies[len(o.Notifies)-1], true
 }
 
-// ReferObserveOptions configures an observed REFER attempt. It has no field:
-// the attempt's lifetime is its refer subscription's (see ReferEnd), and a
-// NOTIFY after that is reported through DialogMedia.OnReferNotifyUnmatched.
-type ReferObserveOptions struct{}
+// ReferObserveOptions configures an observed REFER attempt. The attempt's
+// lifetime is its refer subscription's (see ReferEnd), and a NOTIFY after that is
+// reported through DialogMedia.OnReferNotifyUnmatched.
+type ReferObserveOptions struct {
+	// OnResponse, when set, is called once with the REFER's final response, 2xx or
+	// not, as soon as it arrives and before the attempt waits on its subscription,
+	// on the goroutine that sends the REFER. It is not called when the attempt ends
+	// with no final response. It must not block: the attempt waits for it.
+	OnResponse func(ReferResponse)
+}
 
 // parseSipfragStatus parses the status code and reason phrase from a
 // message/sipfrag status line of the form "SIP/2.0 <code> <reason>" (the shape
@@ -408,7 +414,7 @@ func dialogReferSend(ctx context.Context, d DialogSession, recipient, referTo, r
 // header or a transport failure. A transport failure comes back as an error that
 // keeps its class for errors.Is and none of sipgo's text, which carries the
 // REFER's request line and socket addresses.
-func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, _ ReferObserveOptions, headers ...sip.Header) (ReferObservation, *sip.Response, error) {
+func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, opts ReferObserveOptions, headers ...sip.Header) (ReferObservation, *sip.Response, error) {
 	if d.DialogSIP().LoadState() != sip.DialogStateConfirmed {
 		return ReferObservation{}, nil, fmt.Errorf("can only be called on answered dialog")
 	}
@@ -445,6 +451,9 @@ func dialogReferObserve(ctx context.Context, d DialogSession, recipient, referTo
 	}
 
 	response := ReferResponse{Status: res.StatusCode, Reason: res.Reason}
+	if opts.OnResponse != nil {
+		opts.OnResponse(response)
+	}
 	if !referAccepted(res.StatusCode) {
 		obs := med.finishReferAttempt(attempt, ReferEndRefused)
 		obs.Response, obs.ResponseReceived = response, true
