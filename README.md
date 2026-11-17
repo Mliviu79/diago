@@ -98,10 +98,19 @@ dg.HandleFunc(func(ctx context.Context, inDialog *diago.DialogServerSession) {
 })
 
 // Serve opens the listeners, ServeRequests hands the requests they read to the
-// handler above, on ctx. Run both until ctx ends.
-go dg.Serve(ctx)
+// handler above, on ctx. Run both until ctx ends, and join both.
+ctx, cancel := context.WithCancel(ctx)
+var wg sync.WaitGroup
+wg.Go(func() {
+	defer cancel()
+	dg.Serve(ctx)
+})
 dg.ServeRequests(ctx, nil)
+cancel()
+wg.Wait()
 ```
+
+[examples/serving](/examples/serving) runs both and returns their errors.
 
 See more [examples in this repo](/examples)
 ### Tracing SIP, RTP
