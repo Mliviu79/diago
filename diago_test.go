@@ -46,6 +46,20 @@ func testDiagoClient(t *testing.T, onRequest func(req *sip.Request) *sip.Respons
 	return NewDiago(ua, opts...)
 }
 
+// serveEndBound is how long a test waits for serving to end: longer than the 10
+// seconds diago allows a handler's hang-up after the handler returns.
+const serveEndBound = 15 * time.Second
+
+// waitEnded fails the test when ended is not closed within serveEndBound.
+func waitEnded(t testing.TB, ended <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ended:
+	case <-time.After(serveEndBound):
+		t.Error("serving did not end with the test")
+	}
+}
+
 // serveBackground serves dg as ServeBackground does and runs its request
 // serving, with f as the dialog handler when it is not nil, on a context that
 // ends with ctx or when the test ends, and has the test wait, bounded, until
@@ -92,18 +106,18 @@ func serveBackground(t testing.TB, dg *Diago, ctx context.Context, f ServeDialog
 	}()
 	t.Cleanup(func() {
 		cancel()
+		// A handler registers its termination before it runs, and the request run
+		// returns only after every handler has, so no registration is left when
+		// the wait for terminations starts. The wait is longer than the 10
+		// seconds diago allows a handler's hang-up after the handler returns.
+		waitEnded(t, requestsDone)
 		terminated := make(chan struct{})
 		go func() {
 			defer close(terminated)
 			terminations.Wait()
 		}()
-		for _, ended := range []chan struct{}{terminated, done, requestsDone} {
-			select {
-			case <-ended:
-			case <-time.After(10 * time.Second):
-				t.Error("serving did not end with the test")
-			}
-		}
+		waitEnded(t, terminated)
+		waitEnded(t, done)
 	})
 
 	select {

@@ -371,7 +371,7 @@ func TestDialogDTLSNewAssociationFailedHandshake(t *testing.T) {
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
 	updated := make(chan error, 1)
 	go func() {
-		updated <- d.handleMediaUpdate(context.Background(), newReInvite(t, []byte(offer)), tx, contact)
+		updated <- d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, []byte(offer)), tx, contact)
 	}()
 
 	// The answer goes out before the handshake, which the peer then runs.
@@ -632,7 +632,7 @@ func TestDialogByeBeforeNewAssociationAnswer(t *testing.T) {
 	d.mu.Unlock()
 
 	contact := &sip.ContactHeader{Address: d.InviteRequest.Recipient}
-	require.NoError(t, d.answerNewAssociation(d.Context(), req, tx, contact, msess))
+	require.NoError(t, d.answerNewAssociation(d.Context(), &d.Dialog, req, tx, contact, msess))
 	require.Len(t, tx.responses, 1, "the re-INVITE got a second final response")
 	require.Same(t, answerer, d.MediaSession())
 	requirePortReleased(t, msess.LocalSDP())
@@ -992,10 +992,17 @@ func newSentDTLSMediaSession(t *testing.T) (*media.MediaSession, *sentPacketConn
 // handshake ProgressMedia started completes with the caller, so the media is
 // encrypted both ways.
 func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
+	// The serving ends in the test's cleanups, after the one that hangs the call
+	// up, not at the return of the test: the callee's BYE needs a caller that
+	// still serves.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
 	sess, sent := newSentDTLSMediaSession(t)
+	// The caller serves first, so it stops last: the callee's calls end with a
+	// BYE the caller still answers.
+	caller := newDTLSDiago(t, 16458, testdata.ClientCertificate())
+	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	callee := newDTLSDiago(t, 16457, testdata.ServerCertificate())
 
 	type progressResult struct {
@@ -1039,8 +1046,6 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 		}
 	}))
 
-	caller := newDTLSDiago(t, 16458, testdata.ClientCertificate())
-	require.NoError(t, serveBackground(t, caller, ctx, nil))
 	type inviteResult struct {
 		d   *DialogClientSession
 		err error
