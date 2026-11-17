@@ -69,7 +69,7 @@ func (p *followPeer) reinvite(t *testing.T, te int, version int) {
 	tx := &fakeServerTransaction{}
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
 	body := teOffer(p.conn.LocalAddr().(*net.UDPAddr).Port, te, version)
-	require.NoError(t, p.d.handleMediaUpdate(context.Background(), newReInvite(t, body), tx, contact))
+	require.NoError(t, p.d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, body), tx, contact))
 	require.NotNil(t, tx.res)
 	require.Equal(t, 200, tx.res.StatusCode)
 }

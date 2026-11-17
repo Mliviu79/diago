@@ -16,7 +16,9 @@ import (
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -45,6 +47,15 @@ func newReInvite(t *testing.T, body []byte) *sip.Request {
 		req.SetBody(body)
 	}
 	return req
+}
+
+// newMediaTestDialog is a dialog whose ctx never ends, for a media update that
+// is not ended by its dialog.
+func newMediaTestDialog(t *testing.T) *sipgo.Dialog {
+	t.Helper()
+	dialog := &sipgo.Dialog{InviteRequest: newReInvite(t, nil)}
+	dialog.Init()
+	return dialog
 }
 
 func newMediaSessionForTest(t *testing.T) *media.MediaSession {
@@ -273,7 +284,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{mediaSession: newMediaSessionForTest(t)}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, nil), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, nil), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		requireLocalSDP(t, d, tx.res)
 	})
@@ -285,7 +296,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{mediaSession: newMediaSessionForTest(t)}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, []byte{}), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, []byte{}), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		requireLocalSDP(t, d, tx.res)
 	})
@@ -297,7 +308,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, nil), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, nil), tx, contactHDR))
 		require.Equal(t, sip.StatusRequestTerminated, tx.res.StatusCode)
 	})
 
@@ -307,7 +318,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		d := &DialogMedia{}
 		tx := &fakeServerTransaction{}
 
-		require.NoError(t, d.handleMediaUpdate(context.Background(), newReInvite(t, []byte("v=0\r\n")), tx, contactHDR))
+		require.NoError(t, d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, []byte("v=0\r\n")), tx, contactHDR))
 		require.Equal(t, sip.StatusRequestTerminated, tx.res.StatusCode)
 		require.Contains(t, tx.res.Reason, "no media session present")
 	})
@@ -437,6 +448,45 @@ func (jd *jitterDialog) sendAndReadTimestamp(t *testing.T, addr net.UDPAddr, seq
 	}
 }
 
+// The RTCP monitors of the session a re-INVITE installs run as long as the
+// dialog, not as long as the request that installed them: the request's ctx
+// ends when its handler returns.
+func TestHandleMediaUpdateKeepsRTCPMonitorAfterRequestCtxEnds(t *testing.T) {
+	d, offerer := newAnsweredDialogMedia(t)
+	contactHDR := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	tx := &fakeServerTransaction{}
+	require.NoError(t, d.handleMediaUpdate(ctx, newMediaTestDialog(t), newReInvite(t, offerer.LocalSDP()), tx, contactHDR))
+	require.Equal(t, sip.StatusOK, tx.res.StatusCode)
+	cancel()
+
+	read := make(chan struct{}, 1)
+	d.RTPSession().OnReadRTCP(func(rtcp.Packet, media.RTPReadStats) {
+		select {
+		case read <- struct{}{}:
+		default:
+		}
+	})
+	raw, err := (&rtcp.ReceiverReport{SSRC: 1}).Marshal()
+	require.NoError(t, err)
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	rtcpAddr := d.MediaSession().Laddr
+	rtcpAddr.Port++
+	for range 20 {
+		_, err = peer.WriteToUDP(raw, &rtcpAddr)
+		require.NoError(t, err)
+		select {
+		case <-read:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("the session a re-INVITE installed stopped reading RTCP when the request's ctx ended")
+}
+
 // TestDialogMediaJitterBufferFollowsReinvite pins that a jitter buffer on the
 // audio reader keeps playing the call after a re-INVITE, reading the session
 // the re-INVITE installs, with nothing left reading the one it replaced. A
@@ -452,7 +502,7 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 
 		tx := &fakeServerTransaction{}
 		contactHDR := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
-		require.NoError(t, jd.d.handleMediaUpdate(context.Background(), newReInvite(t, jd.offerer.LocalSDP()), tx, contactHDR))
+		require.NoError(t, jd.d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, jd.offerer.LocalSDP()), tx, contactHDR))
 		require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")
 

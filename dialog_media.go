@@ -994,10 +994,11 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 	return d.mediaSession
 }
 
-// endsWithDialog derives from ctx a ctx that also ends when dialogCtx does,
-// with dialogCtx's cause, and the func that releases it. The release waits for
-// the callback that carries the dialog's end across, when it has started.
-func endsWithDialog(ctx, dialogCtx context.Context) (context.Context, func()) {
+// endsWithDialog derives from ctx a ctx that also ends when dialog does, with
+// the dialog's cause, and the func that releases it. The release waits for the
+// callback that carries the dialog's end across, when it has started.
+func endsWithDialog(ctx context.Context, dialog *sipgo.Dialog) (context.Context, func()) {
+	dialogCtx := dialog.Context()
 	ctx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
 	stop := context.AfterFunc(dialogCtx, func() {
@@ -1013,15 +1014,15 @@ func endsWithDialog(ctx, dialogCtx context.Context) (context.Context, func()) {
 }
 
 // handleMediaUpdate answers an in-dialog INVITE and applies its offer, if it
-// has one, to a fork of the media session. ctx is the request handler's, which
-// the caller ends with the dialog as well (endsWithDialog): it carries the
-// answer and bounds a DTLS handshake the offer asks for. An error
-// wrapping errMediaUpdateAfterAnswer means the update failed after the 2xx was
-// sent, and the caller ends the call.
+// has one, to a fork of the media session. ctx is the request handler's: the
+// answer goes out on it, and a DTLS handshake the offer asks for runs on it and
+// ends with dialog as well. The RTCP monitors of the installed session run as
+// long as dialog does. An error wrapping errMediaUpdateAfterAnswer means the
+// update failed after the 2xx was sent, and the caller ends the call.
 //
 // The answer is sent through respondPeerReInvite with mu released, so a BYE
 // that ends the dialog meanwhile has it answered 487 instead.
-func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
+func (d *DialogMedia) handleMediaUpdate(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
 	respond := func(res *sip.Response) error {
 		_, err := d.respondPeerReInvite(ctx, tx, res)
 		return err
@@ -1052,10 +1053,10 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 		if err == nil && msess.FinalizePending() {
 			d.mediaUpdating = true
 			d.mu.Unlock()
-			return d.answerNewAssociation(ctx, req, tx, contactHDR, msess)
+			return d.answerNewAssociation(ctx, dialog, req, tx, contactHDR, msess)
 		}
 		if err == nil {
-			err = d.replaceRTPSessionUnsafe(ctx, msess)
+			err = d.replaceRTPSessionUnsafe(dialog.Context(), msess)
 		}
 		if err != nil {
 			d.mu.Unlock()
@@ -1156,9 +1157,10 @@ func (d *DialogMedia) applyAckAnswer(ctx context.Context, req *sip.Request) (boo
 // other media updates out until it clears it.
 //
 // A dialog that ends before the answer has the re-INVITE answered 487 by the
-// BYE, and one that ends while the handshake runs ends it through ctx. Either
-// way nothing is installed and the fork is discarded.
-func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
+// BYE, and one that ends while the handshake runs ends it: the handshake runs
+// on ctx ended with dialog. Either way nothing is installed and the fork is
+// discarded.
+func (d *DialogMedia) answerNewAssociation(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", msess.LocalSDP())
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
@@ -1171,12 +1173,14 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 		return err
 	}
 
-	err = msess.FinalizeContext(ctx)
+	handshakeCtx, release := endsWithDialog(ctx, dialog)
+	defer release()
+	err = msess.FinalizeContext(handshakeCtx)
 
 	d.mu.Lock()
 	d.mediaUpdating = false
 	switch {
-	case ctx.Err() != nil:
+	case handshakeCtx.Err() != nil:
 		// The dialog ended, which is no failure of the update.
 		err = d.discardForkUnsafe(msess)
 		d.mu.Unlock()
@@ -1187,7 +1191,7 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 	if err != nil {
 		err = errors.Join(err, d.discardForkUnsafe(msess))
 	} else {
-		err = d.replaceRTPSessionUnsafe(ctx, msess)
+		err = d.replaceRTPSessionUnsafe(dialog.Context(), msess)
 	}
 	onMediaUpdate := d.onMediaUpdate
 	d.mu.Unlock()

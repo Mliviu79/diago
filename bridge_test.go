@@ -1580,7 +1580,7 @@ func TestBridgeMixFollowsCodecChange(t *testing.T) {
 		movedPeer.LocalAddr().(*net.UDPAddr).Port, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ALAW})
 	tx := &fakeServerTransaction{}
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
-	require.NoError(t, moved.media.handleMediaUpdate(context.Background(), newReInvite(t, offer), tx, contact))
+	require.NoError(t, moved.media.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, offer), tx, contact))
 	require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 	p := MediaProps{}
 	moved.media.audioReaderProps(&p)
@@ -1829,7 +1829,7 @@ func (d *bridgeTestDialog) reInviteAlaw(t *testing.T, peer *net.UDPConn) {
 		peer.LocalAddr().(*net.UDPAddr).Port, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ALAW})
 	tx := &fakeServerTransaction{}
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
-	require.NoError(t, d.media.handleMediaUpdate(context.Background(), newReInvite(t, offer), tx, contact))
+	require.NoError(t, d.media.handleMediaUpdate(context.Background(), newMediaTestDialog(t), newReInvite(t, offer), tx, contact))
 	require.Equal(t, sip.StatusOK, tx.res.StatusCode)
 	p := MediaProps{}
 	d.media.audioWriterProps(&p)

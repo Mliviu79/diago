@@ -1473,9 +1473,7 @@ func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Reque
 		return err
 	}
 
-	mediaCtx, release := endsWithDialog(ctx, d.Context())
-	defer release()
-	if err := d.handleMediaUpdate(mediaCtx, req, tx, d.InviteResponse.Contact()); err != nil {
+	if err := d.handleMediaUpdate(ctx, &d.Dialog, req, tx, d.InviteResponse.Contact()); err != nil {
 		if errors.Is(err, errMediaUpdateAfterAnswer) {
 			return errors.Join(err, d.hangupNoMedia())
 		}

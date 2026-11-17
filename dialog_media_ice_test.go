@@ -119,13 +119,13 @@ func newICEDialogMedia(t *testing.T, sess *media.MediaSession) *DialogMedia {
 
 // handleMediaUpdateNoPanic turns a panic into an error whose text begins
 // "panic: ", so a crash fails the test rather than the whole binary.
-func handleMediaUpdateNoPanic(d *DialogMedia, req *sip.Request, tx sip.ServerTransaction, contact sip.Header) (err error) {
+func handleMediaUpdateNoPanic(t *testing.T, d *DialogMedia, req *sip.Request, tx sip.ServerTransaction, contact sip.Header) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
-	return d.handleMediaUpdate(context.Background(), req, tx, contact)
+	return d.handleMediaUpdate(context.Background(), newMediaTestDialog(t), req, tx, contact)
 }
 
 // checkEarlyMediaNoPanic is handleMediaUpdateNoPanic for the early media path.
@@ -187,7 +187,7 @@ func TestDialogICEForkSameCredentialsReinvite(t *testing.T) {
 	tx := &fakeServerTransaction{}
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
 
-	err := handleMediaUpdateNoPanic(d, newReInvite(t, e.offer), tx, contact)
+	err := handleMediaUpdateNoPanic(t, d, newReInvite(t, e.offer), tx, contact)
 	requireNoRecoveredPanic(t, err)
 	require.NoError(t, err)
 	require.NotNil(t, tx.res)
@@ -227,7 +227,7 @@ func TestDialogICEForkRestartReinviteAnswers488(t *testing.T) {
 	tx := &fakeServerTransaction{}
 	contact := &sip.ContactHeader{Address: sip.Uri{User: "us", Host: "127.0.0.1"}}
 
-	err := handleMediaUpdateNoPanic(d, newReInvite(t, replaceICECredentials(t, e.offer)), tx, contact)
+	err := handleMediaUpdateNoPanic(t, d, newReInvite(t, replaceICECredentials(t, e.offer)), tx, contact)
 	requireNoRecoveredPanic(t, err)
 	require.NoError(t, err)
 	require.NotNil(t, tx.res)
