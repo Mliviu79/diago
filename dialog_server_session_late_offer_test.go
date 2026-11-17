@@ -29,7 +29,7 @@ type firstResponseTx struct {
 	first chan *sip.Response
 }
 
-func (tx *firstResponseTx) Respond(res *sip.Response) error {
+func (tx *firstResponseTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.once.Do(func() { tx.first <- res })
 	return nil
 }

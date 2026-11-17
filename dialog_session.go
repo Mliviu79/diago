@@ -531,12 +531,12 @@ func referAccepted(status int) bool {
 // (RFC 3261 section 12.2.2) without answering it. Some sipgo versions answer
 // such a BYE themselves and some leave the answer to their caller; the BYE is
 // answered once either way.
-func readByeOnce(req *sip.Request, tx sip.ServerTransaction, readBye func(*sip.Request, sip.ServerTransaction) error) error {
+func readByeOnce(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, readBye func(context.Context, *sip.Request, sip.ServerTransaction) error) error {
 	rtx := &respondRecordingTx{ServerTransaction: tx}
-	err := readBye(req, rtx)
+	err := readBye(ctx, req, rtx)
 	if errors.Is(err, sipgo.ErrDialogInvalidCseq) && !rtx.responded.Load() {
 		res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
-		return errors.Join(err, tx.Respond(res))
+		return errors.Join(err, tx.Respond(ctx, res))
 	}
 	return err
 }
@@ -548,9 +548,9 @@ type respondRecordingTx struct {
 	responded atomic.Bool
 }
 
-func (tx *respondRecordingTx) Respond(res *sip.Response) error {
+func (tx *respondRecordingTx) Respond(ctx context.Context, res *sip.Response) error {
 	tx.responded.Store(true)
-	return tx.ServerTransaction.Respond(res)
+	return tx.ServerTransaction.Respond(ctx, res)
 }
 
 // respondDialogEnded answers req 481 when d has ended, and reports whether it
@@ -558,12 +558,12 @@ func (tx *respondRecordingTx) Respond(res *sip.Response) error {
 // returns, for an inbound call, or until it is closed, for an outbound one, so
 // an in-dialog request can still find it. It matches no live dialog, and RFC
 // 3261 section 12.2.2 has such a request answered 481.
-func respondDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
+func respondDialogEnded(ctx context.Context, d DialogSession, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
 	if d.DialogSIP().LoadState() != sip.DialogStateEnded {
 		return false, nil
 	}
 	res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
-	return true, tx.Respond(res)
+	return true, tx.Respond(ctx, res)
 }
 
 // parseReferNotify reads a refer NOTIFY: its message/sipfrag status line, its
@@ -597,12 +597,12 @@ func parseReferNotify(req *sip.Request) (n ReferNotify, ok bool) {
 // 5.5), so a transfer outcome is still taken after the call has ended. A refer
 // NOTIFY answered here is one no subscription holds, and is reported to the
 // function DialogMedia.OnReferNotifyUnmatched set.
-func respondNotifyDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTransaction) bool {
+func respondNotifyDialogEnded(ctx context.Context, d DialogSession, req *sip.Request, tx sip.ServerTransaction) bool {
 	med := d.Media()
 	if d.DialogSIP().LoadState() != sip.DialogStateEnded || med.referNotifyExpected(req) {
 		return false
 	}
-	ended, _ := respondDialogEnded(d, req, tx)
+	ended, _ := respondDialogEnded(ctx, d, req, tx)
 	if n, parsed := parseReferNotify(req); ended && parsed {
 		med.reportUnmatchedReferNotify(n)
 	}
@@ -617,10 +617,10 @@ func respondNotifyDialogEnded(d DialogSession, req *sip.Request, tx sip.ServerTr
 // DialogMedia.OnReferNotifyUnmatched set. A body that is not a sipfrag status
 // line is answered 400. The dialog is left to its owner: what follows a
 // transfer result, success or failure, is the caller's decision.
-func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
+func dialogHandleReferNotify(ctx context.Context, d DialogSession, req *sip.Request, tx sip.ServerTransaction) {
 	n, parsed := parseReferNotify(req)
 	if !parsed {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
 		return
 	}
 
@@ -632,12 +632,12 @@ func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTra
 	onNot := med.onReferNotify
 	med.mu.Unlock()
 	if attempt == nil && onNot == nil {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
+		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
 		med.reportUnmatchedReferNotify(n)
 		return
 	}
 
-	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+	tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
 	if attempt != nil {
 		med.retireEndedReferAttempt(attempt)
 	}
@@ -646,7 +646,7 @@ func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTra
 	}
 }
 
-func dialogHandleRefer(d DialogSession, dg *Diago, req *sip.Request, tx sip.ServerTransaction, onReferDialog OnReferDialogFunc) error {
+func dialogHandleRefer(ctx context.Context, d DialogSession, dg *Diago, req *sip.Request, tx sip.ServerTransaction, onReferDialog OnReferDialogFunc) error {
 	// https://datatracker.ietf.org/doc/html/rfc3515#section-2.4.2
 	// 	An agent responding to a REFER method MUST return a 400 (Bad Request)
 	//    if the request contained zero or more than one Refer-To header field
@@ -655,7 +655,7 @@ func dialogHandleRefer(d DialogSession, dg *Diago, req *sip.Request, tx sip.Serv
 	referTo := req.GetHeader("Refer-To")
 	if referTo == nil {
 		log.Info("Received REFER without Refer-To header")
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
 	}
 
 	referToUri := sip.Uri{}
@@ -664,18 +664,18 @@ func dialogHandleRefer(d DialogSession, dg *Diago, req *sip.Request, tx sip.Serv
 	_, err := sip.ParseAddressValue(referTo.Value(), &referToUri, &headerParams)
 	if err != nil {
 		log.Info("Received REFER but failed to parse Refer-To uri", "error", err)
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
 	}
 
 	contact := req.Contact()
 	if contact == nil {
 		log.Info("Received REFER but no Contact Header present")
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", []byte("No Contact Header")))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", []byte("No Contact Header")))
 	}
 
 	// TODO can we locate this more checks
 	log.Info("Accepting refer")
-	if err := tx.Respond(sip.NewResponseFromRequest(req, 202, "Accepted", nil)); err != nil {
+	if err := tx.Respond(ctx, sip.NewResponseFromRequest(req, 202, "Accepted", nil)); err != nil {
 		return fmt.Errorf("failed to send 202 Accepted")
 	}
 
@@ -839,7 +839,7 @@ func (r *ReferTransaction) Accept(ctx context.Context, opts InviteClientOptions)
 
 	log := dg.log
 	log.Info("Accepting refer")
-	if err := r.tx.Respond(sip.NewResponseFromRequest(req, 202, "Accepted", nil)); err != nil {
+	if err := r.tx.Respond(ctx, sip.NewResponseFromRequest(req, 202, "Accepted", nil)); err != nil {
 		return nil, fmt.Errorf("failed to send 202 Accepted")
 	}
 
@@ -948,12 +948,12 @@ func (r *ReferTransaction) sendNotify(ctx context.Context, statusCode int, reaso
 	return nil
 }
 
-func dialogHandleReferTransaction(d DialogSession, dg *Diago, req *sip.Request, tx sip.ServerTransaction, onReferDialog OnReferTransactionFunc) error {
+func dialogHandleReferTransaction(ctx context.Context, d DialogSession, dg *Diago, req *sip.Request, tx sip.ServerTransaction, onReferDialog OnReferTransactionFunc) error {
 	log := dg.log
 	referTo := req.GetHeader("Refer-To")
 	if referTo == nil {
 		log.Info("Received REFER without Refer-To header")
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
 	}
 
 	referToUri := sip.Uri{}
@@ -962,13 +962,13 @@ func dialogHandleReferTransaction(d DialogSession, dg *Diago, req *sip.Request, 
 	_, err := sip.ParseAddressValue(referTo.Value(), &referToUri, &headerParams)
 	if err != nil {
 		log.Info("Received REFER but failed to parse Refer-To uri", "error", err)
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
 	}
 
 	contact := req.Contact()
 	if contact == nil {
 		log.Info("Received REFER but no Contact Header present")
-		return tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", []byte("No Contact Header")))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, 400, "Bad Request", []byte("No Contact Header")))
 	}
 
 	rtx := ReferTransaction{

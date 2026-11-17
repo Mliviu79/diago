@@ -127,15 +127,15 @@ func (d *DialogServerSession) Transport() string {
 	return d.InviteRequest.Transport()
 }
 
-func (d *DialogServerSession) Trying() error {
-	return d.Respond(sip.StatusTrying, "Trying", nil)
+func (d *DialogServerSession) Trying(ctx context.Context) error {
+	return d.Respond(ctx, sip.StatusTrying, "Trying", nil)
 }
 
 // Progress sends 100 trying.
 //
 // Deprecated: Use Trying. It will change behavior to 183 Sesion Progress in future releases
-func (d *DialogServerSession) Progress() error {
-	return d.Respond(sip.StatusTrying, "Trying", nil)
+func (d *DialogServerSession) Progress(ctx context.Context) error {
+	return d.Respond(ctx, sip.StatusTrying, "Trying", nil)
 }
 
 // ProgressMedia sends 183 Session Progress and creates early media
@@ -145,8 +145,8 @@ func (d *DialogServerSession) Progress() error {
 // ProgressMediaOptions.KeyTimeout.
 //
 // Experimental: Naming of API might change
-func (d *DialogServerSession) ProgressMedia() error {
-	return d.ProgressMediaOptions(ProgressMediaOptions{})
+func (d *DialogServerSession) ProgressMedia(ctx context.Context) error {
+	return d.ProgressMediaOptions(ctx, ProgressMediaOptions{})
 }
 
 type ProgressMediaOptions struct {
@@ -191,7 +191,7 @@ const defaultEarlyMediaKeyTimeout = 5 * time.Second
 // has failed by then, Answer declines the call 488 instead.
 var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has not completed the DTLS handshake")
 
-func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) error {
+func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt ProgressMediaOptions) error {
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
 	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
@@ -207,7 +207,7 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
 	body := sess.LocalSDP()
-	if err := d.DialogServerSession.Respond(183, "Session Progress", body, headers...); err != nil {
+	if err := d.DialogServerSession.Respond(ctx, 183, "Session Progress", body, headers...); err != nil {
 		return err
 	}
 
@@ -246,8 +246,8 @@ func (d *DialogServerSession) ProgressMediaOptions(opt ProgressMediaOptions) err
 	return rtpSess.MonitorBackground(d.Context())
 }
 
-func (d *DialogServerSession) Ringing() error {
-	return d.Respond(sip.StatusRinging, "Ringing", nil)
+func (d *DialogServerSession) Ringing(ctx context.Context) error {
+	return d.Respond(ctx, sip.StatusRinging, "Ringing", nil)
 }
 
 func (d *DialogServerSession) DialogSIP() *sipgo.Dialog {
@@ -354,7 +354,7 @@ func (d *DialogServerSession) prepareSessionTimers(ctx context.Context) error {
 	ta, hdrs, status := buildTimerAnswer(d.InviteRequest, d.sessionTimers)
 	if status == statusSessionIntervalTooSmall {
 		err := d.answerWithin(ctx, make(chan struct{}), func() error {
-			return d.Respond(statusSessionIntervalTooSmall, "Session Interval Too Small", nil, hdrs...)
+			return d.Respond(d.Context(), statusSessionIntervalTooSmall, "Session Interval Too Small", nil, hdrs...)
 		})
 		if err != nil {
 			return err
@@ -497,20 +497,20 @@ func (d *DialogServerSession) refreshSession(ctx context.Context, t *sessionTime
 // RespondSDP answers the INVITE with a 2xx carrying body and waits for its
 // ACK. An in-dialog request that arrives meanwhile is handled once it returns,
 // see awaitAnswer.
-func (d *DialogServerSession) RespondSDP(body []byte) error {
+func (d *DialogServerSession) RespondSDP(ctx context.Context, body []byte) error {
 	d.mu.Lock()
 	answering := make(chan struct{})
 	d.answering = answering
 	d.mu.Unlock()
 	defer close(answering)
 
-	return d.respondSDP(body)
+	return d.respondSDP(ctx, body)
 }
 
 // respondSDP is RespondSDP for an answer that has marked itself in progress,
 // because it sets up media after the ACK and must keep in-dialog requests
 // waiting until that is done too.
-func (d *DialogServerSession) respondSDP(body []byte) error {
+func (d *DialogServerSession) respondSDP(ctx context.Context, body []byte) error {
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
 
 	d.mu.Lock()
@@ -520,7 +520,7 @@ func (d *DialogServerSession) respondSDP(body []byte) error {
 		headers = append(headers, ta.headers...)
 	}
 
-	if err := d.DialogServerSession.Respond(200, "OK", body, headers...); err != nil {
+	if err := d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...); err != nil {
 		return err
 	}
 
@@ -607,6 +607,10 @@ func (d *DialogServerSession) AnswerContext(ctx context.Context) error {
 // and then ends the call (endAbandonedAnswer). When the dialog has ended by
 // then, complete ends with it, and its result is returned. The goroutine is bounded by the ACK wait of 64*T1, the
 // media setup that follows the ACK, and that BYE's Timer F; Close joins it.
+//
+// complete answers on the dialog's ctx, not on ctx: once the final response is
+// being sent, its exchange belongs to the dialog and goes on without the
+// caller, which ctx only stops waiting.
 func (d *DialogServerSession) answerWithin(ctx context.Context, answering chan struct{}, complete func() error) error {
 	if ctx.Err() != nil {
 		close(answering)
@@ -700,21 +704,21 @@ type AnswerOptions struct {
 // Experimental
 //
 // NOTE: API may change
-func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
+func (d *DialogServerSession) AnswerOptions(ctx context.Context, opt AnswerOptions) error {
 	d.mu.Lock()
 	d.onReferDialog = opt.OnRefer
 	d.onMediaUpdate = opt.OnMediaUpdate
 	d.mu.Unlock()
 
 	// RFC 4028: mirror Answer and negotiate session timers before the 200 OK.
-	if err := d.prepareSessionTimers(d.Context()); err != nil {
+	if err := d.prepareSessionTimers(ctx); err != nil {
 		return err
 	}
 
 	// If media exists as early, only respond 200
 	if d.mediaSession != nil {
 		// Check do codecs match
-		return d.answerEarlyMedia(d.Context())
+		return d.answerEarlyMedia(ctx)
 	}
 
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
@@ -722,7 +726,7 @@ func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 		return err
 	}
 	rtpSess := media.NewRTPSession(d.mediaSession)
-	return d.answerSession(d.Context(), rtpSess)
+	return d.answerSession(ctx, rtpSess)
 }
 
 func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) {
@@ -757,7 +761,7 @@ func (d *DialogServerSession) answerEarlyMedia(ctx context.Context) error {
 	d.answering = answering
 	d.mu.Unlock()
 	return d.answerWithin(ctx, answering, func() error {
-		return d.respondSDP(earlyAnswer)
+		return d.respondSDP(d.Context(), earlyAnswer)
 	})
 }
 
@@ -785,11 +789,11 @@ func (d *DialogServerSession) answerUnkeyedEarlyMedia(ctx context.Context, sess 
 	if err := sess.FinalizeWithin(d.Context(), 0); err != nil && !errors.Is(err, media.ErrFinalizeInProgress) {
 		// The 488 waits for its ACK within ctx, as the 200 would.
 		return errors.Join(err, d.answerWithin(ctx, answering, func() error {
-			return d.Respond(sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
+			return d.Respond(d.Context(), sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
 		}))
 	}
 	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(earlyAnswer); err != nil {
+		if err := d.respondSDP(d.Context(), earlyAnswer); err != nil {
 			return err
 		}
 		if err := sess.FinalizeContext(d.Context()); err != nil {
@@ -830,7 +834,7 @@ func (d *DialogServerSession) answerSession(ctx context.Context, rtpSess *media.
 	d.mu.Unlock()
 
 	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(sess.LocalSDP()); err != nil {
+		if err := d.respondSDP(d.Context(), sess.LocalSDP()); err != nil {
 			return err
 		}
 		// The handshake ends with the call.
@@ -883,7 +887,7 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) error {
 	d.mu.Unlock()
 
 	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(localSDP); err != nil {
+		if err := d.respondSDP(d.Context(), localSDP); err != nil {
 			return err
 		}
 		// Must be called after media and reader writer is setup
@@ -1068,12 +1072,12 @@ func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
 // rejected with 500. Depending on the sipgo version, the delegate answers it
 // 500 itself or leaves the answer to its caller; readByeOnce answers it only
 // when the delegate did not, and the error is returned: the dialog goes on.
-func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogServerSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	d.awaitAnswer(tx)
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
 	d.terminatingBye.Store(req)
-	if err := readByeOnce(req, tx, d.DialogServerSession.ReadBye); err != nil {
+	if err := readByeOnce(ctx, req, tx, d.DialogServerSession.ReadBye); err != nil {
 		// Not this dialog's ending: leave no cause planted on it. A BYE
 		// taken whose 200 could not be sent may still have ended it.
 		if errors.Is(err, sipgo.ErrDialogInvalidCseq) || d.LoadState() != sip.DialogStateEnded {
@@ -1081,7 +1085,7 @@ func (d *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 		}
 		return err
 	}
-	return d.terminatePeerReInviteLocked()
+	return d.terminatePeerReInviteLocked(ctx)
 }
 
 // NewByeRequest returns a BYE to the dialog's remote target, RemoteContact,
@@ -1109,7 +1113,7 @@ func (d *DialogServerSession) Hangup(ctx context.Context) error {
 	if state >= sip.DialogStateEstablished {
 		return d.Bye(ctx)
 	}
-	return d.Respond(sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)
+	return d.Respond(ctx, sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)
 }
 
 // ReInvite sends a re-INVITE offering the media session as it is, and installs
@@ -1372,16 +1376,16 @@ func (d *DialogServerSession) ReferAndObserve(ctx context.Context, referTo sip.U
 	return obs, err
 }
 
-func (d *DialogServerSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
-	if respondNotifyDialogEnded(d, req, tx) {
+func (d *DialogServerSession) handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	if respondNotifyDialogEnded(ctx, d, req, tx) {
 		return
 	}
-	dialogHandleReferNotify(d, req, tx)
+	dialogHandleReferNotify(ctx, d, req, tx)
 }
 
-func (d *DialogServerSession) handleRefer(dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
+func (d *DialogServerSession) handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
 	// A REFER asks to transfer this call, which an ended dialog no longer has.
-	if ended, _ := respondDialogEnded(d, req, tx); ended {
+	if ended, _ := respondDialogEnded(ctx, d, req, tx); ended {
 		return
 	}
 
@@ -1389,14 +1393,14 @@ func (d *DialogServerSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 	onRefDialog := d.onReferDialog
 	d.mu.Unlock()
 	if onRefDialog == nil {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 		return
 	}
 
-	dialogHandleRefer(d, dg, req, tx, onRefDialog)
+	dialogHandleRefer(ctx, d, dg, req, tx, onRefDialog)
 }
 
-func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) (err error) {
+func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) (err error) {
 	// A re-INVITE that arrives after our 2xx but before its ACK is handled once
 	// the answer is complete, as RFC 5407 section 3.1.4 recommends. It cannot be
 	// read ahead of the ACK: ReadRequest below moves the remote CSeq past the
@@ -1405,7 +1409,7 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	// answer does not complete in time, RFC 5407 permits 491, which asks the
 	// peer to retry.
 	if !d.awaitAnswer(tx) {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 
 	d.requestMu.Lock()
@@ -1414,7 +1418,7 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
 	// media. A live one is answered through respondPeerReInvite, or 487 by a
 	// BYE that ends the dialog first.
-	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
+	if answered, err := d.beginPeerReInvite(ctx, &d.Dialog, req, tx); answered {
 		return err
 	}
 	// RFC 4028 section 9: while the session timer runs, the 2xx to the
@@ -1452,11 +1456,11 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 			//    randomly chosen value of between 0 and 10 seconds.
 			res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
 			res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(rand.IntN(10))))
-			_, err := d.respondPeerReInvite(tx, res)
+			_, err := d.respondPeerReInvite(ctx, tx, res)
 			return err
 		}
 
-		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
 		return err
 	}
 
@@ -1465,11 +1469,13 @@ func (d *DialogServerSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	var ok bool
 	endUpdate, ok = d.beginPeerMediaUpdate()
 	if !ok {
-		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
 	}
 
-	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteResponse.Contact()); err != nil {
+	mediaCtx, release := endsWithDialog(ctx, d.Context())
+	defer release()
+	if err := d.handleMediaUpdate(mediaCtx, req, tx, d.InviteResponse.Contact()); err != nil {
 		if errors.Is(err, errMediaUpdateAfterAnswer) {
 			return errors.Join(err, d.hangupNoMedia())
 		}
@@ -1489,14 +1495,14 @@ func (d *DialogServerSession) hangupNoMedia() error {
 	return d.Hangup(ctx)
 }
 
-func (d *DialogServerSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {
-	if ended, err := respondDialogEnded(d, req, tx); ended {
+func (d *DialogServerSession) readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	if ended, err := respondDialogEnded(ctx, d, req, tx); ended {
 		return err
 	}
 	// DTMF relay is not read yet, so an INFO on a live dialog is refused
 	// whatever it carries, without a body and so without a Content-Type (RFC
 	// 3261 section 20.15) too.
-	return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 	// if err := d.ReadRequest(req, tx); err != nil {
 	// 	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
 	// 	return

@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -129,7 +130,7 @@ func (s *DigestAuthServer) AuthorizeRequest(req *sip.Request, auth DigestAuth) (
 	return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil), nil
 }
 
-func (s *DigestAuthServer) AuthorizeDialog(d *DialogServerSession, auth DigestAuth) error {
+func (s *DigestAuthServer) AuthorizeDialog(ctx context.Context, d *DialogServerSession, auth DigestAuth) error {
 	if auth.Realm == "" {
 		auth.Realm = "sipgo"
 	}
@@ -139,7 +140,7 @@ func (s *DigestAuthServer) AuthorizeDialog(d *DialogServerSession, auth DigestAu
 	res, err := s.AuthorizeRequest(req, auth)
 	if err == nil && res.StatusCode != 200 {
 		err = fmt.Errorf("not authorized")
-		return errors.Join(err, d.WriteResponse(res))
+		return errors.Join(err, d.WriteResponse(ctx, res))
 	}
 	return errors.Join(err, nil)
 }

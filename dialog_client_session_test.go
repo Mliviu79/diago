@@ -67,12 +67,12 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 	dg := NewDiago(ua)
 
-	err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		// t.Log("Call received", d.InviteRequest)
 		// Add some routing
 		if d.ToUser() == "alice" {
-			d.Trying()
-			d.Ringing()
+			d.Trying(t.Context())
+			d.Ringing(t.Context())
 			d.Answer()
 
 			dialogEcho(d)
@@ -81,13 +81,13 @@ func TestIntegrationDialogClient(t *testing.T) {
 		}
 
 		if d.ToUser() == "hanguper" {
-			d.Trying()
+			d.Trying(t.Context())
 			d.Answer()
 			d.Hangup(d.Context())
 			return
 		}
 
-		d.Respond(sip.StatusForbidden, "Forbidden", nil)
+		d.Respond(t.Context(), sip.StatusForbidden, "Forbidden", nil)
 
 		<-d.Context().Done()
 	})
@@ -113,7 +113,7 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 		phone := newDialer(ua)
 		// listening but stil with empheral port
-		err := serveBackground(t, phone, t.Context(), func(d *DialogServerSession) {})
+		err := serveBackground(t, phone, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		ports := phone.server.TransportLayer().ListenPorts("udp")
@@ -131,7 +131,7 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 		phone := newDialer(ua)
 		// Start listener in order to reuse UDP listener
-		err := serveBackground(t, phone, t.Context(), func(d *DialogServerSession) {})
+		err := serveBackground(t, phone, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		phone.server.TransportLayer().ListenPorts("udp")
@@ -179,10 +179,10 @@ func TestIntegrationDialogClientCancel(t *testing.T) {
 		},
 	))
 
-	serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+	serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		ctx := d.Context()
-		d.Trying()
-		d.Ringing()
+		d.Trying(t.Context())
+		d.Ringing(t.Context())
 
 		<-ctx.Done()
 	})
@@ -192,7 +192,7 @@ func TestIntegrationDialogClientCancel(t *testing.T) {
 		defer ua.Close()
 
 		dg := newDialer(ua)
-		serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+		serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -228,10 +228,10 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 
 		authServer := NewDigestServer()
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call received")
 
-			err := authServer.AuthorizeDialog(d, DigestAuth{
+			err := authServer.AuthorizeDialog(t.Context(), d, DigestAuth{
 				Username: "test",
 				Password: "test123",
 				Realm:    "",
@@ -242,8 +242,8 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 				return
 			}
 
-			d.Trying()
-			if err := d.ProgressMedia(); err != nil {
+			d.Trying(t.Context())
+			if err := d.ProgressMedia(t.Context()); err != nil {
 				log("Failed to progress media", err)
 				return
 			}
@@ -268,7 +268,7 @@ func TestIntegrationDialogClientEarlyMedia(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.NewDialog(sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, NewDialogOptions{})
@@ -319,9 +319,9 @@ func TestIntegrationDialogClientReinvite(t *testing.T) {
 			},
 		))
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call received")
-			d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
+			d.AnswerOptions(t.Context(), AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
 			<-d.Context().Done()
@@ -333,7 +333,7 @@ func TestIntegrationDialogClientReinvite(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{})
@@ -361,9 +361,9 @@ func TestIntegrationDialogClientReinviteKeepAlive(t *testing.T) {
 			},
 		))
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call received")
-			d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
+			d.AnswerOptions(t.Context(), AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
 			<-d.Context().Done()
@@ -375,7 +375,7 @@ func TestIntegrationDialogClientReinviteKeepAlive(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15066}, InviteOptions{})
@@ -412,16 +412,16 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 		))
 		digServer := NewDigestServer()
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("New INVITE")
-			if err := digServer.AuthorizeDialog(d, DigestAuth{
+			if err := digServer.AuthorizeDialog(t.Context(), d, DigestAuth{
 				Username: "test",
 				Password: "test",
 			}); err != nil {
 				return
 			}
 
-			d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
+			d.AnswerOptions(t.Context(), AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 				// fmt.Println("Server media update", d)
 			}})
 
@@ -461,8 +461,8 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 	defer ua.Close()
 
 	dg := newDialer(ua)
-	// err := dg.ServeBackground(context.TODO(), func(d *DialogServerSession) {})
-	// require.NoError(t, err)
+	// The server's re-INVITE reaches this Diago, which has to serve requests.
+	serveRequests(t, dg)
 	dialog, err := dg.NewDialog(sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15079}, NewDialogOptions{})
 	require.NoError(t, err)
 	err = dialog.Invite(ctx, InviteClientOptions{
@@ -629,7 +629,7 @@ func TestDialogClientReInviteEndedDialog(t *testing.T) {
 		newTestMediaSession(t, &d.DialogMedia)
 
 		tx := newByeServerTx()
-		require.NoError(t, d.handleReInvite(newPeerReInvite(d, 5), tx))
+		require.NoError(t, d.handleReInvite(t.Context(), newPeerReInvite(d, 5), tx))
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
@@ -641,7 +641,7 @@ func TestDialogClientReInviteEndedDialog(t *testing.T) {
 		require.NoError(t, d.DialogMedia.Close())
 
 		tx := newByeServerTx()
-		require.NoError(t, d.handleReInvite(newPeerReInvite(d, 5), tx))
+		require.NoError(t, d.handleReInvite(t.Context(), newPeerReInvite(d, 5), tx))
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
 	})
@@ -674,7 +674,7 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 		)
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call received")
 			if err := d.Answer(); err != nil {
 				log("Error on answer", err)
@@ -700,7 +700,7 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	})
 
 	dg := newDialer(ua)
-	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	// Media negotiaton should fail and call should be terminated
@@ -753,9 +753,9 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		))
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call received")
-			d.AnswerOptions(AnswerOptions{
+			d.AnswerOptions(t.Context(), AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
 						return err
@@ -786,15 +786,15 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		))
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call INVITE due to REFER received")
 			// waitReferDialog <- d
 			switch d.ToUser() {
 			case "busy":
-				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
 				return
 			case "noanswer":
-				d.Ringing()
+				d.Ringing(t.Context())
 				return
 			default:
 				d.Answer()
@@ -825,7 +825,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(d.Context())
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
@@ -843,7 +844,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(d.Context())
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "noanswer", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
@@ -861,7 +863,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(d.Context())
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "busy", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
@@ -1000,7 +1003,7 @@ func TestDialogReInviteWaitsForPeerMediaUpdate(t *testing.T) {
 
 	handled := make(chan error, 1)
 	go func() {
-		handled <- d.handleReInvite(peerReInvite, newAckedServerTx(&loggedPeerTx{byeServerTx: newByeServerTx(), h: h}, func() {
+		handled <- d.handleReInvite(t.Context(), peerReInvite, newAckedServerTx(&loggedPeerTx{byeServerTx: newByeServerTx(), h: h}, func() {
 			_ = d.handleReInviteACK(newReInviteAck(peerReInvite, nil), newByeServerTx())
 		}))
 	}()
@@ -1054,7 +1057,7 @@ func TestDialogReInviteGlare(t *testing.T) {
 	peerReInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	peerReInvite.SetBody(peerSDP())
 	tx := newByeServerTx()
-	require.NoError(t, d.handleReInvite(peerReInvite, tx))
+	require.NoError(t, d.handleReInvite(t.Context(), peerReInvite, tx))
 	h.release <- struct{}{}
 	select {
 	case err := <-held:
@@ -1073,7 +1076,7 @@ type loggedPeerTx struct {
 	h *heldReInvites
 }
 
-func (tx *loggedPeerTx) Respond(res *sip.Response) error {
+func (tx *loggedPeerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.h.record(fmt.Sprintf("peer's re-INVITE %d", res.StatusCode))
 	return nil
 }
@@ -1089,7 +1092,7 @@ func TestDialogClientOutOfOrderBye(t *testing.T) {
 	require.NoError(t, d.ReadRequest(newPeerInDialogRequest(sip.INVITE, 5), newByeServerTx()))
 
 	tx := newByeServerTx()
-	err := d.ReadBye(newPeerInDialogRequest(sip.BYE, 4), tx)
+	err := d.ReadBye(t.Context(), newPeerInDialogRequest(sip.BYE, 4), tx)
 	require.Len(t, tx.responses, 1, "the BYE must be answered once")
 	if tx.responses[0].StatusCode == sip.StatusOK {
 		require.NoError(t, err)
@@ -1168,7 +1171,7 @@ func TestDialogClientInviteCancelContextCut(t *testing.T) {
 	ua, _ := sipgo.NewUA()
 	t.Cleanup(func() { _ = ua.Close() })
 	dg := newDialer(ua)
-	require.NoError(t, serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {}))
+	require.NoError(t, serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {}))
 
 	d, err := dg.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: peer.LocalAddr().(*net.UDPAddr).Port}, NewDialogOptions{})
 	require.NoError(t, err)

@@ -858,7 +858,7 @@ func TestReferObservationCarriesNoRoutingInternals(t *testing.T) {
 			t.Errorf("building a REFER NOTIFY transaction: %v", err)
 			return
 		}
-		dialogHandleReferNotify(d, req, tx)
+		dialogHandleReferNotify(t.Context(), d, req, tx)
 	}
 	banned := []string{"10.9.8.7", "sip:", "@", "Via", "Contact", "secret"}
 	requireClean := func(t *testing.T, what, rendered string) {
@@ -1102,8 +1102,8 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-			d.AnswerOptions(AnswerOptions{
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			d.AnswerOptions(t.Context(), AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
 						return err
@@ -1132,10 +1132,10 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			switch d.ToUser() {
 			case "busy":
-				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
 				return
 			default:
 				d.Answer()
@@ -1163,8 +1163,8 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-			d.AnswerOptions(AnswerOptions{
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			d.AnswerOptions(t.Context(), AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					<-stuckRefer
 					return nil
@@ -1399,9 +1399,9 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 				BindPort:  15090,
 			},
 		))
-		require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			if d.ToUser() == "busy" {
-				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
 				return
 			}
 			d.Answer()
@@ -1423,8 +1423,8 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 					ID:        "udp",
 				},
 			))
-			require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-				d.AnswerOptions(AnswerOptions{OnRefer: transferee.onRefer})
+			require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+				d.AnswerOptions(t.Context(), AnswerOptions{OnRefer: transferee.onRefer})
 				<-d.Context().Done()
 			}))
 		}
@@ -1487,7 +1487,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 			},
 		))
 		received := make(chan *DialogServerSession)
-		require.NoError(t, serveBackground(t, referrer, ctx, func(d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, referrer, ctx, func(_ context.Context, d *DialogServerSession) {
 			select {
 			case received <- d:
 			case <-ctx.Done():

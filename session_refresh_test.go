@@ -131,7 +131,10 @@ func newRefreshPeer(t *testing.T, setup func(d *DialogServerSession)) *refreshPe
 		WithSessionTimers(policy),
 		WithLogger(slog.New(p.log)),
 	)
-	require.NoError(t, serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {
+	// The run outlives the test's own ctx, which ends before the cleanups run:
+	// the cleanup below has the peer answer the BYE that ends the call, while
+	// the request run waits for the handler that sends it.
+	require.NoError(t, serveBackground(t, dg, context.WithoutCancel(t.Context()), func(_ context.Context, d *DialogServerSession) {
 		defer close(p.handlerDone)
 		if setup != nil {
 			setup(d)

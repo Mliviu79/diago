@@ -28,7 +28,7 @@ func newRespondedServerTx() *respondedServerTx {
 	return &respondedServerTx{byeServerTx: newByeServerTx(), responded: make(chan *sip.Response, 1)}
 }
 
-func (tx *respondedServerTx) Respond(res *sip.Response) error {
+func (tx *respondedServerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.responded <- res
 	return nil
 }
@@ -48,8 +48,8 @@ func newAckedServerTx(tx sip.ServerTransaction, ack func()) *ackedServerTx {
 	return &ackedServerTx{ServerTransaction: tx, ack: ack, acked: make(chan struct{})}
 }
 
-func (tx *ackedServerTx) Respond(res *sip.Response) error {
-	err := tx.ServerTransaction.Respond(res)
+func (tx *ackedServerTx) Respond(ctx context.Context, res *sip.Response) error {
+	err := tx.ServerTransaction.Respond(ctx, res)
 	if res.IsSuccess() {
 		tx.once.Do(func() {
 			go func() {
@@ -81,7 +81,7 @@ type sentServerTx struct {
 	sent chan struct{}
 }
 
-func (tx *sentServerTx) Respond(res *sip.Response) error {
+func (tx *sentServerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.once.Do(func() { close(tx.sent) })
 	return nil
 }
@@ -117,7 +117,7 @@ func sendOK(t *testing.T, d *DialogServerSession, inviteTx *sentServerTx) <-chan
 
 	answered := make(chan error, 1)
 	go func() {
-		answered <- d.RespondSDP(nil)
+		answered <- d.RespondSDP(t.Context(), nil)
 	}()
 	select {
 	case <-inviteTx.sent:
@@ -181,7 +181,7 @@ func handleEarly(t *testing.T, handle func(tx sip.ServerTransaction) error, rele
 var inDialogRequests = []struct {
 	name       string
 	newRequest func(t *testing.T, d *DialogServerSession) *sip.Request
-	handle     func(d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error
+	handle     func(ctx context.Context, d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error
 	wantState  sip.DialogState
 }{
 	{
@@ -189,7 +189,9 @@ var inDialogRequests = []struct {
 		newRequest: func(t *testing.T, d *DialogServerSession) *sip.Request {
 			return newBye(t, d, d.InviteRequest.CSeq().SeqNo+1)
 		},
-		handle:    (*DialogServerSession).ReadBye,
+		handle: func(ctx context.Context, d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error {
+			return d.ReadBye(ctx, req, tx)
+		},
 		wantState: sip.DialogStateEnded,
 	},
 	{
@@ -197,8 +199,8 @@ var inDialogRequests = []struct {
 		newRequest: func(t *testing.T, d *DialogServerSession) *sip.Request {
 			return newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
 		},
-		handle: func(d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error {
-			return d.handleReInvite(req, newAckedServerTx(tx, func() {
+		handle: func(ctx context.Context, d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error {
+			return d.handleReInvite(ctx, req, newAckedServerTx(tx, func() {
 				_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
 			}))
 		},
@@ -221,7 +223,7 @@ func TestDialogServerRequestBeforeAck(t *testing.T) {
 
 			req := tc.newRequest(t, d)
 			res := handleEarly(t, func(tx sip.ServerTransaction) error {
-				return tc.handle(d, req, tx)
+				return tc.handle(t.Context(), d, req, tx)
 			}, func() {
 				readAck(t, d)
 			})
@@ -266,7 +268,7 @@ func TestDialogServerRequestBeforeAnswerMedia(t *testing.T) {
 
 			req := tc.newRequest(t, d)
 			res := handleEarly(t, func(tx sip.ServerTransaction) error {
-				return tc.handle(d, req, tx)
+				return tc.handle(t.Context(), d, req, tx)
 			}, func() {
 				close(answering)
 			})
@@ -297,10 +299,10 @@ func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 	}{
 		{name: "early media Answer", answer: (*DialogServerSession).Answer},
 		{name: "early media AnswerOptions", answer: func(d *DialogServerSession) error {
-			return d.AnswerOptions(AnswerOptions{})
+			return d.AnswerOptions(t.Context(), AnswerOptions{})
 		}},
 		{name: "RespondSDP", answer: func(d *DialogServerSession) error {
-			return d.RespondSDP(d.mediaSession.LocalSDP())
+			return d.RespondSDP(t.Context(), d.mediaSession.LocalSDP())
 		}},
 	}
 	for _, tc := range answers {
@@ -339,7 +341,7 @@ func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 
 			bye := newBye(t, d, d.InviteRequest.CSeq().SeqNo+1)
 			res := handleEarly(t, func(tx sip.ServerTransaction) error {
-				return d.ReadBye(bye, tx)
+				return d.ReadBye(t.Context(), bye, tx)
 			}, func() {
 				readAck(t, d)
 			})
@@ -370,7 +372,7 @@ func newInviteServerTx() *inviteServerTx {
 	return &inviteServerTx{byeServerTx: newByeServerTx(), sent: make(chan struct{})}
 }
 
-func (tx *inviteServerTx) Respond(res *sip.Response) error {
+func (tx *inviteServerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.mu.Lock()
 	tx.statuses = append(tx.statuses, res.StatusCode)
 	tx.mu.Unlock()
@@ -421,7 +423,7 @@ func TestDialogServerHangupAnswered(t *testing.T) {
 		res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
 		res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
 		accepted := make(chan error, 1)
-		go func() { accepted <- d.DialogServerSession.WriteResponse(res) }()
+		go func() { accepted <- d.DialogServerSession.WriteResponse(t.Context(), res) }()
 		select {
 		case <-inviteTx.sent:
 		case <-time.After(5 * time.Second):

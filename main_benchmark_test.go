@@ -69,7 +69,7 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 	defer ua.Close()
 	srv := NewDiago(ua, WithTransport(tran))
 
-	err := srv.ServeBackground(ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, srv, ctx, func(_ context.Context, d *DialogServerSession) {
 		handlersMu.Lock()
 		if handlersClosed {
 			handlersMu.Unlock()

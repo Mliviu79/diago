@@ -13,6 +13,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
@@ -51,17 +52,17 @@ func start(ctx context.Context, recipientUri string) error {
 		return err
 	}
 
-	return d.Serve(ctx, func(inDialog *diago.DialogServerSession) {
-		BridgeCall(d, inDialog, recipient)
+	return serving.Run(ctx, d, func(ctx context.Context, inDialog *diago.DialogServerSession) {
+		BridgeCall(ctx, d, inDialog, recipient)
 	})
 }
 
-func BridgeCall(d *diago.Diago, inDialog *diago.DialogServerSession, recipient sip.Uri) error {
-	inDialog.Trying()  // Progress -> 100 Trying
-	inDialog.Ringing() // Ringing -> 180 Response
+func BridgeCall(ctx context.Context, d *diago.Diago, inDialog *diago.DialogServerSession, recipient sip.Uri) error {
+	inDialog.Trying(ctx)  // Progress -> 100 Trying
+	inDialog.Ringing(ctx) // Ringing -> 180 Response
 
 	inCtx := inDialog.Context()
-	ctx, cancel := context.WithTimeout(inCtx, 5*time.Second)
+	inviteCtx, cancel := context.WithTimeout(inCtx, 5*time.Second)
 	defer cancel()
 
 	bridge := diago.NewBridge()
@@ -73,7 +74,7 @@ func BridgeCall(d *diago.Diago, inDialog *diago.DialogServerSession, recipient s
 		return err
 	}
 
-	outDialog, err := d.InviteBridge(ctx, recipient, &bridge, diago.InviteOptions{})
+	outDialog, err := d.InviteBridge(inviteCtx, recipient, &bridge, diago.InviteOptions{})
 	if err != nil {
 		return err
 	}

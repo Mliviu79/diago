@@ -110,7 +110,9 @@ func newReferDiago(t *testing.T, f ServeDialogFunc) (*Diago, *net.UDPAddr) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ua.Close() })
 	dg := NewDiago(ua, WithTransport(Transport{Transport: "udp", BindHost: "127.0.0.1", BindPort: 0}))
-	require.NoError(t, serveBackground(t, dg, t.Context(), f))
+	// The run outlives the test's own ctx, which ends before the cleanups run:
+	// a handler may end its call in a cleanup, with the peer answering.
+	require.NoError(t, serveBackground(t, dg, context.WithoutCancel(t.Context()), f))
 	tran, _ := dg.getTransport("udp")
 	return dg, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: tran.BindPort}
 }
@@ -124,15 +126,20 @@ func newReferPeerCallingUs(t *testing.T) *referPeer {
 	dialogs := make(chan *DialogServerSession, 1)
 	hold := make(chan struct{})
 	handlerDone := make(chan struct{})
-	_, p.dgAddr = newReferDiago(t, func(d *DialogServerSession) {
+	_, p.dgAddr = newReferDiago(t, func(ctx context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		if err := d.Answer(); err != nil {
 			return
 		}
 		dialogs <- d
 		<-hold
+		// The request run waits for this handler, so the call is ended here
+		// and not after the handler returns, while the peer still answers.
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_ = d.Hangup(ctx)
 	})
-	// The handler returns with the test; Diago hangs up a call still up, and
+	// The handler returns with the test, after it has hung up the call, and
 	// the peer answers that BYE until the handler has returned.
 	t.Cleanup(func() {
 		close(hold)

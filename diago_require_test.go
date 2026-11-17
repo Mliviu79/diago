@@ -65,7 +65,7 @@ func newRequireHarness(t *testing.T, timers SessionTimerPolicy) *requireHarness 
 	t.Cleanup(func() { _ = ua.Close() })
 	dg := NewDiago(ua, WithLogger(slog.New(h.log)), WithSessionTimers(timers))
 	dg.cache.server = h.cache
-	dg.HandleFunc(func(*DialogServerSession) {
+	dg.HandleFunc(func(context.Context, *DialogServerSession) {
 		h.mu.Lock()
 		h.serves++
 		h.mu.Unlock()
@@ -79,6 +79,7 @@ func newRequireHarness(t *testing.T, timers SessionTimerPolicy) *requireHarness 
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 	go func() { _ = dg.server.ServeUDP(server) }()
+	serveRequests(t, dg)
 	h.serverAddr = server.LocalAddr()
 	h.serverPort = server.LocalAddr().(*net.UDPAddr).Port
 

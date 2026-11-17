@@ -61,7 +61,7 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 
 	log := asyncLog(t)
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
@@ -98,12 +98,12 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 
 	d := <-waitDialog
 
-	err = d.ProgressMedia()
+	err = d.ProgressMedia(t.Context())
 	require.NoError(t, err)
 
 	// It is valid to also send 180
 	time.Sleep(500 * time.Millisecond)
-	require.NoError(t, d.Ringing())
+	require.NoError(t, d.Ringing(t.Context()))
 
 	// We can play some file ringtone
 	playback, err := d.PlaybackCreate()
@@ -171,7 +171,7 @@ func TestDialogServerProgressMediaDTLS(t *testing.T) {
 		d, peer, inviteTx := newProgressMediaDTLSDialog(t)
 
 		progressed := make(chan error, 1)
-		go func() { progressed <- d.ProgressMedia() }()
+		go func() { progressed <- d.ProgressMedia(t.Context()) }()
 
 		var res *sip.Response
 		select {
@@ -221,7 +221,7 @@ func TestDialogServerProgressMediaDTLS(t *testing.T) {
 		d, _, inviteTx := newProgressMediaDTLSDialog(t)
 
 		progressed := make(chan error, 1)
-		go func() { progressed <- d.ProgressMedia() }()
+		go func() { progressed <- d.ProgressMedia(t.Context()) }()
 
 		select {
 		case <-inviteTx.responded:
@@ -297,7 +297,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	))
 
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
@@ -345,10 +345,10 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 	// The handler runs on a server goroutine, so its errors are handed to the
 	// test rather than asserted there.
 	answered := make(chan error, 1)
-	err := serveBackground(t, uas, ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, uas, ctx, func(_ context.Context, d *DialogServerSession) {
 		// This is the reported role: the peer sends the initial INVITE and
 		// Diago answers it as the UAS. RTP NAT must not change the SIP flow.
-		err := d.AnswerOptions(AnswerOptions{
+		err := d.AnswerOptions(t.Context(), AnswerOptions{
 			RTPNAT:        media.RTPNATSymetric,
 			OnMediaUpdate: func(*DialogMedia) {},
 		})
@@ -372,7 +372,7 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 	peerUA, _ := sipgo.NewUA(sipgo.WithUserAgent("peer"))
 	defer peerUA.Close()
 	peer := newDialer(peerUA)
-	err = serveBackground(t, peer, ctx, func(*DialogServerSession) {})
+	err = serveBackground(t, peer, ctx, func(context.Context, *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, err := peer.Invite(ctx, sip.Uri{User: "service", Host: "127.0.0.1", Port: 15080}, InviteOptions{})
@@ -505,15 +505,15 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 		))
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			log("Call INVITE due to REFER received")
 			// waitReferDialog <- d
 			switch d.ToUser() {
 			case "busy":
-				d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
 				return
 			case "noanswer":
-				d.Ringing()
+				d.Ringing(t.Context())
 				return
 			default:
 				d.Answer()
@@ -537,7 +537,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 
 	log := asyncLog(t)
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
@@ -674,11 +674,11 @@ func newReInviteTestDialog(t *testing.T) *DialogServerSession {
 func TestDialogServerReInviteEndedDialog(t *testing.T) {
 	t.Run("ended", func(t *testing.T) {
 		d := newReInviteTestDialog(t)
-		require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+		require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
 		require.Equal(t, sip.DialogStateEnded, d.LoadState())
 
 		tx := newByeServerTx()
-		require.NoError(t, d.handleReInvite(newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+2), tx))
+		require.NoError(t, d.handleReInvite(t.Context(), newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+2), tx))
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
@@ -689,7 +689,7 @@ func TestDialogServerReInviteEndedDialog(t *testing.T) {
 		require.NoError(t, d.DialogMedia.Close())
 
 		tx := newByeServerTx()
-		require.NoError(t, d.handleReInvite(newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), tx))
+		require.NoError(t, d.handleReInvite(t.Context(), newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), tx))
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
 	})
@@ -711,7 +711,7 @@ func TestDialogServerAnswerRepeatsEarlyAnswer(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = d.DialogMedia.Close() })
 
-	require.NoError(t, d.ProgressMedia())
+	require.NoError(t, d.ProgressMedia(t.Context()))
 	var early *sip.Response
 	select {
 	case early = <-inviteTx.responded:
@@ -753,7 +753,7 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 	}{
 		{
 			name: "ProgressMedia",
-			run:  func(d *DialogServerSession) error { return d.ProgressMedia() },
+			run:  func(d *DialogServerSession) error { return d.ProgressMedia(t.Context()) },
 		},
 		{
 			name:     "Answer",
@@ -762,7 +762,7 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 		},
 		{
 			name:     "AnswerOptions",
-			run:      func(d *DialogServerSession) error { return d.AnswerOptions(AnswerOptions{}) },
+			run:      func(d *DialogServerSession) error { return d.AnswerOptions(t.Context(), AnswerOptions{}) },
 			complete: func(t *testing.T, d *DialogServerSession, _ *sip.Response) { confirm(t, d) },
 		},
 		{
@@ -832,7 +832,7 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 			require.True(t, live, "the allocation was made on an ended ctx")
 			require.NoError(t, allocCtx.Err(), "the dialog's ctx was ended while the dialog was live")
 
-			require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+			require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
 			select {
 			case <-allocCtx.Done():
 			case <-time.After(5 * time.Second):

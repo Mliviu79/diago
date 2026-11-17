@@ -101,7 +101,7 @@ func TestServeWithReadyCallsReadyOnceAllListenersUp(t *testing.T) {
 	var serveErr error
 	go func() {
 		defer close(served)
-		serveErr = dg.ServeWithReady(ctx, nil, ready)
+		serveErr = dg.ServeWithReady(ctx, ready)
 	}()
 
 	var obs readyObservation
@@ -156,7 +156,7 @@ func TestServeWithReadyReturnsListenErrorWithoutReady(t *testing.T) {
 	var readyCalls atomic.Int64
 	served := make(chan error, 1)
 	go func() {
-		served <- dg.ServeWithReady(ctx, nil, func() { readyCalls.Add(1) })
+		served <- dg.ServeWithReady(ctx, func() { readyCalls.Add(1) })
 	}()
 
 	select {
@@ -248,7 +248,7 @@ func TestServeEphemeralPortWhileRequestsReadTransports(t *testing.T) {
 	ready := make(chan struct{})
 	served := make(chan error, 1)
 	go func() {
-		served <- dg.ServeWithReady(ctx, nil, func() { close(ready) })
+		served <- dg.ServeWithReady(ctx, func() { close(ready) })
 	}()
 	select {
 	case <-ready:

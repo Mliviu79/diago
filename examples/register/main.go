@@ -13,6 +13,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
@@ -78,7 +79,7 @@ func start(ctx context.Context, recipientURI string, regOpts diago.RegisterOptio
 
 	// Start listening incoming calls
 	go func() {
-		tu.Serve(ctx, func(inDialog *diago.DialogServerSession) {
+		serving.Run(ctx, tu, func(ctx context.Context, inDialog *diago.DialogServerSession) {
 			slog.Info("New dialog request", "id", inDialog.ID)
 			defer slog.Info("Dialog finished", "id", inDialog.ID)
 		})

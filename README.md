@@ -78,9 +78,9 @@ Checkout more on [Getting started](https://emiago.github.io/diago/docs/getting_s
 ua, _ := sipgo.NewUA()
 dg := diago.NewDiago(ua)
 
-dg.Serve(ctx, func(inDialog *diago.DialogServerSession) {
-	inDialog.Trying() // 100 Trying
-	inDialog.Answer(); // Answer - 200 OK SDP
+dg.HandleFunc(func(ctx context.Context, inDialog *diago.DialogServerSession) {
+	inDialog.Trying(ctx) // 100 Trying
+	inDialog.AnswerContext(ctx) // Answer - 200 OK SDP
 
 	// Make sure file below exists in work dir
 	playfile, err := os.Open("demo-echotest.wav")
@@ -95,7 +95,12 @@ dg.Serve(ctx, func(inDialog *diago.DialogServerSession) {
 	if err := pb.Play(playfile, "audio/wav"); err != nil {
 		fmt.Println("Playing failed", err)
 	}
-}
+})
+
+// Serve opens the listeners, ServeRequests hands the requests they read to the
+// handler above, on ctx. Run both until ctx ends.
+go dg.Serve(ctx)
+dg.ServeRequests(ctx, nil)
 ```
 
 See more [examples in this repo](/examples)

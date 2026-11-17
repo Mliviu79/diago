@@ -900,16 +900,16 @@ func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.U
 	return obs, err
 }
 
-func (d *DialogClientSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
-	if respondNotifyDialogEnded(d, req, tx) {
+func (d *DialogClientSession) handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	if respondNotifyDialogEnded(ctx, d, req, tx) {
 		return
 	}
-	dialogHandleReferNotify(d, req, tx)
+	dialogHandleReferNotify(ctx, d, req, tx)
 }
 
-func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
+func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
 	// A REFER asks to transfer this call, which an ended dialog no longer has.
-	if ended, _ := respondDialogEnded(d, req, tx); ended {
+	if ended, _ := respondDialogEnded(ctx, d, req, tx); ended {
 		return
 	}
 
@@ -917,11 +917,11 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 	onRefDialog := d.onReferDialog
 	d.mu.Unlock()
 	if onRefDialog == nil {
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 		return
 	}
 
-	dialogHandleRefer(d, dg, req, tx, onRefDialog)
+	dialogHandleRefer(ctx, d, dg, req, tx, onRefDialog)
 }
 
 // ReadBye reads the peer's BYE as the embedded session does. It does not wait
@@ -934,11 +934,11 @@ func (d *DialogClientSession) handleRefer(dg *Diago, req *sip.Request, tx sip.Se
 // The BYE is stashed for TerminatingBye before the embedded session ends the
 // dialog, and rolled back when it was refused or did not end the dialog, as
 // DialogServerSession.ReadBye does.
-func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogClientSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
 	d.terminatingBye.Store(req)
-	if err := readByeOnce(req, tx, d.DialogClientSession.ReadBye); err != nil {
+	if err := readByeOnce(ctx, req, tx, d.DialogClientSession.ReadBye); err != nil {
 		// Not this dialog's ending: leave no cause planted on it. A BYE
 		// taken whose 200 could not be sent may still have ended it.
 		if errors.Is(err, sipgo.ErrDialogInvalidCseq) || d.LoadState() != sip.DialogStateEnded {
@@ -946,7 +946,7 @@ func (d *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 		}
 		return err
 	}
-	return d.terminatePeerReInviteLocked()
+	return d.terminatePeerReInviteLocked(ctx)
 }
 
 // awaitAck waits until Ack has returned before a re-INVITE of the peer's is
@@ -978,9 +978,9 @@ func (d *DialogClientSession) awaitAck(tx sip.ServerTransaction) bool {
 	}
 }
 
-func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTransaction) (err error) {
+func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) (err error) {
 	if !d.awaitAck(tx) {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 
 	d.requestMu.Lock()
@@ -989,7 +989,7 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	// A re-INVITE for an ended dialog is answered 481 without reaching the
 	// media. A live one is answered through respondPeerReInvite, or 487 by a
 	// BYE that ends the dialog first.
-	if answered, err := d.beginPeerReInvite(&d.Dialog, req, tx); answered {
+	if answered, err := d.beginPeerReInvite(ctx, &d.Dialog, req, tx); answered {
 		return err
 	}
 	// Once a 2xx has been sent, its ACK is waited for, and only then is the
@@ -1006,7 +1006,7 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	}()
 
 	if err := d.ReadRequest(req, tx); err != nil {
-		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
 		return err
 	}
 
@@ -1015,11 +1015,13 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	var ok bool
 	endUpdate, ok = d.beginPeerMediaUpdate()
 	if !ok {
-		_, err := d.respondPeerReInvite(tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
 	}
 
-	if err := d.handleMediaUpdate(d.Context(), req, tx, d.InviteRequest.Contact()); err != nil {
+	mediaCtx, release := endsWithDialog(ctx, d.Context())
+	defer release()
+	if err := d.handleMediaUpdate(mediaCtx, req, tx, d.InviteRequest.Contact()); err != nil {
 		if errors.Is(err, errMediaUpdateAfterAnswer) {
 			return errors.Join(err, d.hangupNoMedia())
 		}
@@ -1066,14 +1068,14 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 	return nil
 }
 
-func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {
-	if ended, err := respondDialogEnded(d, req, tx); ended {
+func (d *DialogClientSession) readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	if ended, err := respondDialogEnded(ctx, d, req, tx); ended {
 		return err
 	}
 	// DTMF relay is not read yet, so an INFO on a live dialog is refused
 	// whatever it carries, without a body and so without a Content-Type (RFC
 	// 3261 section 20.15) too.
-	return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 }
 
 func (d *DialogClientSession) Hold(ctx context.Context) error {

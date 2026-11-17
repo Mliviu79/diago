@@ -51,7 +51,7 @@ func main() {
 			},
 		))
 
-	// err = dg.ServeBackground(ctx, func(d *DialogServerSession) {})
+	// err = dg.ServeBackground(ctx)
 	// require.NoError(t, err)
 
 	d, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, diago.InviteOptions{Transport: "tcp"})

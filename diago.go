@@ -22,7 +22,10 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-type ServeDialogFunc func(d *DialogServerSession)
+// ServeDialogFunc serves one inbound dialog. ctx is the ctx of the run
+// ServeRequests started: it ends when the run's ctx does, and is the ctx to
+// answer the dialog's requests on.
+type ServeDialogFunc func(ctx context.Context, d *DialogServerSession)
 
 type Diago struct {
 	ua         *sipgo.UserAgent
@@ -303,7 +306,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	dg := &Diago{
 		ua:  ua,
 		log: sip.DefaultLogger(),
-		serveHandler: func(d *DialogServerSession) {
+		serveHandler: func(ctx context.Context, d *DialogServerSession) {
 			fmt.Println("Serve Handler not implemented")
 		},
 		transports: []Transport{},
@@ -335,9 +338,9 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	}
 	server := dg.server
 
-	errHandler := func(f func(req *sip.Request, tx sip.ServerTransaction) error) sipgo.RequestHandler {
-		handler := func(req *sip.Request, tx sip.ServerTransaction) {
-			if err := f(req, tx); err != nil {
+	errHandler := func(f func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error) sipgo.RequestHandler {
+		handler := func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+			if err := f(ctx, req, tx); err != nil {
 				// The request may have failed because From or To is absent
 				var from, to string
 				if h := req.From(); h != nil {
@@ -354,33 +357,33 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 		// Return handler wrapped with middleware if user supprots
 		if dg.serverMiddleware != nil {
-			return func(req *sip.Request, tx sip.ServerTransaction) {
-				dg.serverMiddleware(handler)(req, tx)
+			return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+				dg.serverMiddleware(handler)(ctx, req, tx)
 			}
 		}
 		return handler
 	}
 
-	handleNoDialog := func(req *sip.Request, tx sip.ServerTransaction, err error) error {
+	handleNoDialog := func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, err error) error {
 		var response *sip.Response
 		if errors.Is(err, sipgo.ErrDialogDoesNotExists) {
 			response = sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
 		} else {
 			response = sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil)
 		}
-		return errors.Join(err, tx.Respond(response))
+		return errors.Join(err, tx.Respond(ctx, response))
 	}
 
-	server.OnInvite(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	server.OnInvite(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// What if multiple server transports?
 		id, err := sip.DialogIDFromRequestUAS(req)
 		if err == nil {
-			return dg.handleReInvite(req, tx, id)
+			return dg.handleReInvite(ctx, req, tx, id)
 		}
 
 		if reason := describeMissingInviteHeader(req); reason != "" {
 			res := sip.NewResponseFromRequest(req, sip.StatusBadRequest, reason, nil)
-			return errors.Join(fmt.Errorf("%w: %s", errInviteMissingHeader, reason), tx.Respond(res))
+			return errors.Join(fmt.Errorf("%w: %s", errInviteMissingHeader, reason), tx.Respond(ctx, res))
 		}
 
 		if tags := unsupportedRequiredExtensions(req, dg.sessionTimers); len(tags) > 0 {
@@ -389,7 +392,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			unsupported := strings.Join(tags, ", ")
 			res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
 			res.AppendHeader(sip.NewHeader("Unsupported", unsupported))
-			return errors.Join(fmt.Errorf("%w: %s", errInviteRequiresUnsupportedExtension, unsupported), tx.Respond(res))
+			return errors.Join(fmt.Errorf("%w: %s", errInviteRequiresUnsupportedExtension, unsupported), tx.Respond(ctx, res))
 		}
 
 		tran, _ := dg.getTransport(req.Transport())
@@ -422,22 +425,21 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return fmt.Errorf("failed to store server dialog: %w", err)
 		}
 		defer func() {
-			// TODO: have better context
-			if err := dg.cache.server.DialogDelete(context.Background(), dWrap.ID); err != nil {
+			if err := dg.cache.server.DialogDelete(ctx, dWrap.ID); err != nil {
 				dg.log.Error("Failed to delete server dialog", "error", err)
 			}
 		}()
 
-		dg.serveHandler(dWrap)
+		dg.serveHandler(ctx, dWrap)
 
 		// Check is dialog closed
 		dialogCtx := dialog.Context()
 		// Always try hanguping call
-		ctx, cancel := context.WithTimeout(dialogCtx, 10*time.Second)
+		hangupCtx, cancel := context.WithTimeout(dialogCtx, 10*time.Second)
 		defer cancel()
 
-		if err := dWrap.Hangup(ctx); err != nil {
-			if errors.Is(ctx.Err(), context.Canceled) {
+		if err := dWrap.Hangup(hangupCtx); err != nil {
+			if errors.Is(hangupCtx.Err(), context.Canceled) {
 				// Already hangup
 				return nil
 			}
@@ -447,13 +449,13 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		return nil
 	}))
 
-	server.OnCancel(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	server.OnCancel(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// INVITE transaction should be terminated by transaction layer and 200 response will be sent
 		// In case of stateless proxy this we would need to forward
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
 	}))
 
-	server.OnAck(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	server.OnAck(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// d, err := dg.cache.MatchDialogServer(req)
 		// if err != nil {
 		// 	// Normally ACK will be received if some out of dialog request is received or we responded negatively
@@ -461,11 +463,11 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		// 	return err
 		// }
 
-		sd, cd, err := dg.cache.MatchDialog(req)
+		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
 			// We should not do responses for ACK
 			return err
-			// return handleNoDialog(req, tx, err)
+			// return handleNoDialog(ctx, req, tx, err)
 		}
 
 		if cd != nil {
@@ -476,10 +478,10 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		return sd.ReadAck(req, tx)
 	}))
 
-	server.OnBye(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
-		sd, cd, err := dg.cache.MatchDialog(req)
+	server.OnBye(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
-			return handleNoDialog(req, tx, err)
+			return handleNoDialog(ctx, req, tx, err)
 		}
 
 		// Respond to BYE
@@ -487,34 +489,34 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		// As user may stuck in playing or reading media, this unblocks that goroutine
 		// A BYE refused as out of order leaves the call, and its media, going.
 		if cd != nil {
-			err = cd.ReadBye(req, tx)
+			err = cd.ReadBye(ctx, req, tx)
 			if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
 				closeAndLog(&cd.DialogMedia, "failed to close client media")
 			}
 			return err
 		}
 
-		err = sd.ReadBye(req, tx)
+		err = sd.ReadBye(ctx, req, tx)
 		if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
 			closeAndLog(&sd.DialogMedia, "failed to close server media")
 		}
 		return err
 	}))
 
-	server.OnInfo(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	server.OnInfo(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// Handle DTMF out of band
 		// The dialog is matched first: an INFO for no live dialog is answered
 		// 481 (RFC 3261 section 12.2.2), whatever it carries.
-		sd, cd, err := dg.cache.MatchDialog(req)
+		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
-			return handleNoDialog(req, tx, err)
+			return handleNoDialog(ctx, req, tx, err)
 		}
 
 		if cd != nil {
-			return cd.readSIPInfoDTMF(req, tx)
+			return cd.readSIPInfoDTMF(ctx, req, tx)
 
 		}
-		return sd.readSIPInfoDTMF(req, tx)
+		return sd.readSIPInfoDTMF(ctx, req, tx)
 
 		// 		INFO sips:sipgo@127.0.0.1:5443 SIP/2.0
 		// Via: SIP/2.0/WSS df7jal23ls0d.invalid;branch=z9hG4bKhzJuRuWp4pLmTAbrIg7MUGofWdV1u577;rport
@@ -535,42 +537,42 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 	// TODO deal with OPTIONS more correctly
 	// For now leave it for keep alive
-	dg.server.OnOptions(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	dg.server.OnOptions(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		methods := dg.server.RegisteredMethods()
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
 		res.AppendHeader(sip.NewHeader("Allow", strings.Join(methods, ", ")))
 		res.AppendHeader(sip.NewHeader("Accept", "application/sdp"))
 		// res.AppendHeader(sip.NewHeader("Supported", "replaces, 100rel"))
-		return tx.Respond(res)
+		return tx.Respond(ctx, res)
 	}))
 
-	dg.server.OnRefer(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
-		sd, cd, err := dg.cache.MatchDialog(req)
+	dg.server.OnRefer(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
-			return handleNoDialog(req, tx, err)
+			return handleNoDialog(ctx, req, tx, err)
 		}
 		if cd != nil {
-			cd.handleRefer(dg, req, tx)
+			cd.handleRefer(ctx, dg, req, tx)
 			return nil
 
 		}
 		// TODO server
-		sd.handleRefer(dg, req, tx)
+		sd.handleRefer(ctx, dg, req, tx)
 		return nil
 	}))
 
-	dg.server.OnNotify(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+	dg.server.OnNotify(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// THIS should match now subscribtion instead dialog
-		sd, cd, err := dg.cache.MatchDialog(req)
+		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
-			return handleNoDialog(req, tx, err)
+			return handleNoDialog(ctx, req, tx, err)
 		}
 
 		if cd != nil {
-			cd.handleReferNotify(req, tx)
+			cd.handleReferNotify(ctx, req, tx)
 			return nil
 		}
-		sd.handleReferNotify(req, tx)
+		sd.handleReferNotify(ctx, req, tx)
 		return nil
 	}))
 	// server.OnRefer(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -585,27 +587,26 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	return dg
 }
 
-func (dg *Diago) handleReInvite(req *sip.Request, tx sip.ServerTransaction, id string) error {
-	ctx := context.TODO()
+func (dg *Diago) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, id string) error {
 	// No Error means we have ID
 	s, err := dg.cache.server.DialogLoad(ctx, id)
 	if err != nil {
 		id, err := sip.DialogIDFromRequestUAC(req)
 		if err != nil {
 			dg.log.Info("Reinvite failed to read request dialog ID", "error", err)
-			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+			return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
 
 		}
 		// No Error means we have ID
 		c, err := dg.cache.client.DialogLoad(ctx, id)
 		if err != nil {
-			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+			return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
 		}
 
-		return c.handleReInvite(req, tx)
+		return c.handleReInvite(ctx, req, tx)
 	}
 
-	return s.handleReInvite(req, tx)
+	return s.handleReInvite(ctx, req, tx)
 }
 
 var errInviteMissingHeader = errors.New("new INVITE rejected with 400 Bad Request")
@@ -656,10 +657,25 @@ func describeMissingInviteHeader(req *sip.Request) string {
 	return ""
 }
 
-// Serve starts 'Server' handle for SIP.
-// Should be called for UAS but can be skipped for UAC behavior
-func (dg *Diago) Serve(ctx context.Context, f ServeDialogFunc) error {
-	return dg.serve(ctx, f, func() {})
+// ServeRequests serves the SIP requests the transports receive until ctx ends
+// or the user agent closes. ctx is the ctx every request handler runs on, and the
+// ServeDialogFunc set by HandleFunc receives it. It returns nil once the user
+// agent is closed and the handlers it admitted have returned, or ctx's cause
+// when ctx ends first, as sipgo.Server.ServeRequests describes. ready, when not
+// nil, is called once as soon as requests are taken, which may be before the
+// listeners of Serve are up.
+//
+// HandleFunc must have been called before ServeRequests. A request that meets
+// no run is answered 480 by the transaction layer.
+func (dg *Diago) ServeRequests(ctx context.Context, ready func()) error {
+	return dg.server.ServeRequests(ctx, ready)
+}
+
+// Serve starts the listeners of every transport and blocks until serving ends.
+// Requests are handled only while ServeRequests runs. Should be called for UAS
+// but can be skipped for UAC behavior
+func (dg *Diago) Serve(ctx context.Context) error {
+	return dg.serve(ctx, func() {})
 }
 
 // ServeWithReady serves like Serve: it blocks until serving ends and returns
@@ -668,19 +684,18 @@ func (dg *Diago) Serve(ctx context.Context, f ServeDialogFunc) error {
 // its listener, so a request built once ready has run uses the rebuilt client.
 // ready runs on a listener goroutine and must not block. If serving fails before
 // every listener is up, ready is never called.
-func (dg *Diago) ServeWithReady(ctx context.Context, f ServeDialogFunc, ready func()) error {
+func (dg *Diago) ServeWithReady(ctx context.Context, ready func()) error {
 	var pending atomic.Int64
 	pending.Store(int64(len(dg.transports)))
-	return dg.serve(ctx, f, func() {
+	return dg.serve(ctx, func() {
 		if pending.Add(-1) == 0 {
 			ready()
 		}
 	})
 }
 
-func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) error {
+func (dg *Diago) serve(ctx context.Context, readyCh func()) error {
 	server := dg.server
-	dg.HandleFunc(f)
 
 	dg.transportsMu.RLock()
 	transports := slices.Clone(dg.transports)
@@ -733,7 +748,7 @@ func (dg *Diago) serve(ctx context.Context, f ServeDialogFunc, readyCh func()) e
 
 // ServeBackground starts serving in background, but waits server listener to be started before returning
 // Checkout more info on Serve()
-func (dg *Diago) ServeBackground(ctx context.Context, f ServeDialogFunc) error {
+func (dg *Diago) ServeBackground(ctx context.Context) error {
 	readyCh := make(chan struct{}, len(dg.transports))
 	ready := func() {
 		readyCh <- struct{}{}
@@ -741,7 +756,7 @@ func (dg *Diago) ServeBackground(ctx context.Context, f ServeDialogFunc) error {
 	chErr := make(chan error, 1)
 
 	go func() {
-		chErr <- dg.serve(ctx, f, ready)
+		chErr <- dg.serve(ctx, ready)
 	}()
 
 	for range dg.transports {
@@ -755,7 +770,8 @@ func (dg *Diago) ServeBackground(ctx context.Context, f ServeDialogFunc) error {
 	return nil
 }
 
-// HandleFunc registers you handler function for dialog. Must be called before serving request
+// HandleFunc registers you handler function for dialog. Must be called before
+// ServeRequests. f must not capture a ctx: it is given the ctx of the run.
 func (dg *Diago) HandleFunc(f ServeDialogFunc) {
 	dg.serveHandler = f
 }

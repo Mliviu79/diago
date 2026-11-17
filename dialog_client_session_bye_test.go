@@ -37,7 +37,7 @@ func TestDialogClientTerminatingBye(t *testing.T) {
 		bye := newPeerBye(2)
 
 		tx := newByeServerTx()
-		require.NoError(t, d.ReadBye(bye, tx))
+		require.NoError(t, d.ReadBye(t.Context(), bye, tx))
 
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusOK, tx.responses[0].StatusCode)
@@ -69,7 +69,7 @@ func TestDialogClientTerminatingBye(t *testing.T) {
 			ctxDone = d.Context().Err() != nil
 		})
 
-		require.NoError(t, d.ReadBye(bye, newByeServerTx()))
+		require.NoError(t, d.ReadBye(t.Context(), bye, newByeServerTx()))
 
 		require.True(t, ended, "the dialog must be seen to end")
 		assert.True(t, ctxDone, "the ending is already observable via the context")
@@ -84,7 +84,7 @@ func TestDialogClientTerminatingBye(t *testing.T) {
 		require.NoError(t, d.ReadRequest(newPeerInDialogRequest(sip.INVITE, 5), newByeServerTx()))
 
 		tx := newByeServerTx()
-		assert.ErrorIs(t, d.ReadBye(newPeerBye(4), tx), sipgo.ErrDialogInvalidCseq)
+		assert.ErrorIs(t, d.ReadBye(t.Context(), newPeerBye(4), tx), sipgo.ErrDialogInvalidCseq)
 		require.Len(t, tx.responses, 1, "an out-of-order BYE must be answered")
 		assert.Equal(t, sip.StatusInternalServerError, tx.responses[0].StatusCode)
 		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
@@ -100,7 +100,7 @@ func TestDialogClientTerminatingBye(t *testing.T) {
 
 		tx := newByeServerTx()
 		tx.respondErr = sip.ErrTransactionTerminated
-		require.ErrorIs(t, d.ReadBye(bye, tx), sip.ErrTransactionTerminated)
+		require.ErrorIs(t, d.ReadBye(t.Context(), bye, tx), sip.ErrTransactionTerminated)
 		if d.LoadState() == sip.DialogStateEnded {
 			assert.Same(t, bye, d.TerminatingBye(), "the BYE that ended the dialog must stay stashed")
 		} else {

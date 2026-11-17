@@ -46,38 +46,102 @@ func testDiagoClient(t *testing.T, onRequest func(req *sip.Request) *sip.Respons
 	return NewDiago(ua, opts...)
 }
 
-// serveBackground serves dg as ServeBackground does, on a context that ends
-// with ctx or when the test ends, and has the test wait, bounded, until serving
-// has returned. sipgo closes a listener from a goroutine of its own once the
-// context is done, so a test that returned without waiting could leave its
+// serveBackground serves dg as ServeBackground does and runs its request
+// serving, with f as the dialog handler when it is not nil, on a context that
+// ends with ctx or when the test ends, and has the test wait, bounded, until
+// both have returned. sipgo closes a listener from a goroutine of its own once
+// the context is done, so a test that returned without waiting could leave its
 // port bound, and the next test binding the same fixed port failed with
 // "address already in use". Serving returns only once its listener is closed.
 // dg serves a single transport, since serving returns with its first
 // listener.
-func serveBackground(t *testing.T, dg *Diago, ctx context.Context, f ServeDialogFunc) error {
+func serveBackground(t testing.TB, dg *Diago, ctx context.Context, f ServeDialogFunc) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(ctx)
+	var terminations sync.WaitGroup
+	if f != nil {
+		// A dialog ends with the run its handler was given: the call is ended
+		// with a BYE, which is bounded since its peer may be gone, and its
+		// media closed, which frees a handler blocked in it. It ends so even
+		// when the handler returned before, as the request run waits for the
+		// BYE diago sends after the handler.
+		dg.HandleFunc(func(ctx context.Context, d *DialogServerSession) {
+			terminations.Add(1)
+			context.AfterFunc(ctx, func() {
+				defer terminations.Done()
+				hangupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+				defer cancel()
+				_ = d.Hangup(hangupCtx)
+				_ = d.Close()
+			})
+			f(ctx, d)
+		})
+	}
 	ready := make(chan struct{})
 	done := make(chan struct{})
 	var serveErr error
 	go func() {
 		defer close(done)
-		serveErr = dg.ServeWithReady(ctx, f, func() { close(ready) })
+		serveErr = dg.ServeWithReady(ctx, func() { close(ready) })
+	}()
+	requestsReady := make(chan struct{})
+	requestsDone := make(chan struct{})
+	go func() {
+		defer close(requestsDone)
+		dg.ServeRequests(ctx, func() { close(requestsReady) })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		terminated := make(chan struct{})
+		go func() {
+			defer close(terminated)
+			terminations.Wait()
+		}()
+		for _, ended := range []chan struct{}{terminated, done, requestsDone} {
+			select {
+			case <-ended:
+			case <-time.After(10 * time.Second):
+				t.Error("serving did not end with the test")
+			}
+		}
+	})
+
+	select {
+	case <-requestsReady:
+	case <-requestsDone:
+	}
+	select {
+	case <-ready:
+		return nil
+	case <-done:
+		return serveErr
+	}
+}
+
+// serveRequests runs dg.ServeRequests for the test, with dg's dialog handler
+// as it is, and has the test wait, bounded, until it has returned. It returns
+// once requests are taken.
+func serveRequests(t testing.TB, dg *Diago) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dg.ServeRequests(ctx, func() { close(ready) })
 	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			t.Error("serving did not end with the test")
+			t.Error("request serving did not end with the test")
 		}
 	})
-
 	select {
 	case <-ready:
-		return nil
 	case <-done:
-		return serveErr
+		t.Fatal("request serving ended before it took requests")
 	}
 }
 
@@ -186,7 +250,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 		if tc.serve {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			require.NoError(t, serveBackground(t, dg, ctx, func(d *DialogServerSession) {}))
+			require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {}))
 			if tc.expectedContactHost != "" {
 				listenPort := dg.transports[0].BindPort
 				require.NotZero(t, listenPort)
@@ -401,16 +465,16 @@ func TestDiagoInfoWithoutContentType(t *testing.T) {
 	var mu sync.Mutex
 	panics := map[string]string{}
 	recoverPanic := func(next sipgo.RequestHandler) sipgo.RequestHandler {
-		return func(req *sip.Request, tx sip.ServerTransaction) {
+		return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			defer func() {
 				if r := recover(); r != nil {
 					mu.Lock()
 					panics[req.CallID().Value()] = fmt.Sprint(r)
 					mu.Unlock()
-					_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
+					_ = tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
 				}
 			}()
-			next(req, tx)
+			next(ctx, req, tx)
 		}
 	}
 
@@ -423,6 +487,7 @@ func TestDiagoInfoWithoutContentType(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	clientUA, _ := sipgo.NewUA()
 	t.Cleanup(func() { _ = clientUA.Close() })
@@ -486,6 +551,7 @@ func TestDiagoInfoMatchesDialogFirst(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	clientUA, _ := sipgo.NewUA()
 	t.Cleanup(func() { _ = clientUA.Close() })
@@ -542,7 +608,7 @@ func TestDiagoInfoMatchesDialogFirst(t *testing.T) {
 			name: "ended dialog",
 			dialog: func(t *testing.T) *DialogServerSession {
 				d := storedDialog(t, "info-first-ended")
-				require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+				require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
 				return d
 			},
 			wantStatus: sip.StatusCallTransactionDoesNotExists,
@@ -578,6 +644,7 @@ func TestDiagoByeMatchesNoDialogIsGone(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	clientUA, _ := sipgo.NewUA()
 	t.Cleanup(func() { _ = clientUA.Close() })
@@ -637,7 +704,7 @@ func TestDialogNotifyForNoRefer(t *testing.T) {
 			t.Run("no REFER", func(t *testing.T) {
 				d := side.newLive(t)
 				tx := newByeServerTx()
-				d.handleReferNotify(newNotify(), tx)
+				d.handleReferNotify(t.Context(), newNotify(), tx)
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 			})
@@ -647,7 +714,7 @@ func TestDialogNotifyForNoRefer(t *testing.T) {
 				attempt := d.Media().beginReferAttempt()
 				d.Media().setReferAttemptCSeq(attempt, 7)
 				tx := newByeServerTx()
-				d.handleReferNotify(newNotify(), tx)
+				d.handleReferNotify(t.Context(), newNotify(), tx)
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusOK, tx.responses[0].StatusCode)
 			})
@@ -668,7 +735,7 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 	panics := map[string][]string{}
 	handlerDone := map[string]chan struct{}{}
 	recoverPanic := func(next sipgo.RequestHandler) sipgo.RequestHandler {
-		return func(req *sip.Request, tx sip.ServerTransaction) {
+		return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			callID := req.CallID().Value()
 			defer func() {
 				r := recover()
@@ -680,13 +747,13 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 				delete(handlerDone, callID)
 				mu.Unlock()
 				if r != nil {
-					_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
+					_ = tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
 				}
 				if done != nil {
 					close(done)
 				}
 			}()
-			next(req, tx)
+			next(ctx, req, tx)
 		}
 	}
 
@@ -699,6 +766,7 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	clientUA, _ := sipgo.NewUA()
 	t.Cleanup(func() { _ = clientUA.Close() })
@@ -774,14 +842,14 @@ func TestDiagoFailedRequestWithoutFromOrTo(t *testing.T) {
 func TestDiagoOutOfOrderBye(t *testing.T) {
 	handled := make(chan struct{}, 1)
 	signalHandled := func(next sipgo.RequestHandler) sipgo.RequestHandler {
-		return func(req *sip.Request, tx sip.ServerTransaction) {
+		return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			defer func() {
 				select {
 				case handled <- struct{}{}:
 				default:
 				}
 			}()
-			next(req, tx)
+			next(ctx, req, tx)
 		}
 	}
 
@@ -793,6 +861,7 @@ func TestDiagoOutOfOrderBye(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	d, _ := newByeTestDialog(t)
 	confirm(t, d)
@@ -990,7 +1059,7 @@ func newRawInviteHarness(t *testing.T) *rawInviteHarness {
 	}
 	var firstRun sync.Once
 	middleware := func(next sipgo.RequestHandler) sipgo.RequestHandler {
-		return func(req *sip.Request, tx sip.ServerTransaction) {
+		return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			h.mu.Lock()
 			h.runs++
 			h.mu.Unlock()
@@ -999,11 +1068,11 @@ func newRawInviteHarness(t *testing.T) *rawInviteHarness {
 					h.mu.Lock()
 					h.panics = append(h.panics, fmt.Sprint(r))
 					h.mu.Unlock()
-					_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
+					_ = tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Server Internal Error", nil))
 				}
 				firstRun.Do(func() { close(h.done) })
 			}()
-			next(req, tx)
+			next(ctx, req, tx)
 		}
 	}
 
@@ -1016,6 +1085,7 @@ func newRawInviteHarness(t *testing.T) *rawInviteHarness {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 	go func() { _ = dg.server.ServeUDP(server) }()
+	serveRequests(t, dg)
 	h.serverAddr = server.LocalAddr()
 	h.serverPort = server.LocalAddr().(*net.UDPAddr).Port
 
@@ -1187,7 +1257,7 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 
 	dg := NewDiago(ua, WithTransport(tran))
 
-	err := serveBackground(t, dg, t.Context(), func(d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	newTran, _ := dg.getTransport("udp")
@@ -1230,8 +1300,8 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-			d.Trying()
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			d.Trying(t.Context())
 			err := d.Answer()
 			answered <- err
 			if err != nil {
@@ -1309,8 +1379,8 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-			d.Trying()
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			d.Trying(t.Context())
 			err := d.Answer()
 			answered <- err
 			if err != nil {
@@ -1405,8 +1475,8 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(t, dg, ctx, func(d *DialogServerSession) {
-			d.Trying()
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			d.Trying(t.Context())
 			err := d.Answer()
 			answered <- err
 			if err != nil {
@@ -1575,14 +1645,14 @@ func TestDiagoAnsweredCallRefusedAfter2xx(t *testing.T) {
 func TestDiagoOutOfOrderByeCallingSide(t *testing.T) {
 	handled := make(chan struct{}, 1)
 	signalHandled := func(next sipgo.RequestHandler) sipgo.RequestHandler {
-		return func(req *sip.Request, tx sip.ServerTransaction) {
+		return func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			defer func() {
 				select {
 				case handled <- struct{}{}:
 				default:
 				}
 			}()
-			next(req, tx)
+			next(ctx, req, tx)
 		}
 	}
 
@@ -1594,6 +1664,7 @@ func TestDiagoOutOfOrderByeCallingSide(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	go func() { _ = dg.server.ServeUDP(conn) }()
+	serveRequests(t, dg)
 
 	d, _ := newAnsweredTestClientDialog(t)
 	require.NoError(t, d.ReadRequest(newPeerInDialogRequest(sip.INVITE, 5), newByeServerTx()))

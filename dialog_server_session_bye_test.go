@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"context"
 	"testing"
 
 	"github.com/emiago/sipgo"
@@ -27,7 +28,7 @@ func newByeServerTx() *byeServerTx {
 	return &byeServerTx{done: make(chan struct{})}
 }
 
-func (tx *byeServerTx) Respond(res *sip.Response) error {
+func (tx *byeServerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.responses = append(tx.responses, res)
 	return tx.respondErr
 }
@@ -118,7 +119,7 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 		bye := newBye(t, d, d.InviteRequest.CSeq().SeqNo+1)
 
 		tx := newByeServerTx()
-		require.NoError(t, d.ReadBye(bye, tx))
+		require.NoError(t, d.ReadBye(t.Context(), bye, tx))
 
 		// BYE semantics are untouched: still answered 200, still ends the dialog.
 		require.Len(t, tx.responses, 1)
@@ -154,7 +155,7 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 			ctxDone = d.Context().Err() != nil
 		})
 
-		require.NoError(t, d.ReadBye(bye, newByeServerTx()))
+		require.NoError(t, d.ReadBye(t.Context(), bye, newByeServerTx()))
 
 		require.True(t, ended, "the dialog must be seen to end")
 		assert.True(t, ctxDone, "the ending is already observable via the context")
@@ -168,7 +169,7 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 		confirm(t, d)
 		stale := newBye(t, d, d.InviteRequest.CSeq().SeqNo-1)
 
-		require.Error(t, d.ReadBye(stale, newByeServerTx()))
+		require.Error(t, d.ReadBye(t.Context(), stale, newByeServerTx()))
 		assert.Nil(t, d.TerminatingBye(), "a rejected BYE must not be stashed")
 		assert.NotEqual(t, sip.DialogStateEnded, d.LoadState(), "a rejected BYE must not end the dialog")
 	})
@@ -183,7 +184,7 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 
 		tx := newByeServerTx()
 		tx.respondErr = sip.ErrTransactionTerminated
-		require.ErrorIs(t, d.ReadBye(bye, tx), sip.ErrTransactionTerminated)
+		require.ErrorIs(t, d.ReadBye(t.Context(), bye, tx), sip.ErrTransactionTerminated)
 		if d.LoadState() == sip.DialogStateEnded {
 			assert.Same(t, bye, d.TerminatingBye(), "the BYE that ended the dialog must stay stashed")
 		} else {
@@ -200,7 +201,7 @@ func TestDialogServerTerminatingBye(t *testing.T) {
 		stale := newBye(t, d, d.InviteRequest.CSeq().SeqNo-1)
 
 		tx := newByeServerTx()
-		assert.ErrorIs(t, d.ReadBye(stale, tx), sipgo.ErrDialogInvalidCseq)
+		assert.ErrorIs(t, d.ReadBye(t.Context(), stale, tx), sipgo.ErrDialogInvalidCseq)
 		require.Len(t, tx.responses, 1, "an out-of-order BYE must be answered")
 		assert.Equal(t, sip.StatusInternalServerError, tx.responses[0].StatusCode)
 		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())

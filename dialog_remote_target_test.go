@@ -80,11 +80,13 @@ var remoteTargetSides = []struct {
 					req.ReplaceHeader(&sip.ContactHeader{Address: contact})
 					return req
 				},
-				handleReInvite: d.handleReInvite,
-				readAck:        func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
-				reInvite:       d.ReInvite,
-				hangup:         d.Hangup,
-				remoteContact:  d.RemoteContact,
+				handleReInvite: func(req *sip.Request, tx sip.ServerTransaction) error {
+					return d.handleReInvite(t.Context(), req, tx)
+				},
+				readAck:       func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
+				reInvite:      d.ReInvite,
+				hangup:        d.Hangup,
+				remoteContact: d.RemoteContact,
 			}
 		},
 	},
@@ -119,11 +121,13 @@ var remoteTargetSides = []struct {
 					req.ReplaceHeader(&sip.ContactHeader{Address: contact})
 					return req
 				},
-				handleReInvite: d.handleReInvite,
-				readAck:        func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
-				reInvite:       d.ReInvite,
-				hangup:         d.Hangup,
-				remoteContact:  d.RemoteContact,
+				handleReInvite: func(req *sip.Request, tx sip.ServerTransaction) error {
+					return d.handleReInvite(t.Context(), req, tx)
+				},
+				readAck:       func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
+				reInvite:      d.ReInvite,
+				hangup:        d.Hangup,
+				remoteContact: d.RemoteContact,
 			}
 		},
 	},

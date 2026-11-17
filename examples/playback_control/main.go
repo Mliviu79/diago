@@ -12,6 +12,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 )
@@ -36,19 +37,19 @@ func start(ctx context.Context) error {
 	ua, _ := sipgo.NewUA()
 	tu := diago.NewDiago(ua)
 
-	return tu.Serve(ctx, func(inDialog *diago.DialogServerSession) {
+	return serving.Run(ctx, tu, func(ctx context.Context, inDialog *diago.DialogServerSession) {
 		slog.Info("New dialog request", "id", inDialog.ID)
 		defer slog.Info("Dialog finished", "id", inDialog.ID)
 
-		if err := Playback(inDialog); err != nil {
+		if err := Playback(ctx, inDialog); err != nil {
 			slog.Error("Playback finished with error", "error", err)
 		}
 	})
 }
 
-func Playback(inDialog *diago.DialogServerSession) error {
-	inDialog.Trying()  // Progress -> 100 Trying
-	inDialog.Ringing() // Ringing -> 180 Response
+func Playback(ctx context.Context, inDialog *diago.DialogServerSession) error {
+	inDialog.Trying(ctx)  // Progress -> 100 Trying
+	inDialog.Ringing(ctx) // Ringing -> 180 Response
 
 	playfile, _ := testdata.OpenFile("demo-echotest.wav")
 	defer playfile.Close()

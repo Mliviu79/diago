@@ -70,9 +70,9 @@ func newDTLSCall(t *testing.T, calleePort int, callerPort int) dtlsCall {
 	calleeUpdated := make(chan struct{}, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
-		if err := d.AnswerOptions(AnswerOptions{OnMediaUpdate: func(*DialogMedia) {
+		if err := d.AnswerOptions(t.Context(), AnswerOptions{OnMediaUpdate: func(*DialogMedia) {
 			select {
 			case calleeUpdated <- struct{}{}:
 			default:
@@ -235,9 +235,9 @@ func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
 	answerErr := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
-		if err := d.ProgressMedia(); err != nil {
+		if err := d.ProgressMedia(t.Context()); err != nil {
 			answerErr <- err
 			return
 		}
@@ -489,7 +489,7 @@ func TestDialogServerReInviteNewAssociationFailureHangsUp(t *testing.T) {
 	req.SetBody([]byte(offer))
 	tx := newRespondedServerTx()
 	handled := make(chan error, 1)
-	go func() { handled <- d.handleReInvite(req, tx) }()
+	go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 
 	var answer []byte
 	select {
@@ -576,7 +576,7 @@ func TestDialogByeEndsNewAssociationHandshake(t *testing.T) {
 
 	tx := newRespondedServerTx()
 	handled := make(chan error, 1)
-	go func() { handled <- d.handleReInvite(req, tx) }()
+	go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 
 	var answer []byte
 	select {
@@ -589,7 +589,7 @@ func TestDialogByeEndsNewAssociationHandshake(t *testing.T) {
 
 	byeTx := newByeServerTx()
 	byeRead := make(chan error, 1)
-	go func() { byeRead <- d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), byeTx) }()
+	go func() { byeRead <- d.ReadBye(t.Context(), newBye(t, d, req.CSeq().SeqNo+1), byeTx) }()
 	select {
 	case err := <-byeRead:
 		require.NoError(t, err)
@@ -617,10 +617,10 @@ func TestDialogByeBeforeNewAssociationAnswer(t *testing.T) {
 	d, answerer, req := newNewAssociationReInviteDialog(t)
 
 	tx := newByeServerTx()
-	answered, err := d.beginPeerReInvite(&d.Dialog, req, tx)
+	answered, err := d.beginPeerReInvite(t.Context(), &d.Dialog, req, tx)
 	require.NoError(t, err)
 	require.False(t, answered)
-	require.NoError(t, d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), newByeServerTx()))
+	require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, req.CSeq().SeqNo+1), newByeServerTx()))
 	require.Len(t, tx.responses, 1)
 	require.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
 
@@ -720,7 +720,7 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 
 		tx := newRespondedServerTx()
 		handled := make(chan error, 1)
-		go func() { handled <- d.handleReInvite(req, tx) }()
+		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 		peerDone := make(chan error, 1)
 		go func() { peerDone <- peer.Finalize() }()
 
@@ -767,7 +767,7 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 
 		tx := newRespondedServerTx()
 		handled := make(chan error, 1)
-		go func() { handled <- d.handleReInvite(req, tx) }()
+		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 		select {
 		case res := <-tx.responded:
 			require.Equal(t, sip.StatusRequestPending, res.StatusCode, "reason: %s", res.Reason)
@@ -798,7 +798,7 @@ func TestDialogServerAnswerAfterEarlyHandshakeFailed(t *testing.T) {
 	offer = strings.Replace(offer, iceSDPLine(t, []byte(offer), "a=fingerprint:"), iceSDPLine(t, newDTLSMediaSession(t, other).LocalSDP(), "a=fingerprint:"), 1)
 	d.InviteRequest.SetBody([]byte(offer))
 
-	require.ErrorIs(t, d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: 200 * time.Millisecond}), ErrEarlyMediaNotKeyed)
+	require.ErrorIs(t, d.ProgressMediaOptions(t.Context(), ProgressMediaOptions{KeyTimeout: 200 * time.Millisecond}), ErrEarlyMediaNotKeyed)
 	var early *sip.Response
 	select {
 	case early = <-inviteTx.responded:
@@ -1015,11 +1015,11 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 	answered := make(chan answerResult, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		d.InitMediaSession(sess, nil, nil)
 		start := time.Now()
-		err := d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: time.Second})
+		err := d.ProgressMediaOptions(t.Context(), ProgressMediaOptions{KeyTimeout: time.Second})
 		progressed <- progressResult{err: err, took: time.Since(start)}
 
 		r := answerResult{d: d}
@@ -1119,10 +1119,10 @@ func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
 	answered := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		d.InitMediaSession(sess, nil, nil)
-		err := d.ProgressMediaOptions(ProgressMediaOptions{KeyTimeout: 5 * time.Second})
+		err := d.ProgressMediaOptions(t.Context(), ProgressMediaOptions{KeyTimeout: 5 * time.Second})
 		progressed <- progressResult{d: d, err: err}
 		if err != nil {
 			return

@@ -46,10 +46,10 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	log := asyncLog(t)
-	err := serveBackground(t, tu, ctx, func(in *DialogServerSession) {
+	err := serveBackground(t, tu, ctx, func(_ context.Context, in *DialogServerSession) {
 		defer wg.Done()
-		in.Trying()
-		in.Ringing()
+		in.Trying(t.Context())
+		in.Ringing(t.Context())
 		in.Answer()
 		log("Playing url ", urlStr)
 		pb, _ := in.PlaybackCreate()
@@ -71,7 +71,7 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 			BindPort:  15060,
 		}))
 		// Just to have handled BYE
-		err := serveBackground(t, phone, ctx, func(d *DialogServerSession) {})
+		err := serveBackground(t, phone, ctx, func(_ context.Context, d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		dialog, err := phone.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 15060}, InviteOptions{})

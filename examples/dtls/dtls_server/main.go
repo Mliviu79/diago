@@ -9,6 +9,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
@@ -43,8 +44,8 @@ func main() {
 			},
 		))
 
-	err := dg.Serve(ctx, func(d *diago.DialogServerSession) {
-		d.Trying()
+	err := serving.Run(ctx, dg, func(ctx context.Context, d *diago.DialogServerSession) {
+		d.Trying(ctx)
 		if err := d.Answer(); err != nil {
 			panic(err)
 		}

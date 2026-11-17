@@ -12,6 +12,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/sipgo"
 )
 
@@ -35,16 +36,16 @@ func start(ctx context.Context) error {
 	ua, _ := sipgo.NewUA()
 	tu := diago.NewDiago(ua)
 
-	return tu.Serve(ctx, func(inDialog *diago.DialogServerSession) {
+	return serving.Run(ctx, tu, func(ctx context.Context, inDialog *diago.DialogServerSession) {
 		slog.Info("New dialog request", "id", inDialog.ID)
 		defer slog.Info("Dialog finished", "id", inDialog.ID)
-		ReadDTMF(inDialog)
+		ReadDTMF(ctx, inDialog)
 	})
 }
 
-func ReadDTMF(inDialog *diago.DialogServerSession) error {
-	inDialog.Trying()  // Progress -> 100 Trying
-	inDialog.Ringing() // Ringing -> 180 Response
+func ReadDTMF(ctx context.Context, inDialog *diago.DialogServerSession) error {
+	inDialog.Trying(ctx)  // Progress -> 100 Trying
+	inDialog.Ringing(ctx) // Ringing -> 180 Response
 	if err := inDialog.Answer(); err != nil {
 		return err
 	}

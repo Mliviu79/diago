@@ -76,7 +76,7 @@ func TestDialogServerAnswerDTLSEndsWithDialog(t *testing.T) {
 	requireClientHello(t, peer)
 
 	byeTx := newByeServerTx()
-	require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), byeTx))
+	require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), byeTx))
 	assert.Error(t, requireReturns(t, answered, "Answer"), "media that was never keyed is not an answer")
 }
 
@@ -102,7 +102,7 @@ func TestDialogServerLateOfferDTLSEndsWithDialog(t *testing.T) {
 	go func() { acked <- d.ReadAck(newLateAck(d, answer), newByeServerTx()) }()
 	requireClientHello(t, peer)
 
-	require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+	require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
 	assert.Error(t, requireReturns(t, acked, "ReadAck"))
 	assert.Error(t, requireReturns(t, answered, "AnswerLate"))
 }

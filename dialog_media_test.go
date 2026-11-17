@@ -26,7 +26,10 @@ type fakeServerTransaction struct {
 	res *sip.Response
 }
 
-func (t *fakeServerTransaction) Respond(res *sip.Response) error      { t.res = res; return nil }
+func (t *fakeServerTransaction) Respond(_ context.Context, res *sip.Response) error {
+	t.res = res
+	return nil
+}
 func (t *fakeServerTransaction) Acks() <-chan *sip.Request            { return nil }
 func (t *fakeServerTransaction) OnCancel(f sip.FnTxCancel) bool       { return false }
 func (t *fakeServerTransaction) OnTerminate(f sip.FnTxTerminate) bool { return false }

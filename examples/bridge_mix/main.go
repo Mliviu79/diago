@@ -13,6 +13,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/examples"
+	"github.com/emiago/diago/examples/serving"
 	"github.com/emiago/sipgo"
 )
 
@@ -46,16 +47,16 @@ func start(ctx context.Context) error {
 	// Setup our main transaction user
 	ua, _ := sipgo.NewUA()
 	d := diago.NewDiago(ua)
-	return d.Serve(ctx, func(inDialog *diago.DialogServerSession) {
-		BridgeCall(d, inDialog)
+	return serving.Run(ctx, d, func(ctx context.Context, inDialog *diago.DialogServerSession) {
+		BridgeCall(ctx, d, inDialog)
 
 		fmt.Println("Bridge state", bridge.String())
 	})
 }
 
-func BridgeCall(d *diago.Diago, inDialog *diago.DialogServerSession) error {
-	inDialog.Trying()  // Progress -> 100 Trying
-	inDialog.Ringing() // Ringing -> 180 Response
+func BridgeCall(ctx context.Context, d *diago.Diago, inDialog *diago.DialogServerSession) error {
+	inDialog.Trying(ctx)  // Progress -> 100 Trying
+	inDialog.Ringing(ctx) // Ringing -> 180 Response
 
 	inCtx := inDialog.Context()
 

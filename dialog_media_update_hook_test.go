@@ -35,7 +35,7 @@ func TestDialogMediaUpdateHooks(t *testing.T) {
 		tx := newAckedServerTx(inner, func() {
 			ackErr <- d.handleReInviteACK(newReInviteAck(req, ackBody), nil)
 		})
-		if err := d.handleReInvite(req, tx); err != nil {
+		if err := d.handleReInvite(t.Context(), req, tx); err != nil {
 			return 0, err
 		}
 		if inner.res.IsSuccess() {
@@ -171,7 +171,7 @@ func TestDialogMediaUpdateHooksAnswerInACKInbound(t *testing.T) {
 	req := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
 	tx := newRespondedServerTx()
 	handled := make(chan error, 1)
-	go func() { handled <- d.handleReInvite(req, tx) }()
+	go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 	var ok *sip.Response
 	select {
 	case ok = <-tx.responded:

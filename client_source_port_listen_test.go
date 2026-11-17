@@ -62,12 +62,12 @@ func TestIntegrationClientSourcesFromBindPortOnceServing(t *testing.T) {
 	}))
 
 	receivedInvites := make(chan *sip.Request, 1)
-	err := peer.ServeBackground(ctx, func(d *DialogServerSession) {
+	err := serveBackground(t, peer, ctx, func(ctx context.Context, d *DialogServerSession) {
 		select {
 		case receivedInvites <- d.InviteRequest:
 		default:
 		}
-		_ = d.Respond(sip.StatusBusyHere, "Busy Here", nil)
+		_ = d.Respond(ctx, sip.StatusBusyHere, "Busy Here", nil)
 		<-d.Context().Done()
 	})
 	if err != nil {
@@ -81,7 +81,7 @@ func TestIntegrationClientSourcesFromBindPortOnceServing(t *testing.T) {
 		BindHost:  "127.0.0.1",
 		BindPort:  dialerBindPort,
 	}))
-	if err := dialer.ServeBackground(ctx, nil); err != nil {
+	if err := dialer.ServeBackground(ctx); err != nil {
 		t.Fatalf("dialer ServeBackground: %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestIntegrationClientSwapDuringServeStartup(t *testing.T) {
 		t.Fatal("readers did not start within 5s")
 	}
 
-	serveErr := dg.ServeBackground(ctx, nil)
+	serveErr := dg.ServeBackground(ctx)
 
 	servedFloors := make([]int64, readerCount)
 	for readerIndex := range readerCount {

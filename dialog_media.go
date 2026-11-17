@@ -255,12 +255,12 @@ func (t ackTimers) values() (t1, t2, timeout time.Duration) {
 // its call handler returns, for an inbound call, or until it is closed, for an
 // outbound one, so a re-INVITE can still find it. It matches no live dialog,
 // and RFC 3261 section 12.2.2 has it answered 481.
-func (d *DialogMedia) beginPeerReInvite(dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
+func (d *DialogMedia) beginPeerReInvite(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
 	if dialog.LoadState() == sip.DialogStateEnded {
 		res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
-		return true, tx.Respond(res)
+		return true, tx.Respond(ctx, res)
 	}
 	p := &pendingReInvite{req: req, tx: tx, dialog: dialog}
 	if cseq := req.CSeq(); cseq != nil {
@@ -359,7 +359,7 @@ func (d *DialogMedia) retransmitReInvite2xx(p *pendingReInvite, res *sip.Respons
 			ended := p.dialog.LoadState() == sip.DialogStateEnded
 			var err error
 			if !ended {
-				err = p.tx.Respond(res)
+				err = p.tx.Respond(p.dialog.Context(), res)
 			}
 			d.answerMu.Unlock()
 			if ended {
@@ -382,22 +382,22 @@ func (d *DialogMedia) retransmitReInvite2xx(p *pendingReInvite, res *sip.Respons
 // has answered gets nothing more, and one found pending once the dialog has
 // ended is answered 487 instead (RFC 3261 section 15.1.2). A request
 // beginPeerReInvite did not record is answered res as it is.
-func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Response) (bool, error) {
+func (d *DialogMedia) respondPeerReInvite(ctx context.Context, tx sip.ServerTransaction, res *sip.Response) (bool, error) {
 	d.answerMu.Lock()
 	defer d.answerMu.Unlock()
 	p := d.peerReInvite
 	if p == nil || p.tx != tx {
-		return true, tx.Respond(res)
+		return true, tx.Respond(ctx, res)
 	}
 	if p.answered {
 		return false, nil
 	}
 	p.answered = true
 	if p.dialog.LoadState() == sip.DialogStateEnded {
-		return false, tx.Respond(sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
+		return false, tx.Respond(ctx, sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
 	}
 	if !res.IsSuccess() {
-		return true, tx.Respond(res)
+		return true, tx.Respond(ctx, res)
 	}
 	if p.on2xx != nil {
 		p.on2xx(res)
@@ -410,7 +410,7 @@ func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Res
 	d.mu.Unlock()
 	// Made before the 2xx goes out, which its ACK can follow at once.
 	p.acked = make(chan struct{})
-	if err := tx.Respond(res); err != nil {
+	if err := tx.Respond(ctx, res); err != nil {
 		return true, err
 	}
 	p.retransmitted = make(chan struct{})
@@ -422,13 +422,13 @@ func (d *DialogMedia) respondPeerReInvite(tx sip.ServerTransaction, res *sip.Res
 // still pending once a BYE has ended the dialog: RFC 3261 section 15.1.2 has
 // every pending request answered, and recommends 487. Called with answerMu
 // held.
-func (d *DialogMedia) terminatePeerReInviteLocked() error {
+func (d *DialogMedia) terminatePeerReInviteLocked(ctx context.Context) error {
 	p := d.peerReInvite
 	if p == nil || p.answered {
 		return nil
 	}
 	p.answered = true
-	return p.tx.Respond(sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
+	return p.tx.Respond(ctx, sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
 }
 
 // referAttempt is one REFER sent on the dialog, the refer subscription it
@@ -994,9 +994,28 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 	return d.mediaSession
 }
 
+// endsWithDialog derives from ctx a ctx that also ends when dialogCtx does,
+// with dialogCtx's cause, and the func that releases it. The release waits for
+// the callback that carries the dialog's end across, when it has started.
+func endsWithDialog(ctx, dialogCtx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	stop := context.AfterFunc(dialogCtx, func() {
+		defer close(done)
+		cancel(context.Cause(dialogCtx))
+	})
+	return ctx, func() {
+		if !stop() {
+			<-done
+		}
+		cancel(nil)
+	}
+}
+
 // handleMediaUpdate answers an in-dialog INVITE and applies its offer, if it
-// has one, to a fork of the media session. ctx is the dialog's: it bounds a
-// DTLS handshake the offer asks for, which the end of the dialog ends. An error
+// has one, to a fork of the media session. ctx is the request handler's, which
+// the caller ends with the dialog as well (endsWithDialog): it carries the
+// answer and bounds a DTLS handshake the offer asks for. An error
 // wrapping errMediaUpdateAfterAnswer means the update failed after the 2xx was
 // sent, and the caller ends the call.
 //
@@ -1004,7 +1023,7 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 // that ends the dialog meanwhile has it answered 487 instead.
 func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
 	respond := func(res *sip.Response) error {
-		_, err := d.respondPeerReInvite(tx, res)
+		_, err := d.respondPeerReInvite(ctx, tx, res)
 		return err
 	}
 
@@ -1082,7 +1101,7 @@ func (d *DialogMedia) handleMediaUpdate(ctx context.Context, req *sip.Request, t
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sd)
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	sent, err := d.respondPeerReInvite(tx, res)
+	sent, err := d.respondPeerReInvite(ctx, tx, res)
 	if offer != nil && !sent {
 		// No 2xx went out, so no ACK will answer the offer.
 		d.mu.Lock()
@@ -1143,7 +1162,7 @@ func (d *DialogMedia) answerNewAssociation(ctx context.Context, req *sip.Request
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", msess.LocalSDP())
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	sent, err := d.respondPeerReInvite(tx, res)
+	sent, err := d.respondPeerReInvite(ctx, tx, res)
 	if err != nil || !sent {
 		d.mu.Lock()
 		d.mediaUpdating = false

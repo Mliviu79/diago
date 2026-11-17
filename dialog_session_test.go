@@ -139,7 +139,7 @@ func TestDialogHandleReferNotifyContentType(t *testing.T) {
 			req := newReferNotifyRequest(t, tc.contentType, "SIP/2.0 200 OK")
 			tx, conn := newReferNotifyTx(t, req)
 
-			dialogHandleReferNotify(d, req, tx)
+			dialogHandleReferNotify(t.Context(), d, req, tx)
 
 			require.Len(t, conn.messages(), 1)
 			res, ok := conn.messages()[0].(*sip.Response)
@@ -163,7 +163,7 @@ func TestDialogHandleReferNotifyShortBody(t *testing.T) {
 	req := newReferNotifyRequest(t, "message/sipfrag", "SIP/2.0")
 	tx, conn := newReferNotifyTx(t, req)
 
-	dialogHandleReferNotify(d, req, tx)
+	dialogHandleReferNotify(t.Context(), d, req, tx)
 
 	require.Len(t, conn.messages(), 1)
 	res := conn.messages()[0].(*sip.Response)
@@ -186,7 +186,7 @@ func TestDialogHandleReferNotifyWithoutContentType(t *testing.T) {
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		dialogHandleReferNotify(d, req, tx)
+		dialogHandleReferNotify(t.Context(), d, req, tx)
 	}()
 	require.Nil(t, recovered, "dialogHandleReferNotify panicked")
 
@@ -232,7 +232,7 @@ func TestDialogHandleReferNotifyLeavesTheDialogAlone(t *testing.T) {
 			}
 			tx, conn := newReferNotifyTx(t, req)
 
-			dialogHandleReferNotify(d, req, tx)
+			dialogHandleReferNotify(t.Context(), d, req, tx)
 
 			require.Len(t, conn.messages(), 1)
 			res, ok := conn.messages()[0].(*sip.Response)
@@ -327,7 +327,7 @@ func sendReferNotify(t *testing.T, d DialogSession, body, event, subscriptionSta
 		return 0
 	}
 
-	dialogHandleReferNotify(d, req, tx)
+	dialogHandleReferNotify(t.Context(), d, req, tx)
 
 	msgs := conn.messages()
 	if len(msgs) != 1 {
@@ -346,9 +346,9 @@ func sendReferNotify(t *testing.T, d DialogSession, body, event, subscriptionSta
 // dialog found in the cache, on either side.
 type inDialogHandlers interface {
 	DialogSession
-	readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error
-	handleRefer(dg *Diago, req *sip.Request, tx sip.ServerTransaction)
-	handleReferNotify(req *sip.Request, tx sip.ServerTransaction)
+	readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error
+	handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction)
+	handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction)
 }
 
 // sentRequests records the methods of the requests a dialog sends through a
@@ -462,7 +462,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				d.InviteResponse = sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
 				confirm(t, d)
 				d.onReferDialog = onRefer
-				require.NoError(t, d.ReadBye(newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
+				require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))
 				require.Equal(t, sip.DialogStateEnded, d.LoadState())
 				return d, sent
 			},
@@ -489,7 +489,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				req.SetBody([]byte("Signal=1\r\nDuration=160\r\n"))
 
 				tx := newByeServerTx()
-				require.NoError(t, d.readSIPInfoDTMF(req, tx))
+				require.NoError(t, d.readSIPInfoDTMF(t.Context(), req, tx))
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 			})
@@ -509,7 +509,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				req.AppendHeader(sip.NewHeader("Refer-To", "<sip:carol@127.0.0.1:5080>"))
 
 				tx := newByeServerTx()
-				d.handleRefer(dg, req, tx)
+				d.handleRefer(t.Context(), dg, req, tx)
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 				assert.Empty(t, sent.sent(), "the REFER on an ended dialog sent a NOTIFY")
@@ -525,7 +525,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				req.SetBody([]byte("SIP/2.0 200 OK"))
 
 				tx := newByeServerTx()
-				d.handleReferNotify(req, tx)
+				d.handleReferNotify(t.Context(), req, tx)
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 			})
@@ -542,7 +542,7 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 				req.SetBody([]byte("SIP/2.0 200 OK"))
 
 				tx := newByeServerTx()
-				d.handleReferNotify(req, tx)
+				d.handleReferNotify(t.Context(), req, tx)
 				require.Len(t, tx.responses, 1)
 				assert.Equal(t, sip.StatusOK, tx.responses[0].StatusCode)
 				d.Media().referMu.Lock()
@@ -579,7 +579,7 @@ func newLoggedServerTx(name string, log *answerLog) *loggedServerTx {
 	return &loggedServerTx{byeServerTx: newByeServerTx(), name: name, log: log}
 }
 
-func (tx *loggedServerTx) Respond(res *sip.Response) error {
+func (tx *loggedServerTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.log.mu.Lock()
 	tx.log.answers = append(tx.log.answers, fmt.Sprintf("%s %d", tx.name, res.StatusCode))
 	tx.log.mu.Unlock()
@@ -625,8 +625,8 @@ func TestDialogReInviteRacingBye(t *testing.T) {
 				reInvite.SetBody(peer.LocalSDP())
 				bye := newBye(t, d, seq+2)
 				return &d.DialogMedia,
-					func(tx sip.ServerTransaction) error { return d.handleReInvite(reInvite, tx) },
-					func(tx sip.ServerTransaction) error { return d.ReadBye(bye, tx) }
+					func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), reInvite, tx) },
+					func(tx sip.ServerTransaction) error { return d.ReadBye(t.Context(), bye, tx) }
 			},
 		},
 		{
@@ -640,8 +640,8 @@ func TestDialogReInviteRacingBye(t *testing.T) {
 				reInvite.SetBody(peerSDP())
 				bye := newPeerInDialogRequest(sip.BYE, seq+2)
 				return &d.DialogMedia,
-					func(tx sip.ServerTransaction) error { return d.handleReInvite(reInvite, tx) },
-					func(tx sip.ServerTransaction) error { return d.ReadBye(bye, tx) }
+					func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), reInvite, tx) },
+					func(tx sip.ServerTransaction) error { return d.ReadBye(t.Context(), bye, tx) }
 			},
 		},
 	}
@@ -710,7 +710,9 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 				require.NoError(t, rtpSess.MonitorBackground(context.Background()))
 				t.Cleanup(func() { _ = d.DialogMedia.Close() })
 
-				return &d.DialogMedia, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), d.handleReInvite,
+				return &d.DialogMedia, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), func(req *sip.Request, tx sip.ServerTransaction) error {
+						return d.handleReInvite(t.Context(), req, tx)
+					},
 					func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) }
 			},
 		},
@@ -718,7 +720,9 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 			name: "outbound",
 			setup: func(t *testing.T) (*DialogMedia, *sip.Request, func(*sip.Request, sip.ServerTransaction) error, func(*sip.Request) error) {
 				d, _ := newAnsweredTestClientDialog(t)
-				return &d.DialogMedia, newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1), d.handleReInvite,
+				return &d.DialogMedia, newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1), func(req *sip.Request, tx sip.ServerTransaction) error {
+						return d.handleReInvite(t.Context(), req, tx)
+					},
 					func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) }
 			},
 		},
@@ -987,7 +991,7 @@ func newTransmissionsTx() *transmissionsTx {
 	return &transmissionsTx{byeServerTx: newByeServerTx(), sent: make(chan int, 256)}
 }
 
-func (tx *transmissionsTx) Respond(res *sip.Response) error {
+func (tx *transmissionsTx) Respond(_ context.Context, res *sip.Response) error {
 	tx.sent <- res.StatusCode
 	return nil
 }
@@ -1028,10 +1032,10 @@ var reInviteAckSides = []struct {
 				}
 			}
 			return &d.DialogMedia, req,
-				func(tx sip.ServerTransaction) error { return d.handleReInvite(req, tx) },
+				func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
 				func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
 				func(tx sip.ServerTransaction) error {
-					return d.ReadBye(newBye(t, d, req.CSeq().SeqNo+1), tx)
+					return d.ReadBye(t.Context(), newBye(t, d, req.CSeq().SeqNo+1), tx)
 				},
 				sentBye
 		},
@@ -1047,10 +1051,10 @@ var reInviteAckSides = []struct {
 				return slices.Contains(sent.sent(), sip.BYE)
 			}
 			return &d.DialogMedia, req,
-				func(tx sip.ServerTransaction) error { return d.handleReInvite(req, tx) },
+				func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
 				func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
 				func(tx sip.ServerTransaction) error {
-					return d.ReadBye(newPeerInDialogRequest(sip.BYE, req.CSeq().SeqNo+1), tx)
+					return d.ReadBye(t.Context(), newPeerInDialogRequest(sip.BYE, req.CSeq().SeqNo+1), tx)
 				},
 				sentBye
 		},

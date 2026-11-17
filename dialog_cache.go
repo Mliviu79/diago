@@ -58,13 +58,13 @@ type DialogCachePool struct {
 	server DialogCache[*DialogServerSession]
 }
 
-func (p *DialogCachePool) MatchDialogClient(req *sip.Request) (*DialogClientSession, error) {
+func (p *DialogCachePool) MatchDialogClient(ctx context.Context, req *sip.Request) (*DialogClientSession, error) {
 	id, err := sip.DialogIDFromRequestUAC(req)
 	if err != nil {
 		return nil, errors.Join(err, sipgo.ErrDialogOutsideDialog)
 	}
 
-	val, err := p.client.DialogLoad(context.Background(), id)
+	val, err := p.client.DialogLoad(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -72,13 +72,13 @@ func (p *DialogCachePool) MatchDialogClient(req *sip.Request) (*DialogClientSess
 	return val, nil
 }
 
-func (p *DialogCachePool) MatchDialogServer(req *sip.Request) (*DialogServerSession, error) {
+func (p *DialogCachePool) MatchDialogServer(ctx context.Context, req *sip.Request) (*DialogServerSession, error) {
 	id, err := sip.DialogIDFromRequestUAS(req)
 	if err != nil {
 		return nil, errors.Join(err, sipgo.ErrDialogOutsideDialog)
 	}
 
-	val, err := p.server.DialogLoad(context.Background(), id)
+	val, err := p.server.DialogLoad(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -86,14 +86,14 @@ func (p *DialogCachePool) MatchDialogServer(req *sip.Request) (*DialogServerSess
 	return val, nil
 }
 
-func (p *DialogCachePool) MatchDialog(req *sip.Request) (*DialogServerSession, *DialogClientSession, error) {
-	d, err := p.MatchDialogServer(req)
+func (p *DialogCachePool) MatchDialog(ctx context.Context, req *sip.Request) (*DialogServerSession, *DialogClientSession, error) {
+	d, err := p.MatchDialogServer(ctx, req)
 	if err != nil {
 		if !errors.Is(err, sipgo.ErrDialogDoesNotExists) {
 			return nil, nil, err
 		}
 
-		cd, err := p.MatchDialogClient(req)
+		cd, err := p.MatchDialogClient(ctx, req)
 		return nil, cd, err
 	}
 	return d, nil, nil
