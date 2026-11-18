@@ -47,7 +47,8 @@ func start(ctx context.Context) error {
 func ReadMedia(ctx context.Context, inDialog *diago.DialogServerSession) error {
 	inDialog.Trying(ctx)  // Progress -> 100 Trying
 	inDialog.Ringing(ctx) // Ringing -> 180 Response
-	if err := inDialog.Answer(); err != nil {
+	med, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
 		return err
 	}
 
@@ -57,7 +58,7 @@ func ReadMedia(ctx context.Context, inDialog *diago.DialogServerSession) error {
 
 	// After answer we can access audio reader and read props
 	m := diago.MediaProps{}
-	audioReader, _ := inDialog.AudioReader(
+	audioReader, _ := med.AudioReader(
 		diago.WithAudioReaderMediaProps(&m),
 	)
 
@@ -74,7 +75,7 @@ func ReadMedia(ctx context.Context, inDialog *diago.DialogServerSession) error {
 			return err
 		}
 
-		pkt := inDialog.RTPPacketReader.PacketHeader
+		pkt := med.RTPPacketReader.PacketHeader
 		if time.Since(lastPrint) > 3*time.Second {
 			lastPrint = time.Now()
 			slog.Info("Received packets", "PayloadType", pkt.PayloadType, "pkts", pktsCount)

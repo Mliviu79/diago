@@ -5,8 +5,6 @@ package media
 
 import (
 	"bytes"
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -60,6 +58,473 @@ func pipeRTP(lport int, rport int) (read *RTPSession, write *RTPSession) {
 	return rtpSessRead, rtpSessWrite
 }
 
+func TestRTPSessionReadSkipsComfortNoise(t *testing.T) {
+	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
+
+	const ssrc uint32 = 1234
+	packets := []rtp.Packet{
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecComfortNoise8000.PayloadType,
+				SequenceNumber: 1,
+				Timestamp:      160,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{1},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: 2,
+				Timestamp:      320,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{2},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecComfortNoise8000.PayloadType,
+				SequenceNumber: 3,
+				Timestamp:      480,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{3},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: 4,
+				Timestamp:      640,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{4},
+		},
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		for i := range packets {
+			if err := rtpSessWrite.Sess.WriteRTP(&packets[i]); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	buf := make([]byte, RTPBufSize)
+	for _, wantSequenceNumber := range []uint16{2, 4} {
+		var pkt rtp.Packet
+		n, err := rtpSessRead.ReadRTP(buf, &pkt)
+		require.NoError(t, err)
+		require.Positive(t, n)
+		assert.Equal(t, CodecAudioAlaw.PayloadType, pkt.PayloadType)
+		assert.Equal(t, wantSequenceNumber, pkt.SequenceNumber)
+	}
+	require.NoError(t, <-writeDone)
+
+	stats := rtpSessRead.ReadStats()
+	assert.EqualValues(t, 2, stats.PacketsCount)
+	assert.EqualValues(t, 2, stats.OctetCount)
+}
+
+func TestRTPSessionReadPassesSupportedPayloadTypeChanges(t *testing.T) {
+	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
+
+	const ssrc uint32 = 1234
+	packets := []rtp.Packet{
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: 1,
+				Timestamp:      160,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{1},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioUlaw.PayloadType,
+				SequenceNumber: 2,
+				Timestamp:      320,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{2},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: 3,
+				Timestamp:      480,
+				SSRC:           ssrc,
+			},
+			Payload: []byte{3},
+		},
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		for i := range packets {
+			if err := rtpSessWrite.Sess.WriteRTP(&packets[i]); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	buf := make([]byte, RTPBufSize)
+	for i := range packets {
+		var pkt rtp.Packet
+		n, err := rtpSessRead.ReadRTP(buf, &pkt)
+		require.NoError(t, err)
+		require.Positive(t, n)
+		assert.Equal(t, packets[i].PayloadType, pkt.PayloadType)
+		assert.Equal(t, packets[i].SequenceNumber, pkt.SequenceNumber)
+	}
+	require.NoError(t, <-writeDone)
+
+	stats := rtpSessRead.ReadStats()
+	assert.EqualValues(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
+	assert.EqualValues(t, 3, stats.PacketsCount)
+	assert.EqualValues(t, 3, stats.OctetCount)
+}
+
+func TestRTPSessionReadPassesAuxiliaryOnAudioSSRC(t *testing.T) {
+	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
+	rtpSessRead.Sess.Codecs = append(rtpSessRead.Sess.Codecs, CodecTelephoneEvent8000, CodecComfortNoise8000)
+
+	const ssrc uint32 = 1234
+	pts := []uint8{
+		CodecTelephoneEvent8000.PayloadType, // before any audio
+		CodecAudioAlaw.PayloadType,
+		CodecTelephoneEvent8000.PayloadType, // mid-call DTMF
+		CodecComfortNoise8000.PayloadType,   // negotiated CN
+		CodecAudioAlaw.PayloadType,
+		CodecAudioUlaw.PayloadType, // supported audio codec changes also pass through
+		127,                        // unnegotiated payload remains rejected
+		CodecAudioAlaw.PayloadType,
+	}
+	packets := make([]rtp.Packet, len(pts))
+	for i, pt := range pts {
+		packets[i] = rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    pt,
+				SequenceNumber: uint16(i + 1),
+				Timestamp:      uint32(160 * (i + 1)),
+				SSRC:           ssrc,
+			},
+			Payload: []byte{byte(i + 1)},
+		}
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		for i := range packets {
+			if err := rtpSessWrite.Sess.WriteRTP(&packets[i]); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	buf := make([]byte, RTPBufSize)
+	for _, wantSequenceNumber := range []uint16{1, 2, 3, 4, 5, 6, 8} {
+		var pkt rtp.Packet
+		n, err := rtpSessRead.ReadRTP(buf, &pkt)
+		require.NoError(t, err)
+		require.Positive(t, n)
+		assert.Equal(t, wantSequenceNumber, pkt.SequenceNumber)
+	}
+	require.NoError(t, <-writeDone)
+
+	stats := rtpSessRead.ReadStats()
+	assert.EqualValues(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
+	assert.EqualValues(t, 7, stats.PacketsCount)
+}
+
+func TestRTPSessionReadSupportedClockRateChanges(t *testing.T) {
+	sess := fakeSession(9876, 1234, nil, nil, nil, nil)
+	t.Cleanup(sess.rtcpTicker.Stop)
+	codec16k := Codec{Name: "custom-format", PayloadType: 112, SampleRate: 16000}
+	sess.Sess.Codecs = append(sess.Sess.Codecs, codec16k, CodecTelephoneEvent8000)
+
+	start := time.Unix(0, 0)
+	for i, a := range []struct {
+		codec     Codec
+		timestamp uint32
+	}{
+		{CodecAudioAlaw, 0},
+		{CodecAudioUlaw, 160},
+		{codec16k, 10000},
+		{codec16k, 10320},
+		{CodecTelephoneEvent8000, 777},
+		{CodecAudioAlaw, 937},
+	} {
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version: 2, PayloadType: a.codec.PayloadType, SequenceNumber: uint16(i + 1),
+				Timestamp: a.timestamp, SSRC: 1234,
+			},
+			Payload: []byte{1},
+		}
+		require.True(t, sess.updateReadStats(pkt, pkt.MarshalSize(), start.Add(time.Duration(i)*20*time.Millisecond)))
+		stats := sess.ReadStats()
+		assert.Equal(t, a.codec.SampleRate, stats.SampleRate)
+		assert.EqualValues(t, i+1, stats.PacketsCount)
+		assert.Zero(t, stats.jitter)
+	}
+}
+
+func TestRTPSessionReadRejectsUnnegotiatedPayloadAfterSenderReport(t *testing.T) {
+	sess := fakeSession(9876, 1234, nil, nil, nil, nil)
+	t.Cleanup(sess.rtcpTicker.Stop)
+	sess.Sess.Codecs = []Codec{CodecAudioAlaw} // Only PCMA (PT 8) is negotiated.
+
+	// RTCP can establish the SSRC before the first RTP packet arrives.
+	const ssrc uint32 = 1234
+	sess.readRTCPPacket(&rtcp.SenderReport{SSRC: ssrc})
+	require.Equal(t, ssrc, sess.ReadStats().SSRC)
+
+	// PCMU (PT 0) matches the zero-valued payload cache, but has never been
+	// validated. A known SSRC must not let this unnegotiated payload through.
+	pkt := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: 1, SSRC: ssrc},
+		Payload: []byte{1},
+	}
+	assert.False(t, sess.updateReadStats(pkt, pkt.MarshalSize(), time.Unix(0, 0)), "unnegotiated PT 0 must be rejected")
+	assert.Zero(t, sess.ReadStats().PacketsCount, "rejected RTP must not be counted")
+}
+
+func TestRTPSessionReadTelephoneEvents(t *testing.T) {
+	checkTelephoneEvents := func(t *testing.T, codec Codec, audioPackets int, negotiated bool, wantDigits string) {
+		t.Helper()
+		events := RTPDTMFEncode8000('5')
+
+		// Each reader holds one datagram; MultiReader returns one packet per Read.
+		var packets []io.Reader
+		addPacket := func(pt uint8, timestamp uint32, marker bool, payload []byte) {
+			pkt := rtp.Packet{
+				Header: rtp.Header{
+					Version: 2, PayloadType: pt, SequenceNumber: uint16(len(packets) + 1),
+					Timestamp: timestamp, SSRC: 1234, Marker: marker,
+				},
+				Payload: payload,
+			}
+			raw, err := pkt.Marshal()
+			require.NoError(t, err)
+			packets = append(packets, bytes.NewReader(raw))
+		}
+		for i := 0; i < audioPackets; i++ {
+			addPacket(CodecAudioAlaw.PayloadType, uint32(i*160), i == 0, []byte{1})
+		}
+		timestamp := uint32(audioPackets * 160)
+		for i, event := range events {
+			addPacket(codec.PayloadType, timestamp, i == 0, DTMFEncode(event))
+		}
+		addPacket(CodecAudioAlaw.PayloadType, timestamp+800, true, []byte{1})
+
+		read := fakeSession(9876, 1234, io.MultiReader(packets...), nil, nil, nil)
+		t.Cleanup(read.rtcpTicker.Stop)
+		if negotiated {
+			read.Sess.Codecs = append(read.Sess.Codecs, codec)
+		}
+		packetReader := NewRTPPacketReaderSession(read)
+		dtmfReader := NewRTPDTMFReader(codec, packetReader, packetReader)
+
+		var digits string
+		buf := make([]byte, RTPBufSize)
+		for {
+			_, err := dtmfReader.Read(buf)
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			if digit, ok := dtmfReader.ReadDTMF(); ok {
+				digits += string(digit)
+			}
+		}
+		assert.Equal(t, wantDigits, digits)
+		wantPackets := audioPackets + 1
+		if negotiated {
+			wantPackets += len(events)
+		}
+		stats := read.ReadStats()
+		assert.EqualValues(t, wantPackets, stats.PacketsCount)
+		assert.Equal(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
+	}
+
+	t.Run("audio before DTMF", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 5, true, "5")
+	})
+
+	t.Run("DTMF before audio", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 0, true, "5")
+	})
+
+	t.Run("negotiated dynamic payload type", func(t *testing.T) {
+		codec := CodecTelephoneEvent8000
+		codec.PayloadType = 110
+		checkTelephoneEvents(t, codec, 5, true, "5")
+	})
+
+	t.Run("unnegotiated telephone-event", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 5, false, "")
+	})
+}
+
+func TestRTPSessionJitter(t *testing.T) {
+	type arrival struct {
+		pt        uint8
+		timestamp uint32
+		ms        int
+		marker    bool
+		jitter    float64
+	}
+	checkJitter := func(t *testing.T, arrivals []arrival) {
+		t.Helper()
+		sess := fakeSession(9876, 1234, nil, nil, nil, nil)
+		t.Cleanup(sess.rtcpTicker.Stop)
+		sess.Sess.Codecs = append(sess.Sess.Codecs, CodecTelephoneEvent8000)
+		start := time.Unix(0, 0)
+		for i, a := range arrivals {
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version: 2, PayloadType: a.pt, SequenceNumber: uint16(i + 1),
+					Timestamp: a.timestamp, SSRC: 1, Marker: a.marker,
+				},
+				Payload: []byte{1},
+			}
+			now := start.Add(time.Duration(a.ms) * time.Millisecond)
+			require.True(t, sess.updateReadStats(pkt, pkt.MarshalSize(), now))
+			assert.InDelta(t, a.jitter, sess.readStats.jitter, 1e-9, "packet %d", i+1)
+		}
+		assert.EqualValues(t, len(arrivals), sess.ReadStats().PacketsCount)
+		var report rtcp.ReceptionReport
+		sess.parseReceptionReport(&report, start.Add(time.Second))
+		assert.EqualValues(t, uint32(arrivals[len(arrivals)-1].jitter), report.Jitter)
+	}
+
+	t.Run("telephone-event updates and end retransmissions", func(t *testing.T) {
+		// RFC 4733 section 2.5.2.2 includes packets with repeated
+		// timestamps in RTCP jitter. At 8 kHz, 20 ms is 160 ticks.
+		checkJitter(t, []arrival{
+			{8, 0, 0, false, 0},
+			{8, 160, 20, false, 0},
+			{101, 320, 40, true, 0},
+			{101, 320, 60, false, 10},
+			{101, 320, 80, false, 19.375},
+			{8, 800, 100, false, 38.1640625},
+		})
+	})
+
+	t.Run("telephone-event marker resets baseline", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, false, 0},
+			{8, 160, 20, false, 0},
+			{101, 320, 50, true, 0},
+			{8, 480, 60, false, 5},
+		})
+	})
+
+	t.Run("audio marker resets baseline", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, true, 0},
+			{8, 160, 20, false, 0},
+			{8, 320, 50, true, 0},
+			{8, 480, 60, false, 5},
+		})
+	})
+
+	t.Run("audio marker after paused stream", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, true, 0},
+			{8, 160, 20, false, 0},
+			{8, 320, 10000, true, 0},
+			{8, 480, 10020, false, 0},
+		})
+	})
+
+	t.Run("repeated event timestamp across clock wrap", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0xfffffff0, 0, false, 0},
+			{101, 0xfffffff0, 20, false, 10},
+			{8, 304, 40, false, 19.375},
+		})
+	})
+}
+
+func TestRTPSessionReadCodecChangesWithSSRC(t *testing.T) {
+	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
+	codec16k := Codec{
+		Name:        "test",
+		PayloadType: 96,
+		SampleRate:  16000,
+		NumChannels: 1,
+	}
+	rtpSessRead.Sess.Codecs = append(rtpSessRead.Sess.Codecs, codec16k)
+
+	packets := []rtp.Packet{
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: 1,
+				Timestamp:      160,
+				SSRC:           1234,
+			},
+			Payload: []byte{1},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    codec16k.PayloadType,
+				SequenceNumber: 2,
+				Timestamp:      320,
+				SSRC:           5678,
+			},
+			Payload: []byte{2},
+		},
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		for i := range packets {
+			if err := rtpSessWrite.Sess.WriteRTP(&packets[i]); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	buf := make([]byte, RTPBufSize)
+	for i := range packets {
+		var pkt rtp.Packet
+		n, err := rtpSessRead.ReadRTP(buf, &pkt)
+		require.NoError(t, err)
+		require.Positive(t, n)
+		assert.Equal(t, packets[i].SSRC, pkt.SSRC)
+		assert.Equal(t, packets[i].PayloadType, pkt.PayloadType)
+	}
+	require.NoError(t, <-writeDone)
+
+	stats := rtpSessRead.ReadStats()
+	assert.Equal(t, packets[1].SSRC, stats.SSRC)
+	assert.EqualValues(t, codec16k.SampleRate, stats.SampleRate)
+	assert.EqualValues(t, 1, stats.PacketsCount)
+	assert.EqualValues(t, 1, stats.OctetCount)
+}
+
 func TestRTPSessionReading(t *testing.T) {
 	// pipeRTP := bytes.NewBuffer([]byte{})
 
@@ -78,9 +543,7 @@ func TestRTPSessionReading(t *testing.T) {
 	}
 
 	rtpWriter := NewRTPPacketWriterSession(rtpSessWrite)
-	writeDone := make(chan struct{})
 	go func() {
-		defer close(writeDone)
 		// Setup remote session
 		// defer rtpWrite.Sess.Close()
 
@@ -105,14 +568,6 @@ func TestRTPSessionReading(t *testing.T) {
 		if err != nil {
 			break
 		}
-	}
-
-	// The writer still logs the last packet and waits a packet clock tick after
-	// the pipe hands it over, so it outlives the last read.
-	select {
-	case <-writeDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("RTP writer did not finish")
 	}
 
 	// stream pkts + 3 -1 as increase of seq number
@@ -152,9 +607,7 @@ func TestRTPSessionWriting(t *testing.T) {
 	}
 
 	rtpReader := NewRTPPacketReaderSession(rtpSessRead)
-	readDone := make(chan struct{})
 	go func() {
-		defer close(readDone)
 		readBuf := make([]byte, 1500)
 		for i := 0; i < len(rtpStream); i++ {
 			_, err := rtpReader.Read(readBuf)
@@ -175,14 +628,6 @@ func TestRTPSessionWriting(t *testing.T) {
 
 		_, err := rtpWriter.Write(payload)
 		assert.NoError(t, err)
-	}
-
-	// The reader still logs and counts the last packet after the pipe hands it
-	// over, so it outlives the last write.
-	select {
-	case <-readDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("RTP reader did not finish")
 	}
 
 	// stream pkts + 3 -1 as increase of seq number
@@ -387,7 +832,7 @@ func TestRTPSessionFork(t *testing.T) {
 		sampleRate:          CodecAudioUlaw.SampleRate,
 	}
 
-	require.NoError(t, rtpSess.MonitorBackground(context.Background()))
+	require.NoError(t, rtpSess.MonitorBackground())
 	require.NoError(t, rtpSess.MonitorClose())
 
 	candidate := sess.Fork()
@@ -400,7 +845,7 @@ func TestRTPSessionFork(t *testing.T) {
 	// its first RTCP write succeeds on the shared deadline-aware connection.
 	fork.rtcpTicker.Stop()
 	fork.rtcpTicker = time.NewTicker(10 * time.Millisecond)
-	require.NoError(t, fork.MonitorBackground(context.Background()))
+	require.NoError(t, fork.MonitorBackground())
 	require.NoError(t, rtcpPeer.SetReadDeadline(time.Now().Add(time.Second)))
 	buf := make([]byte, 1500)
 	n, err := rtcpPeer.Read(buf)
@@ -461,9 +906,7 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
 	rtpSessRead.sourceLock = true // Enable source locking
 
-	writeDone := make(chan struct{})
 	go func() {
-		defer close(writeDone)
 		var seq uint16 = 1
 		for ; seq < 5; seq++ {
 			pkt := rtp.Packet{
@@ -481,260 +924,5 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	_, err := rtpSessRead.ReadRTP(make([]byte, 1600), &pkt)
 	require.NoError(t, err)
 
-	// The writer still logs and counts the last packet after the pipe hands it
-	// over, so it outlives the read.
-	select {
-	case <-writeDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("RTP writer did not finish")
-	}
-
 	assert.Equal(t, uint16(4), pkt.SequenceNumber)
-}
-
-// TestRTPSessionForkSourceLock pins that a fork keeps the RTP source it learned
-// only while it runs on the same socket toward the same peer. A re-INVITE that
-// moves the peer forks the session toward the new address, and the peer's
-// packets then come from there: the fork has to learn that source, and a lock
-// carried over from the old one refuses every packet the peer sends.
-func TestRTPSessionForkSourceLock(t *testing.T) {
-	oldPeer := net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4000}
-	newPeer := net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 5000}
-
-	// readFrom hands the session one packet from source and reports whether
-	// the session accepted it. A refused packet leaves the reader dry, so the
-	// read then ends with io.EOF.
-	readFrom := func(t *testing.T, rtpSess *RTPSession, conn *fakes.UDPConn, source net.UDPAddr, ssrc uint32, seq uint16) bool {
-		t.Helper()
-		raw, err := (&rtp.Packet{
-			Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: seq, SSRC: ssrc},
-			Payload: []byte{1, 2, 3},
-		}).Marshal()
-		require.NoError(t, err)
-		conn.ExpectAddr(source)
-		conn.Reader = bytes.NewReader(raw)
-
-		_, err = rtpSess.ReadRTP(make([]byte, RTPBufSize), &rtp.Packet{})
-		if errors.Is(err, io.EOF) {
-			return false
-		}
-		require.NoError(t, err)
-		return true
-	}
-
-	// lockedSession is a session that has learned oldPeer as its source.
-	lockedSession := func(t *testing.T) (*RTPSession, *fakes.UDPConn) {
-		t.Helper()
-		conn := &fakes.UDPConn{}
-		sess := &MediaSession{
-			Codecs:  []Codec{CodecAudioUlaw},
-			Mode:    sdp.ModeSendrecv,
-			Laddr:   net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
-			rtpConn: conn,
-		}
-		sess.SetRemoteAddr(&oldPeer)
-		rtpSess := NewRTPSession(sess)
-		rtpSess.sourceLock = true
-
-		for seq := uint16(1); seq < 4; seq++ {
-			require.False(t, readFrom(t, rtpSess, conn, oldPeer, 1111, seq), "packet %d is still learning", seq)
-		}
-		require.True(t, readFrom(t, rtpSess, conn, oldPeer, 1111, 4), "the fourth packet in sequence locks the source")
-		return rtpSess, conn
-	}
-
-	t.Run("fork toward a moved peer learns its source", func(t *testing.T) {
-		rtpSess, conn := lockedSession(t)
-		candidate := rtpSess.Sess.Fork()
-		candidate.SetRemoteAddr(&newPeer)
-		fork := rtpSess.Fork(candidate)
-
-		// The moved peer's stream has a sequence of its own.
-		accepted := 0
-		for seq := uint16(30000); seq < 30010; seq++ {
-			if readFrom(t, fork, conn, newPeer, 2222, seq) {
-				accepted++
-			}
-		}
-		assert.Equal(t, 7, accepted, "the new source is learned from four packets in sequence and accepted after")
-	})
-
-	t.Run("fork toward the same peer keeps the lock", func(t *testing.T) {
-		rtpSess, conn := lockedSession(t)
-		candidate := rtpSess.Sess.Fork()
-		candidate.SetRemoteAddr(&oldPeer)
-		fork := rtpSess.Fork(candidate)
-
-		assert.True(t, readFrom(t, fork, conn, oldPeer, 1111, 5), "the locked source is accepted at once")
-		for seq := uint16(30000); seq < 30010; seq++ {
-			assert.False(t, readFrom(t, fork, conn, newPeer, 2222, seq), "another source stays refused")
-		}
-	})
-}
-
-// TestRTPSessionWriteUnknownPayloadType asserts the session survives a write with
-// a payload type that is not in the codec list. The lookup failure must release
-// the RTCP lock it took, so a later write can still make progress.
-func TestRTPSessionWriteUnknownPayloadType(t *testing.T) {
-	rtpSess := fakeSession(9876, 1234, nil, &bytes.Buffer{}, nil, &bytes.Buffer{})
-	rtpSess.rtcpTicker = time.NewTicker(time.Hour) // DO NOT TICK
-
-	pkt := rtp.Packet{
-		Header: rtp.Header{
-			Version:     2,
-			PayloadType: 111, // not in Codecs
-			SSRC:        1234,
-		},
-		Payload: []byte{1, 2, 3},
-	}
-
-	err := rtpSess.WriteRTP(&pkt)
-	require.Error(t, err)
-
-	// The failed write must not have left rtcpMU held.
-	done := make(chan error, 1)
-	go func() {
-		done <- rtpSess.WriteRTP(&pkt)
-	}()
-
-	select {
-	case err := <-done:
-		require.Error(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("WriteRTP blocked on rtcpMU held by the previous failed write")
-	}
-}
-
-// readOneRTP feeds pkt to a session and returns what ReadRTP made of it.
-func readOneRTP(t *testing.T, rtpSess *RTPSession, pkt *rtp.Packet) (int, *rtp.Packet) {
-	t.Helper()
-	raw, err := pkt.Marshal()
-	require.NoError(t, err)
-
-	rtpSess.Sess.rtpConn.(*fakes.UDPConn).Reader = bytes.NewReader(raw)
-
-	readPkt := rtp.Packet{}
-	n, err := rtpSess.ReadRTP(make([]byte, 1600), &readPkt)
-	require.NoError(t, err)
-	return n, &readPkt
-}
-
-func negotiatedRTPSession(t *testing.T) *RTPSession {
-	t.Helper()
-	rtpSess := fakeSession(9876, 1234, nil, &bytes.Buffer{}, nil, &bytes.Buffer{})
-	rtpSess.rtcpTicker = time.NewTicker(time.Hour) // DO NOT TICK
-
-	// We offered opus at our own 96, the peer answered with 111, so 111 is what
-	// goes on the wire in both directions.
-	opus96 := CodecAudioOpus
-	opus111 := CodecAudioOpus
-	opus111.PayloadType = 111
-
-	rtpSess.Sess.Codecs = []Codec{opus96, CodecTelephoneEvent8000}
-	rtpSess.Sess.filterCodecs = []Codec{opus111}
-	return rtpSess
-}
-
-// The read path must accept the payload type negotiation settled on. Gating on
-// the local codec list dropped every packet of a call whose dynamic format the
-// peer numbered differently (RFC 3551 section 3, RFC 3264 section 6.1), and the
-// guard returned before recording the SSRC, so it re-fired on each packet: a
-// permanent one way blackhole with no error raised anywhere.
-func TestRTPSessionReadGatesOnNegotiatedCodecs(t *testing.T) {
-	rtpSess := negotiatedRTPSession(t)
-
-	pkt := &rtp.Packet{
-		Header:  rtp.Header{Version: 2, PayloadType: 111, SSRC: 111222, SequenceNumber: 1},
-		Payload: make([]byte, 20),
-	}
-	n, readPkt := readOneRTP(t, rtpSess, pkt)
-
-	require.NotZero(t, n, "the negotiated payload type must be read, not dropped")
-	assert.EqualValues(t, 111, readPkt.PayloadType)
-
-	stats := rtpSess.ReadStats()
-	assert.EqualValues(t, 111222, stats.SSRC, "the source must be recorded, or the guard re-fires per packet")
-	assert.EqualValues(t, 48000, stats.SampleRate, "stats must carry opus' clock, resolved from the negotiated codec")
-}
-
-// A payload type that is in the local list but was not negotiated is not part of
-// this session and must not be accepted.
-func TestRTPSessionReadRejectsUnnegotiatedPayloadType(t *testing.T) {
-	rtpSess := negotiatedRTPSession(t)
-
-	// 96 is our local opus constant, but the peer numbered opus 111.
-	pkt := &rtp.Packet{
-		Header:  rtp.Header{Version: 2, PayloadType: 96, SSRC: 111222, SequenceNumber: 1},
-		Payload: make([]byte, 20),
-	}
-	n, _ := readOneRTP(t, rtpSess, pkt)
-	assert.Zero(t, n, "96 was never negotiated for this session")
-}
-
-// Before negotiation there is nothing to filter on, so the local list stands.
-// Fork clones Codecs but deliberately not filterCodecs, so a re-INVITE lands
-// here too and must not go silent.
-func TestRTPSessionReadFallsBackToLocalCodecsBeforeNegotiation(t *testing.T) {
-	rtpSess := fakeSession(9876, 1234, nil, &bytes.Buffer{}, nil, &bytes.Buffer{})
-	rtpSess.rtcpTicker = time.NewTicker(time.Hour)
-	rtpSess.Sess.Codecs = []Codec{CodecAudioAlaw}
-	require.Empty(t, rtpSess.Sess.filterCodecs)
-
-	pkt := &rtp.Packet{
-		Header:  rtp.Header{Version: 2, PayloadType: 8, SSRC: 111222, SequenceNumber: 1},
-		Payload: make([]byte, 160),
-	}
-	n, _ := readOneRTP(t, rtpSess, pkt)
-	assert.NotZero(t, n, "with no negotiated set the local codecs must still be honoured")
-}
-
-// The write path resolves the codec for its statistics from the same set.
-func TestRTPSessionWriteGatesOnNegotiatedCodecs(t *testing.T) {
-	rtpSess := negotiatedRTPSession(t)
-
-	pkt := rtp.Packet{
-		Header:  rtp.Header{Version: 2, PayloadType: 111, SSRC: 1234},
-		Payload: []byte{1, 2, 3},
-	}
-	require.NoError(t, rtpSess.WriteRTP(&pkt), "writing the negotiated payload type must not fail")
-	assert.EqualValues(t, 48000, rtpSess.WriteStats().sampleRate)
-}
-
-// TestRTPSessionMonitorEndsWithCtx pins that the RTCP monitors return when the
-// ctx they run on ends, with no MonitorClose and while the sockets stay open.
-func TestRTPSessionMonitorEndsWithCtx(t *testing.T) {
-	rtpConn, rtpPeer := net.Pipe()
-	rtcpConn, rtcpPeer := net.Pipe()
-	t.Cleanup(func() {
-		_ = rtpConn.Close()
-		_ = rtpPeer.Close()
-		_ = rtcpConn.Close()
-		_ = rtcpPeer.Close()
-	})
-
-	sess := &MediaSession{
-		Codecs:    []Codec{CodecAudioUlaw},
-		Mode:      sdp.ModeSendrecv,
-		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
-		Raddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9876},
-		rtcpRaddr: net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9877},
-		rtpConn:   &pipePacketConn{Conn: rtpConn},
-		rtcpConn:  &pipePacketConn{Conn: rtcpConn},
-	}
-	rtpSess := NewRTPSession(sess)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	require.NoError(t, rtpSess.MonitorBackground(ctx))
-	cancel()
-
-	done := make(chan struct{})
-	go func() {
-		rtpSess.monitorWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RTCP monitors still running after their ctx ended")
-	}
 }

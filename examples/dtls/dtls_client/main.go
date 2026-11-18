@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,7 +14,6 @@ import (
 	"github.com/emiago/diago/audio"
 	"github.com/emiago/diago/examples"
 	"github.com/emiago/diago/media"
-	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
@@ -30,19 +28,12 @@ func main() {
 	dg := diago.NewDiago(ua,
 		diago.WithTransport(
 			diago.Transport{
-				ID:        "tcp",
-				Transport: "tcp",
-				BindHost:  "127.0.0.1",
-				BindPort:  16441,
-				MediaSRTP: 2, // USE DTLS
-				// The caller offers actpass (RFC 5763 section 5), so it acts as
-				// the DTLS server when the answer takes active, which needs a
-				// certificate. It asks for the peer's to check it against the
-				// answer's a=fingerprint.
-				MediaDTLSConf: media.DTLSConfig{
-					Certificates:     []tls.Certificate{testdata.ClientCertificate()},
-					ServerClientAuth: media.ServerClientAuthRequireCert,
-				},
+				ID:            "tcp",
+				Transport:     "tcp",
+				BindHost:      "127.0.0.1",
+				BindPort:      16441,
+				MediaSRTP:     2, // USE DTLS
+				MediaDTLSConf: media.DTLSConfig{},
 			},
 		),
 		diago.WithMediaConfig(
@@ -54,17 +45,18 @@ func main() {
 	// err = dg.ServeBackground(ctx)
 	// require.NoError(t, err)
 
-	d, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, diago.InviteOptions{Transport: "tcp"})
+	d, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, diago.InviteOptions{Transport: "tcp"})
 	if err != nil {
 		panic(err)
 	}
 	defer d.Close()
+	defer med.Close()
 	defer d.Hangup(d.Context())
 
 	ulaw := make([]byte, 160)
 
-	r, _ := d.AudioReader()
-	w, _ := d.AudioWriter()
+	r, _ := med.AudioReader()
+	w, _ := med.AudioWriter()
 	time.Sleep(1 * time.Second)
 
 	go func() {

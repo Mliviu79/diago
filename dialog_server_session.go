@@ -7,10 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math/rand/v2"
+	mrand "math/rand/v2"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,90 +25,22 @@ type OnReferDialogFunc func(referDialog *DialogClientSession) error
 type DialogServerSession struct {
 	*sipgo.DialogServerSession
 
-	// MediaSession *media.MediaSession
-	DialogMedia
-
-	onReferDialog OnReferDialogFunc
+	dialogCallbacks
 
 	mediaConf MediaConfig
-
-	// sessionTimers is the RFC 4028 policy stamped from dg.sessionTimers at
-	// construction. It is consumed by the answer path.
-	sessionTimers SessionTimerPolicy
-	// timerAnswer holds the negotiated timer outcome for this answer, nil until a
-	// timer-supporting peer is negotiated. Guarded by d.mu.
-	timerAnswer *timerAnswer
-	// timer is the running session timer, set once by the 2xx that answered
-	// the INVITE with one, and nil without one.
-	timer atomic.Pointer[sessionTimer]
-	// log is the logger of the Diago that made this dialog.
-	log *slog.Logger
-	// answering is set by an answer before it sends its 2xx, and closed when
-	// that answer returns: after the ACK is read and, for an answer that sets
-	// up its media after the ACK, after that too. awaitAnswer waits on it.
-	// Guarded by d.mu.
-	answering chan struct{}
-	// ackAnswerErr is why the answer an ACK carried to the offer in our 2xx
-	// could not be applied or keyed. ReadAck sets it before the ACK confirms
-	// the dialog, for the answer waiting on that ACK to report. Guarded by
-	// d.mu.
-	ackAnswerErr error
-	// ackCarriesAnswer is set by AnswerLate before its 2xx, which carries our
-	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
-	// section 13.2.1). Guarded by d.mu.
-	ackCarriesAnswer bool
-	// earlyAnswerSDP is the answer the 183 of ProgressMedia carried, which the
-	// 200 repeats: RFC 3261 section 13.2.1 has the answer placed in a
-	// provisional response be that same exact answer. LocalSDP would change it,
-	// at least in its o= version, and cannot read the media session while a
-	// handshake ProgressMedia left running uses it. Guarded by d.mu.
-	earlyAnswerSDP []byte
-	// earlyUnkeyed is set when ProgressMedia returned ErrEarlyMediaNotKeyed.
-	// Guarded by d.mu.
-	earlyUnkeyed bool
-
-	// terminatingBye holds the BYE request that ended this dialog, captured by
-	// ReadBye for read-only inspection. Without it the BYE is unrecoverable:
-	// ReadBye answers 200 and drops the request, so an application observes the
-	// ending only as a Context() cancel and cannot see a cause the peer stated
-	// for itself, such as an RFC 3326 Reason header.
-	//
-	// nil until a remote BYE arrives. A local Hangup, a transport death or a
-	// cancel all leave it nil, which is the truthful "the peer stated no cause".
-	terminatingBye atomic.Pointer[sip.Request]
-
-	// answers counts the answers still running from their 2xx on, each on a
-	// goroutine of the dialog's (answerWithin). Close waits for them.
-	answers sync.WaitGroup
-
-	closed atomic.Uint32
-}
-
-// TerminatingBye returns the BYE request that ended this dialog, or nil when the
-// dialog was not ended by a remote BYE or has not ended yet. The request is
-// read-only; callers must not mutate it.
-//
-// Safe to call from any goroutine. The store happens before the dialog moves to
-// DialogStateEnded, so an observer that reacts to Context() being done sees it.
-func (d *DialogServerSession) TerminatingBye() *sip.Request {
-	return d.terminatingBye.Load()
+	closed    atomic.Uint32
 }
 
 func (d *DialogServerSession) Id() string {
 	return d.ID
 }
 
-// Close releases the dialog's media and the dialog. It first waits for an
-// answer still running from its 2xx on, which an answer whose caller stopped
-// waiting leaves (AnswerContext): that wait is bounded by the ACK wait of
-// 64*T1, the media setup that follows the ACK, and the BYE that ends such a
-// call, bounded by its transaction's Timer F.
 func (d *DialogServerSession) Close() error {
 	if !d.closed.CompareAndSwap(0, 1) {
 		return nil
 	}
-	d.answers.Wait()
-	e1 := d.DialogMedia.Close()
+
+	e1 := d.closeCallbacks()
 	e2 := d.DialogServerSession.Close()
 	return errors.Join(e1, e2)
 }
@@ -140,110 +71,72 @@ func (d *DialogServerSession) Progress(ctx context.Context) error {
 
 // ProgressMedia sends 183 Session Progress and creates early media
 //
-// For DTLS-SRTP it returns once the caller has keyed the early media, or
-// ErrEarlyMediaNotKeyed when the caller has not within
-// ProgressMediaOptions.KeyTimeout.
-//
 // Experimental: Naming of API might change
-func (d *DialogServerSession) ProgressMedia(ctx context.Context) error {
-	return d.ProgressMediaOptions(ctx, ProgressMediaOptions{})
-}
-
 type ProgressMediaOptions struct {
 	// Codecs that will be used
 	Codecs []media.Codec
 
 	// RTPNAT exposes MediaSession property
 	RTPNAT int
-
-	// KeyTimeout bounds how long a DTLS-SRTP ProgressMedia waits for the
-	// caller to key the early media, by completing the ICE connectivity checks
-	// and the DTLS handshake with us, before it returns ErrEarlyMediaNotKeyed.
-	// Zero means five seconds, for the reasons defaultEarlyMediaKeyTimeout
-	// gives. It bounds the wait only: the handshake goes on, for Answer to
-	// complete after the 200.
-	KeyTimeout time.Duration
 }
 
-// defaultEarlyMediaKeyTimeout is how long ProgressMedia waits for a caller to
-// key DTLS-SRTP early media when ProgressMediaOptions leaves it unset.
-//
-// A caller that takes the answer in the 183 keys it within a few round trips:
-// a DTLS 1.2 handshake with a cookie exchange is three, about a second on a 300
-// ms path, and ICE adds its checks ahead of it. Five seconds also covers two
-// lost flights, whose retransmission timers start at one second and double
-// (RFC 6347 section 4.2.4.1). A caller that ignores the 183 (RFC 3960) never
-// keys it, and costs the application this long before it learns early media is
-// not available. Too short a bound costs only the early media, never the call,
-// since the handshake is not abandoned with the wait.
-const defaultEarlyMediaKeyTimeout = 5 * time.Second
+func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMediaOptions) (*DialogMedia, error) {
+	codecs := opts.Codecs
+	rtpNAT := opts.RTPNAT
 
-// ErrEarlyMediaNotKeyed is returned by ProgressMedia when the caller did not key
-// DTLS-SRTP early media within ProgressMediaOptions.KeyTimeout, most likely
-// because it ignores early media (RFC 3960) and takes part in the DTLS
-// handshake only once the call is answered.
-//
-// The call stays answerable. The dialog has no early media, so no audio reader
-// or writer, and its media session refuses to send with media.ErrDTLSNotKeyed;
-// nothing may use it before Answer. Answer sends the 200 and then completes the
-// handshake ProgressMedia started, bounded by the call and by
-// media.DTLSHandshakeTimeout, before it sets the media up. When that handshake
-// has failed by then, Answer declines the call 488 instead.
-var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has not completed the DTLS handshake")
+	conf := d.mediaConf
+	// Let override of formats
+	if codecs != nil {
+		conf.Codecs = codecs
+	}
+	conf.rtpNAT = rtpNAT
+
+	med := &DialogMedia{}
+
+	err := func() error {
+		if err := med.initMediaSessionFromConf(conf); err != nil {
+			return err
+		}
+
+		rtpSess := media.NewRTPSession(med.mediaSession)
+		if err := med.setupRTPSession(d.InviteRequest.Body(), rtpSess); err != nil {
+			return err
+		}
+
+		headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
+		body := rtpSess.Sess.LocalSDP(true)
+		if err := d.DialogServerSession.Respond(ctx, 183, "Session Progress", body, headers...); err != nil {
+			return err
+		}
+		med.registerDialogCallbacks(&d.dialogCallbacks)
+		return rtpSess.MonitorBackground()
+	}()
+	return med, err
+}
 
 func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt ProgressMediaOptions) error {
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
-	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
+	med := &DialogMedia{}
+	if err := med.initMediaSessionFromConf(d.mediaConf); err != nil {
 		return err
 	}
-	sess := d.mediaSession
-	offer := d.InviteRequest.Body()
-	if offer == nil {
+	rtpSess := media.NewRTPSession(med.mediaSession)
+	sdp := d.InviteRequest.Body()
+	if sdp == nil {
 		return fmt.Errorf("no sdp present in INVITE")
 	}
-	if err := sess.RemoteSDP(offer); err != nil {
+
+	if err := med.setupRTPSession(sdp, rtpSess); err != nil {
 		return err
 	}
 
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
-	body := sess.LocalSDP()
+	body := rtpSess.Sess.LocalSDP(true)
 	if err := d.DialogServerSession.Respond(ctx, 183, "Session Progress", body, headers...); err != nil {
 		return err
 	}
-
-	// The 183 carries our answer. A caller that treats it as the answer (RFC
-	// 3261 section 13.2.1) keys the early media with us: we take setup:active
-	// and start the DTLS handshake at once (RFC 5763 section 6.2), and no media
-	// may go out before it completes (RFC 5764 section 5.1). A caller may also
-	// ignore early media (RFC 3960) and take part only after the 200, so the
-	// wait is bounded by KeyTimeout, and by the dialog when the caller gives
-	// up.
-	//
-	// The handshake is not abandoned with the wait. The ClientHellos already
-	// sent wait on the caller's socket until its DTLS stack reads them after
-	// the 200: it completes this association from them, and fails a new one
-	// they are read ahead of. Answer waits for it instead.
-	keyTimeout := opt.KeyTimeout
-	if keyTimeout <= 0 {
-		keyTimeout = defaultEarlyMediaKeyTimeout
-	}
-	if err := sess.FinalizeWithin(d.Context(), keyTimeout); err != nil {
-		if errors.Is(err, media.ErrFinalizeInProgress) {
-			d.mu.Lock()
-			d.earlyAnswerSDP = body
-			d.earlyUnkeyed = true
-			d.mu.Unlock()
-			return ErrEarlyMediaNotKeyed
-		}
-		return err
-	}
-
-	rtpSess := media.NewRTPSession(sess)
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	d.earlyAnswerSDP = body
-	d.mu.Unlock()
-	return rtpSess.MonitorBackground(d.Context())
+	med.registerDialogCallbacks(&d.dialogCallbacks)
+	return rtpSess.MonitorBackground()
 }
 
 func (d *DialogServerSession) Ringing(ctx context.Context) error {
@@ -255,432 +148,20 @@ func (d *DialogServerSession) DialogSIP() *sipgo.Dialog {
 }
 
 func (d *DialogServerSession) RemoteContact() *sip.ContactHeader {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.remoteContactTarget != nil {
-		return d.remoteContactTarget
-	}
-	return d.InviteRequest.Contact()
+	return d.remoteContact(d.InviteRequest.Contact())
 }
 
-// statusSessionIntervalTooSmall is the RFC 4028 §6 rejection for an offered
-// Session-Expires below the Min-SE floor. sipgo carries no constant for it.
-const statusSessionIntervalTooSmall = 422
-
-// errSessionIntervalTooSmall aborts the answer when the offered Session-Expires
-// is below the Min-SE floor. A 422 has already been sent to the peer.
-var errSessionIntervalTooSmall = errors.New("session interval too small")
-
-// errAckCarriesNoAnswer ends a call whose 2xx carried our offer when the ACK
-// confirming the dialog brings no answer to it: RFC 3261 section 13.2.1 has the
-// answer in that ACK.
-var errAckCarriesNoAnswer = errors.New("the ACK to the 2xx carrying our offer carries no answer")
-
-// timerAnswer is the negotiated RFC 4028 outcome for a single answer: the
-// headers to append to the 200 OK and the session timer it starts. It is
-// computed before RespondSDP and consumed once the 200 OK is sent.
-type timerAnswer struct {
-	headers   []sip.Header
-	weRefresh bool
-	expiry    time.Duration
-	// minSE is the Min-SE the INVITE carried, zero when it carried none.
-	minSE time.Duration
-}
-
-// buildTimerAnswer is the pure UAS answer-path decision for RFC 4028 session
-// timers. Given the offered INVITE and our policy it returns the headers to add
-// to the 200 OK (or the Min-SE header for a 422) and the response status. It
-// keeps every SIP-transaction dependency out so the decision is unit testable
-// without a PBX.
-//
-//   - timers disabled, or the peer offered no Session-Expires (timer-unaware) →
-//     no headers, status 200, nil answer: a graceful no-op, never a rejection.
-//   - offered Session-Expires below the floor → status 422 plus Min-SE, nil
-//     answer, so no media, no loop and no watchdog.
-//   - otherwise → Session-Expires with the honored refresher plus Supported:
-//     timer, and Require: timer when the refresher is uac (RFC 4028 section 9:
-//     the UAC must process the 2xx to know it refreshes), and an answer that
-//     either refreshes or arms the watchdog.
-func buildTimerAnswer(invite *sip.Request, policy SessionTimerPolicy) (ta *timerAnswer, hdrs []sip.Header, status int) {
-	if !policy.Enabled {
-		return nil, nil, sip.StatusOK
-	}
-
-	offer, ok := parseSessionTimerOffer(invite)
-	if !ok {
-		// Timer-unaware peer: answer normally with no timer headers, start nothing.
-		return nil, nil, sip.StatusOK
-	}
-
-	dec := negotiate(offer.SE, offer.MinSE, offer.Refresher, policy, refresherUAS)
-
-	if dec.BelowFloor {
-		// RFC 4028 §6: reject below-floor and echo our Min-SE, establishing nothing.
-		return nil, []sip.Header{sip.NewHeader("Min-SE", secondsOf(dec.Negotiated))}, statusSessionIntervalTooSmall
-	}
-
-	seValue := secondsOf(dec.Negotiated)
-	if dec.Refresher != "" {
-		seValue += ";refresher=" + dec.Refresher
-	}
-	hdrs = []sip.Header{
-		sip.NewHeader("Session-Expires", seValue),
-		sip.NewHeader("Supported", "timer"),
-	}
-	if dec.Refresher == refresherUAC {
-		hdrs = append(hdrs, sip.NewHeader("Require", "timer"))
-	}
-	// We refresh when we are the elected refresher, otherwise the peer refreshes
-	// and the timer ends a session the peer stops refreshing.
-	ta = &timerAnswer{
-		headers:   hdrs,
-		weRefresh: dec.WeRefresh,
-		expiry:    dec.Negotiated,
-	}
-	if offer.MinSE != nil {
-		ta.minSE = time.Duration(*offer.MinSE) * time.Second
-	}
-	return ta, hdrs, sip.StatusOK
-}
-
-// prepareSessionTimers negotiates RFC 4028 session timers for the answer. On a
-// below-floor offer it sends 422 with Min-SE and returns
-// errSessionIntervalTooSmall so the caller aborts before any media, loop or
-// watchdog; the 422 waits for its ACK within ctx, see answerWithin. Otherwise it stashes the timer headers, which RespondSDP appends to
-// the 200 OK, along with the launch parameters. A timer-unaware peer or a
-// disabled policy leaves d.timerAnswer nil, a graceful no-op.
-func (d *DialogServerSession) prepareSessionTimers(ctx context.Context) error {
-	ta, hdrs, status := buildTimerAnswer(d.InviteRequest, d.sessionTimers)
-	if status == statusSessionIntervalTooSmall {
-		err := d.answerWithin(ctx, make(chan struct{}), func() error {
-			return d.Respond(d.Context(), statusSessionIntervalTooSmall, "Session Interval Too Small", nil, hdrs...)
-		})
-		if err != nil {
-			return err
-		}
-		return errSessionIntervalTooSmall
-	}
-	if ta == nil {
-		return nil
-	}
-	d.mu.Lock()
-	d.timerAnswer = ta
-	d.mu.Unlock()
-	return nil
-}
-
-// launchSessionTimers starts the RFC 4028 timer the 2xx that answered the
-// INVITE set, exactly once. Its goroutine runs on d.Context(), so the end of
-// the dialog ends it: it refreshes the session while we are the refresher and
-// ends the call when the peer is and lets the session expire.
-func (d *DialogServerSession) launchSessionTimers(ta *timerAnswer) {
-	t := newSessionTimer(d.sessionTimers, sessionTimerState{
-		active:    true,
-		expires:   ta.expiry,
-		weRefresh: ta.weRefresh,
-		minSE:     ta.minSE,
-	})
-	if !d.timer.CompareAndSwap(nil, t) {
-		return
-	}
-	go t.run(d.Context(), func(ctx context.Context) refreshOutcome {
-		return d.refreshSession(ctx, t)
-	}, d.expireSession)
-}
-
-// logger returns the dialog's logger, sipgo's default for a dialog made
-// outside Diago.
-func (d *DialogServerSession) logger() *slog.Logger {
-	if d.log != nil {
-		return d.log
-	}
-	return sip.DefaultLogger()
-}
-
-// callID returns the dialog's Call-ID for a log line.
-func (d *DialogServerSession) callID() string {
-	if h := d.InviteRequest.CallID(); h != nil {
-		return h.Value()
-	}
-	return ""
-}
-
-// expireSession ends the call whose peer let the session expire without a
-// refresh (RFC 4028 section 10). Our BYE ends ctx, the dialog's context, once
-// it is sent and its answer is awaited past that end, so a failure is logged
-// whatever ctx's state; only ctx's cancellation, which means the dialog ended
-// before our BYE went out, is not a failure of ours.
-func (d *DialogServerSession) expireSession(ctx context.Context) {
-	d.logger().Warn("The peer did not refresh the session, ending the call", "call_id", d.callID())
-	if err := d.Hangup(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		d.logger().Warn("Ending the call whose session expired failed", "call_id", d.callID(), "error", err)
-	}
-}
-
-// errReInviteAnswerWithoutSDP is why a re-INVITE of ours answered 2xx with no
-// SDP left the media session as it was.
-var errReInviteAnswerWithoutSDP = errors.New("re-INVITE answered 2xx without SDP")
-
-// refreshSession sends one session refresh, a re-INVITE offering the media
-// session as it is, and acts on its outcome as RFC 4028 section 10 sets out: a
-// 408 or 481, or a transaction that timed out, ends the call with our BYE; a
-// 422 is retried once asking for its Min-SE (section 7.3); a 500 or 503 with
-// Retry-After is retried once after it; a 491 is retried by ReInvite; a 2xx
-// without SDP keeps the running session and refreshing goes on; any other
-// failure stops refreshing, which leaves the session to the peer's own timer.
-// Every failure is logged.
-func (d *DialogServerSession) refreshSession(ctx context.Context, t *sessionTimer) refreshOutcome {
-	log := d.logger()
-	retried := false
-	for {
-		err := d.ReInvite(ctx)
-		if err == nil {
-			return refreshGoesOn
-		}
-		if ctx.Err() != nil {
-			return refreshEnded
-		}
-		if errors.Is(err, errReInviteAnswerWithoutSDP) {
-			log.Warn("Session refresh answered without SDP, keeping the media session", "call_id", d.callID())
-			return refreshGoesOn
-		}
-		if errors.Is(err, errMediaClosed) || errors.Is(err, errMediaUpdateAfterAnswer) {
-			// The call is ending: the media is closed, or the answer could not
-			// be applied and the call was hung up.
-			log.Warn("Session refresh failed, the call is ending", "call_id", d.callID(), "error", err)
-			return refreshEnded
-		}
-
-		status := 0
-		var resErr sipgo.ErrDialogResponse
-		if errors.As(err, &resErr) && resErr.Res != nil {
-			status = resErr.Res.StatusCode
-		}
-		switch {
-		case status == sip.StatusRequestTimeout || status == sip.StatusCallTransactionDoesNotExists || errors.Is(err, sip.ErrTransactionTimeout):
-			log.Warn("Session refresh failed, ending the call", "call_id", d.callID(), "status", status, "error", err)
-			if herr := d.hangupNoMedia(); herr != nil {
-				log.Warn("Ending the call after a failed session refresh failed", "call_id", d.callID(), "error", herr)
-			}
-			return refreshEnded
-		case status == statusSessionIntervalTooSmall && !retried:
-			minSE, ok := parseMinSE(resErr.Res)
-			if !ok {
-				break
-			}
-			retried = true
-			t.raiseMinSE(time.Duration(minSE) * time.Second)
-			log.Warn("Session refresh answered 422, retrying with its Min-SE", "call_id", d.callID(), "min_se", minSE)
-			continue
-		case (status == sip.StatusInternalServerError || status == sip.StatusServiceUnavailable) && !retried:
-			after, ok := retryAfter(resErr.Res)
-			if !ok {
-				break
-			}
-			retried = true
-			log.Warn("Session refresh failed, retrying after Retry-After", "call_id", d.callID(), "status", status, "retry_after", after)
-			timer := time.NewTimer(d.sessionTimers.wall(after))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return refreshEnded
-			case <-timer.C:
-			}
-			continue
-		}
-		log.Warn("Session refresh failed, refreshing stopped", "call_id", d.callID(), "status", status, "error", err)
-		return refreshStopped
-	}
-}
-
-// RespondSDP answers the INVITE with a 2xx carrying body and waits for its
-// ACK. An in-dialog request that arrives meanwhile is handled once it returns,
-// see awaitAnswer.
+// RespondSDP answers the INVITE 200 with body on ctx, and waits for the ACK
+// within it. Answer, AnswerEarlyMedia, AnswerLate and AnswerWebrtc take no ctx
+// and answer on the dialog's, so their wait for the ACK ends with the dialog.
 func (d *DialogServerSession) RespondSDP(ctx context.Context, body []byte) error {
-	d.mu.Lock()
-	answering := make(chan struct{})
-	d.answering = answering
-	d.mu.Unlock()
-	defer close(answering)
-
-	return d.respondSDP(ctx, body)
-}
-
-// respondSDP is RespondSDP for an answer that has marked itself in progress,
-// because it sets up media after the ACK and must keep in-dialog requests
-// waiting until that is done too.
-func (d *DialogServerSession) respondSDP(ctx context.Context, body []byte) error {
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
-
-	d.mu.Lock()
-	ta := d.timerAnswer
-	d.mu.Unlock()
-	if ta != nil {
-		headers = append(headers, ta.headers...)
-	}
-
-	if err := d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...); err != nil {
-		return err
-	}
-
-	// The ACK carried the answer to an offer in our 2xx, and it failed. ReadAck
-	// left ending the call to this answer, which reports why.
-	d.mu.Lock()
-	ackErr := d.ackAnswerErr
-	d.mu.Unlock()
-	if ackErr != nil {
-		return errors.Join(ackErr, d.hangupNoMedia())
-	}
-
-	// The 200 OK established the session, so start the refresh loop or arm the
-	// peer-refresh watchdog now, exactly once and on the dialog context so
-	// teardown cancels it.
-	if ta != nil {
-		d.launchSessionTimers(ta)
-	}
-	return nil
+	return d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...)
 }
 
 // Answer creates media session and answers
 // After this new AudioReader and AudioWriter are created for audio manipulation
-// It waits for the ACK to its 2xx for as long as the dialog lives; see
-// AnswerContext for an answer whose wait a caller ends.
 // NOTE: Not final API
-func (d *DialogServerSession) Answer() error {
-	return d.AnswerContext(d.Context())
-}
-
-// AnswerContext is Answer, whose wait ends with ctx. It returns once the ACK
-// to its 2xx is read and the media set up, with the reason it was not, or,
-// when ctx ends first while the dialog lives, at that end with an error
-// wrapping context.Cause(ctx). The dialog's end ends the answer's exchange
-// too, which then returns why it was not confirmed. A ctx that has ended
-// before the 2xx is sent leaves the INVITE unanswered.
-//
-// The RTCP monitors of the answered media run on ctx and end with it, so ctx
-// is the call's, not a bound for the answer alone.
-//
-// A refusal the answer makes instead, a 422 to a Session-Expires below our
-// Min-SE or a 488 to a DTLS handshake that failed, waits for its ACK within
-// ctx too; its transaction ends it on its own.
-//
-// A 2xx once sent is the INVITE's final response, and its exchange goes on
-// without the caller: the dialog retransmits it until its ACK is read or 64*T1
-// has passed (RFC 3261 section 13.3.1.4). Nobody is then left to use the
-// answer, so the dialog ends the call itself with a BYE, which goes out once
-// the ACK has confirmed the dialog, or once the ACK wait has passed without
-// one, and never before (RFC 3261 section 15). The dialog has ended once that
-// BYE is handed to its transaction. Close waits for all of it.
-func (d *DialogServerSession) AnswerContext(ctx context.Context) error {
-	// RFC 4028: negotiate session timers before the 200 OK. A below-floor offer is
-	// rejected here with 422 and aborts the answer. The timer headers are stashed
-	// for RespondSDP, which launches the loop or watchdog once the 200 OK is sent.
-	if err := d.prepareSessionTimers(ctx); err != nil {
-		return err
-	}
-
-	// Media Exists as early
-	if d.mediaSession != nil {
-		return d.answerEarlyMedia(ctx)
-	}
-
-	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
-		return err
-	}
-
-	rtpSess := media.NewRTPSession(d.mediaSession)
-	return d.answerSession(ctx, rtpSess)
-}
-
-// answerWithin runs complete, the part of an answer from its final response
-// on, a 2xx or a refusal, on a goroutine of the dialog's, and waits for it
-// within ctx. answering is the
-// answer's in-progress mark, which the goroutine closes once complete has
-// returned, so in-dialog requests wait for the whole answer (awaitAnswer),
-// and an ACK whose answer cannot be applied leaves the BYE to complete
-// (ReadAck). When ctx has ended already, complete does not run and no 2xx is
-// sent.
-//
-// When ctx ends while complete runs and the dialog is live, answerWithin
-// returns at once with its cause, and the goroutine goes on to complete's end
-// and then ends the call (endAbandonedAnswer). When the dialog has ended by
-// then, complete ends with it, and its result is returned. The goroutine is bounded by the ACK wait of 64*T1, the
-// media setup that follows the ACK, and that BYE's Timer F; Close joins it.
-//
-// complete answers on the dialog's ctx, not on ctx: once the final response is
-// being sent, its exchange belongs to the dialog and goes on without the
-// caller, which ctx only stops waiting.
-func (d *DialogServerSession) answerWithin(ctx context.Context, answering chan struct{}, complete func() error) error {
-	if ctx.Err() != nil {
-		close(answering)
-		return fmt.Errorf("answer: %w", context.Cause(ctx))
-	}
-
-	var (
-		// mu orders the goroutine's report against the caller's leaving, so
-		// complete's result is either reported or acted on by the goroutine.
-		mu        sync.Mutex
-		abandoned bool
-	)
-	result := make(chan error, 1)
-	d.answers.Add(1)
-	go func() {
-		defer d.answers.Done()
-		defer close(answering)
-		err := complete()
-		mu.Lock()
-		if !abandoned {
-			result <- err
-			mu.Unlock()
-			return
-		}
-		mu.Unlock()
-		d.endAbandonedAnswer(err)
-	}()
-
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-	}
-	if d.Context().Err() != nil {
-		// The dialog has ended, which ends complete's exchange too, as it ends
-		// Answer's own ctx: complete's error says why the answer was not
-		// confirmed.
-		return <-result
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	select {
-	case err := <-result:
-		return err
-	default:
-	}
-	abandoned = true
-	return fmt.Errorf("answer: %w", context.Cause(ctx))
-}
-
-// endAbandonedAnswer ends the call of an answer whose caller stopped waiting,
-// once that answer's exchange is over, err being how it ended. A dialog the
-// ACK, or the ACK wait passing without one, has confirmed is ended with a BYE,
-// whose wait is bounded by its transaction's Timer F (RFC 3261 section
-// 17.1.2.2). A dialog that ended meanwhile, on the peer's BYE, on a CANCEL
-// that took the INVITE's transaction, or on the BYE an answer that could not
-// be applied sends, needs none.
-func (d *DialogServerSession) endAbandonedAnswer(err error) {
-	state := d.LoadState()
-	if state < sip.DialogStateEstablished || state == sip.DialogStateEnded {
-		return
-	}
-	d.logger().Debug("Ending the call of an answer nobody waits for", "call_id", d.callID(), "answer_error", err)
-	ctx, cancel := context.WithTimeout(d.Context(), sip.Timer_F)
-	defer cancel()
-	if byeErr := d.Bye(ctx); byeErr != nil {
-		d.logger().Warn("Ending the call of an answer nobody waits for failed", "call_id", d.callID(), "error", byeErr)
-	}
-}
-
 type AnswerOptions struct {
 	// OnMediaUpdate triggers when media update happens. It is blocking func, so make sure you exit
 	OnMediaUpdate func(d *DialogMedia)
@@ -700,33 +181,45 @@ type AnswerOptions struct {
 	RTPNAT int
 }
 
-// AnswerOptions allows to answer dialog with options
-// Experimental
-//
-// NOTE: API may change
-func (d *DialogServerSession) AnswerOptions(ctx context.Context, opt AnswerOptions) error {
-	d.mu.Lock()
+// Answer creates media session and answers.
+// After this new AudioReader and AudioWriter are created for audio manipulation.
+func (d *DialogServerSession) Answer(opt AnswerOptions) (*DialogMedia, error) {
+	d.dialogCallbacks.mu.Lock()
 	d.onReferDialog = opt.OnRefer
-	d.onMediaUpdate = opt.OnMediaUpdate
-	d.mu.Unlock()
+	d.dialogCallbacks.mu.Unlock()
 
-	// RFC 4028: mirror Answer and negotiate session timers before the 200 OK.
-	if err := d.prepareSessionTimers(ctx); err != nil {
+	med := &DialogMedia{}
+	med.onMediaUpdate = opt.OnMediaUpdate
+	conf := d.mediaConf
+	conf.update(opt.Codecs, opt.RTPNAT)
+	if err := med.initMediaSessionFromConf(conf); err != nil {
+		return nil, err
+	}
+
+	d.Dialog.OnState(func(s sip.DialogState) {
+		if s == sip.DialogStateEnded {
+			med.Close()
+		}
+	})
+
+	rtpSess := media.NewRTPSession(med.mediaSession)
+	return med, d.answerSession(med, rtpSess)
+}
+
+// TODO Change answerOptions because codecs or RTPNAT makes no sense here
+func (d *DialogServerSession) AnswerEarlyMedia(m *DialogMedia, opt AnswerOptions) error {
+	d.dialogCallbacks.mu.Lock()
+	d.onReferDialog = opt.OnRefer
+	d.dialogCallbacks.mu.Unlock()
+
+	m.mu.Lock()
+	m.onMediaUpdate = opt.OnMediaUpdate
+	m.mu.Unlock()
+
+	if err := d.RespondSDP(d.Context(), m.mediaSession.LocalSDP(true)); err != nil {
 		return err
 	}
-
-	// If media exists as early, only respond 200
-	if d.mediaSession != nil {
-		// Check do codecs match
-		return d.answerEarlyMedia(ctx)
-	}
-
-	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
-	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
-		return err
-	}
-	rtpSess := media.NewRTPSession(d.mediaSession)
-	return d.answerSession(ctx, rtpSess)
+	return nil
 }
 
 func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) {
@@ -738,538 +231,204 @@ func (d *DialogServerSession) updateMediaConf(codecs []media.Codec, rtpNAT int) 
 	conf.rtpNAT = rtpNAT
 }
 
-// answerEarlyMedia answers a call whose media session exists already: set up
-// by ProgressMedia, whose answer the 200 repeats, or installed by the
-// application. It only sends the 200, unless ProgressMedia left the DTLS
-// handshake of the early media running. Its wait ends with ctx, see
-// answerWithin.
-func (d *DialogServerSession) answerEarlyMedia(ctx context.Context) error {
-	d.mu.Lock()
-	sess := d.mediaSession
-	earlyAnswer := d.earlyAnswerSDP
-	unkeyed := d.earlyUnkeyed
-	d.mu.Unlock()
-
-	if unkeyed {
-		return d.answerUnkeyedEarlyMedia(ctx, sess, earlyAnswer)
-	}
-	if earlyAnswer == nil {
-		earlyAnswer = sess.LocalSDP()
-	}
-	d.mu.Lock()
-	answering := make(chan struct{})
-	d.answering = answering
-	d.mu.Unlock()
-	return d.answerWithin(ctx, answering, func() error {
-		return d.respondSDP(d.Context(), earlyAnswer)
-	})
-}
-
-// answerUnkeyedEarlyMedia answers a call whose caller did not key the early
-// media, which ProgressMedia reported with ErrEarlyMediaNotKeyed. The 200
-// repeats the answer in the 183, and once its ACK is read, the handshake
-// ProgressMedia left running is waited for, now bounded by the call and by
-// media.DTLSHandshakeTimeout: a caller that ignored the 183 takes part in it
-// only after the 200. The media is set up once the handshake has keyed it. An
-// in-dialog request waits for all of it, as it does for answerSession.
-//
-// A handshake that has already failed leaves the call no media to answer
-// with, so the call is declined 488 rather than answered 200 and ended with a
-// BYE: RFC 3261 section 21.4.26 gives 488 the meaning of 606, a session
-// description the callee cannot support, and RFC 5763 section 5 has the media
-// session torn down on a certificate that does not match its fingerprint.
-//
-// Its wait from the 200 on ends with ctx, see answerWithin.
-func (d *DialogServerSession) answerUnkeyedEarlyMedia(ctx context.Context, sess *media.MediaSession, earlyAnswer []byte) error {
-	d.mu.Lock()
-	answering := make(chan struct{})
-	d.answering = answering
-	d.mu.Unlock()
-
-	if err := sess.FinalizeWithin(d.Context(), 0); err != nil && !errors.Is(err, media.ErrFinalizeInProgress) {
-		// The 488 waits for its ACK within ctx, as the 200 would.
-		return errors.Join(err, d.answerWithin(ctx, answering, func() error {
-			return d.Respond(d.Context(), sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
-		}))
-	}
-	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(d.Context(), earlyAnswer); err != nil {
-			return err
-		}
-		if err := sess.FinalizeContext(d.Context()); err != nil {
-			return err
-		}
-
-		rtpSess := media.NewRTPSession(sess)
-		d.mu.Lock()
-		d.initRTPSessionUnsafe(sess, rtpSess)
-		d.mu.Unlock()
-		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground(ctx)
-	})
-}
-
-// answerSession. It allows answering with custom RTP Session. Its wait from
-// the 2xx on ends with ctx, see answerWithin.
+// answerSession. It allows answering with custom RTP Session.
 // NOTE: Not final API
-func (d *DialogServerSession) answerSession(ctx context.Context, rtpSess *media.RTPSession) error {
+func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTPSession) error {
+	// TODO: Use setupRTPSession
 	sess := rtpSess.Sess
 	sdp := d.InviteRequest.Body()
 	if sdp == nil {
 		return fmt.Errorf("no sdp present in INVITE")
 	}
 
-	if err := sess.RemoteSDP(sdp); err != nil {
+	if err := sess.RemoteSDP(sdp, false); err != nil {
 		return err
 	}
 
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	// Close RTP session
-	// d.onCloseUnsafe(func() error {
-	// 	return rtpSess.Close()
-	// })
-	answering := make(chan struct{})
-	d.answering = answering
-	d.mu.Unlock()
+	med.registerDialogCallbacks(&d.dialogCallbacks)
+	med.mu.Lock()
+	med.initRTPSessionUnsafe(sess, rtpSess)
+	med.mu.Unlock()
 
-	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(d.Context(), sess.LocalSDP()); err != nil {
-			return err
-		}
-		// The handshake ends with the call.
-		if err := sess.FinalizeContext(d.Context()); err != nil {
-			return err
-		}
-		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground(ctx)
-	})
+	// This will now block until ACK received with 64*T1 as max.
+	// How to let caller to cancel this?
+	if err := d.RespondSDP(d.Context(), sess.LocalSDP(true)); err != nil {
+		return err
+	}
+
+	// Must be called after media and reader writer is setup
+	return rtpSess.MonitorBackground()
 }
 
-// AnswerLate answers an INVITE that carried no offer: its 2xx carries our
-// offer, and the ACK the answer (RFC 3261 section 13.2.1), which ReadAck
-// applies. It negotiates the session timer as Answer does. An ACK that brings
-// no answer ends the call with a BYE, and AnswerLate returns
-// errAckCarriesNoAnswer. It waits for the ACK for as long as the dialog lives;
-// see AnswerLateContext for an answer whose wait a caller ends.
-func (d *DialogServerSession) AnswerLate() error {
-	return d.AnswerLateContext(d.Context())
-}
-
-// AnswerLateContext is AnswerLate, whose wait ends with ctx, as AnswerContext
-// describes: when ctx ends first it returns at that end, and the dialog reads
-// the ACK, applies the answer it carries and then ends the call with a BYE,
-// or ends it with a BYE once the ACK wait has passed without one.
-func (d *DialogServerSession) AnswerLateContext(ctx context.Context) error {
-	// RFC 4028: as Answer, negotiate session timers before the 2xx. A
-	// below-floor offer is refused 422 here, and RespondSDP adds the timer
-	// headers to the 2xx and starts the timer once it is sent.
-	if err := d.prepareSessionTimers(ctx); err != nil {
-		return err
+// AnswerLate does answer with Late offer.
+func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
+	m := &DialogMedia{}
+	if err := m.initMediaSessionFromConf(d.mediaConf); err != nil {
+		return nil, err
 	}
-
-	if err := d.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
-		return err
-	}
-	sess := d.mediaSession
+	sess := m.mediaSession
 	rtpSess := media.NewRTPSession(sess)
-	localSDP := sess.LocalSDP()
+	localSDP := sess.LocalSDP(false)
 
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	// Close RTP session
-	// d.onCloseUnsafe(func() error {
-	// 	return rtpSess.Close()
-	// })
-	answering := make(chan struct{})
-	d.answering = answering
-	d.ackCarriesAnswer = true
-	d.mu.Unlock()
+	m.mu.Lock()
+	m.initRTPSessionUnsafe(sess, rtpSess)
+	m.mu.Unlock()
+	m.registerDialogCallbacks(&d.dialogCallbacks)
 
-	return d.answerWithin(ctx, answering, func() error {
-		if err := d.respondSDP(d.Context(), localSDP); err != nil {
-			return err
-		}
-		// Must be called after media and reader writer is setup
-		return rtpSess.MonitorBackground(ctx)
-	})
+	// This will now block until ACK received with 64*T1 as max.
+	// How to let caller to cancel this?
+	if err := d.RespondSDP(d.Context(), localSDP); err != nil {
+		return nil, err
+	}
+	// Must be called after media and reader writer is setup
+	return m, rtpSess.MonitorBackground()
 }
 
-// ReadAck reads the ACK to our 2xx. When the 2xx carried an offer, the ACK
-// carries the answer (RFC 3261 section 13.2.1). The answer to the offer in the
-// 2xx to our INVITE is applied to the media session, not carrying media yet,
-// and finalizes it, running the DTLS handshake of a DTLS-SRTP session. The
-// answer to the offer in the 2xx to a re-INVITE of the peer's is applied to the
-// fork that made the offer, which is then installed, since the media session
-// carries the media meanwhile.
-//
-// An ACK cannot be refused, so an answer that cannot be applied, an answer
-// missing from the ACK to the 2xx of AnswerLate, or a handshake that fails,
-// ends the call with a BYE once the ACK has confirmed the dialog:
-// RFC 3261 section 13.2.2.4 has a UAC do the same with an offer it cannot
-// accept, and RFC 5763 section 5 has the media session torn down on a
-// fingerprint mismatch. An answer waiting for this ACK sends the BYE and
-// reports the error itself.
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
-	if reInvite, err := d.applyAckAnswer(d.Context(), req); reInvite {
-		ackErr := d.DialogServerSession.ReadAck(req, tx)
-		d.ackPeerReInvite(req)
-		if err != nil {
-			return errors.Join(err, ackErr, d.hangupNoMedia())
+	d.dialogCallbacks.mu.Lock()
+	mediaHanshaker := d.mediaHanshaker
+	d.dialogCallbacks.mu.Unlock()
+
+	var err error
+	if mediaHanshaker != nil {
+		if body := req.Body(); body != nil {
+			err = mediaHanshaker.onRemoteSDP(d.Context(), body, true)
 		}
-		d.runMediaUpdateHooks()
-		d.mu.Lock()
-		onMediaUpdate := d.onMediaUpdate
-		d.mu.Unlock()
-		if onMediaUpdate != nil {
-			onMediaUpdate(&d.DialogMedia)
+		if err == nil {
+			err = mediaHanshaker.onFinalize(d.Context())
 		}
-		return ackErr
 	}
-	// The ACK to the 2xx to a re-INVITE of the peer's that carried an offer
-	// ends the retransmission of that 2xx.
-	d.ackPeerReInvite(req)
-
-	// Check do we have some session
-	answerWaiting := false
-	err := func() error {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		sess := d.mediaSession
-		if sess == nil {
-			return nil
-		}
-		// Only the ACK confirming the dialog answers the offer in the 2xx to
-		// our INVITE. A copy of it read later answers nothing more.
-		if d.LoadState() != sip.DialogStateEstablished {
-			return nil
-		}
-		if d.answering != nil {
-			select {
-			case <-d.answering:
-			default:
-				answerWaiting = true
-			}
-		}
-		contentType := req.ContentType()
-		body := req.Body()
-		if contentType == nil || body == nil || contentType.Value() != "application/sdp" {
-			if d.ackCarriesAnswer {
-				// Our 2xx carried the offer, and this ACK, the one place the
-				// answer may be, has none: the session has no remote media.
-				d.ackAnswerErr = errAckCarriesNoAnswer
-				return errAckCarriesNoAnswer
-			}
-			return nil
-		}
-
-		// This is Late offer response
-		sess.RemoteSDPIsAnswer = true
-		if err := sess.RemoteSDP(body); err != nil {
-			d.ackAnswerErr = err
-			return err
-		}
-
-		// Finalize session. The handshake ends with the call.
-		if err := sess.FinalizeContext(d.Context()); err != nil {
-			d.ackAnswerErr = err
-			return err
-		}
-		return nil
-	}()
 	if err != nil {
-		if ackErr := d.DialogServerSession.ReadAck(req, tx); ackErr != nil {
-			return errors.Join(err, ackErr)
-		}
-		if answerWaiting {
-			return err
-		}
-		return errors.Join(err, d.hangupNoMedia())
+		e := d.Hangup(d.Context())
+		return errors.Join(err, e)
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
 }
 
-// awaitAnswer waits until our answer is complete before an in-dialog request is
-// handled, and reports whether it is. Complete means the ACK to our 2xx is read
-// and the answer has returned. A peer sends its ACK before any request that
-// follows it, but sipgo hands each request to its handler on its own
-// goroutine, so a later request can be handled before the ACK, or before the
-// answer has finalized and started the media that a re-INVITE would replace.
-// Reading the ACK is not enough either with sipgo v1.6.0, which tells the
-// dialog's state observers of each transition on the goroutine that makes it,
-// one observer after another: a BYE woken by the ACK's notification could end
-// the dialog, and have that told to the answer, before the ACK's notification
-// reached it, and the answer would then report the ACK missing. A sipgo that
-// tells the observers of the transitions in the order they happen cannot
-// reorder them so. Waiting restores the order the peer sent them in.
-// The wait ends with tx, or after two T1 intervals, which covers an ACK lost
-// in transit and resent when our 2xx is first retransmitted.
-func (d *DialogServerSession) awaitAnswer(tx sip.ServerTransaction) bool {
-	timer := time.NewTimer(2 * sip.T1)
-	defer timer.Stop()
-
-	if d.LoadState() == sip.DialogStateEstablished {
-		// The state is loaded again after the read is registered, so an ACK
-		// read in between is not missed.
-		stateCh := d.StateRead()
-		for state := d.LoadState(); state == sip.DialogStateEstablished; {
-			select {
-			case state = <-stateCh:
-			case <-tx.Done():
-				return false
-			case <-timer.C:
-				return false
-			}
-		}
-	}
-
-	// Loaded only now: an answer sets it before its 2xx, so once the 2xx is
-	// acknowledged it is in place.
-	d.mu.Lock()
-	answering := d.answering
-	d.mu.Unlock()
-	if answering == nil {
-		return true
-	}
-	select {
-	case <-answering:
-		return true
-	case <-tx.Done():
-		return false
-	case <-timer.C:
-		return false
-	}
-}
-
-// ReadBye stashes the terminating BYE and then hands it to the embedded session,
-// which owns BYE handling: validation, the 200, and the move to
-// DialogStateEnded. The request is recorded here, not acted upon differently,
-// but for the answer the embedded session leaves to its caller when it refuses
-// a BYE, described below.
-//
-// A BYE that arrives before our answer is complete is read once it is. The
-// wait is for the media: an answer that sets up its media after the ACK,
-// finalizing the session and starting its RTP monitor, would otherwise have
-// that media closed under it by the BYE's handler. It also has the answer see
-// the ACK the peer sent ahead of the BYE, rather than the dialog ending before
-// any ACK, which the answer would report as a missing ACK. A BYE that arrives
-// while a re-INVITE is being handled does not wait for it: the BYE is answered,
-// and the re-INVITE, when it has no final response yet, is answered 487 (RFC
-// 3261 section 15.1.2), so the peer never gets a 200 to the re-INVITE after
-// the one to its BYE.
-//
-// The stash must precede the delegation, because the delegate is what ends the
-// dialog: storing afterwards would let an observer woken by Context() read nil.
-// A rejected BYE is therefore rolled back rather than pre-filtered, which keeps
-// validation in one place instead of duplicating the embedded session's rules
-// here and letting the copies drift. Such a BYE is briefly visible, but it is
-// one no observer can be looking at: only a BYE the delegate accepts ends the
-// dialog, and until the dialog ends nothing has cause to read the stash.
-//
-// The delegate refuses a BYE it finds out of order with
-// sipgo.ErrDialogInvalidCseq, and RFC 3261 section 12.2.2 has such a BYE
-// rejected with 500. Depending on the sipgo version, the delegate answers it
-// 500 itself or leaves the answer to its caller; readByeOnce answers it only
-// when the delegate did not, and the error is returned: the dialog goes on.
-func (d *DialogServerSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
-	d.awaitAnswer(tx)
-	d.answerMu.Lock()
-	defer d.answerMu.Unlock()
-	d.terminatingBye.Store(req)
-	if err := readByeOnce(ctx, req, tx, d.DialogServerSession.ReadBye); err != nil {
-		// Not this dialog's ending: leave no cause planted on it. A BYE
-		// taken whose 200 could not be sent may still have ended it.
-		if errors.Is(err, sipgo.ErrDialogInvalidCseq) || d.LoadState() != sip.DialogStateEnded {
-			d.terminatingBye.CompareAndSwap(req, nil)
-		}
-		return err
-	}
-	return d.terminatePeerReInviteLocked(ctx)
-}
-
-// NewByeRequest returns a BYE to the dialog's remote target, RemoteContact,
-// over the INVITE's transport (RFC 3261 section 12.2.1.1). WriteBye fills in
-// the dialog's headers.
-func (d *DialogServerSession) NewByeRequest() *sip.Request {
-	bye := sip.NewRequest(sip.BYE, *d.RemoteContact().Address.Clone())
-	bye.SetTransport(d.InviteRequest.Transport())
-	return bye
-}
-
-// Bye sends NewByeRequest and waits within ctx for its final answer, see
-// WriteBye.
-func (d *DialogServerSession) Bye(ctx context.Context) error {
-	return d.WriteBye(ctx, d.NewByeRequest())
-}
-
-// Hangup ends the call: it declines one not answered yet with 480, and ends an
-// answered one with a BYE. Once our 2xx is sent the INVITE transaction takes no
-// other final response, so a call whose 2xx awaits its ACK is ended with a BYE
-// too, which Bye sends once the ACK is read or the transaction has timed out
-// without one (RFC 3261 section 15). Until then it waits, bounded by ctx.
 func (d *DialogServerSession) Hangup(ctx context.Context) error {
 	state := d.LoadState()
-	if state >= sip.DialogStateEstablished {
+	if state >= sip.DialogStateConfirmed {
 		return d.Bye(ctx)
 	}
 	return d.Respond(ctx, sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)
 }
 
-// ReInvite sends a re-INVITE offering the media session as it is, and installs
-// it with the answer. The offer is made by a fork of the media session, which
-// takes the answer: a subsequent offer carries a=setup:actpass (RFC 8842
-// section 5.5), which the media session in place, whose role is set, would not
-// offer. It offers the codecs the call runs on, see negotiatedOffer, as a
-// session refresh renegotiates nothing.
 func (d *DialogServerSession) ReInvite(ctx context.Context) error {
-	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
-		m := cur.Fork()
-		return m, negotiatedOffer(m, cur)
-	})
-}
-
-// reInviteMediaSession re-INVITEs with ms, a fork of the media session, and
-// installs it with the answer.
-func (d *DialogServerSession) reInviteMediaSession(ctx context.Context, ms *media.MediaSession) error {
-	return d.reInviteMedia(ctx, func(*media.MediaSession) (*media.MediaSession, []byte) {
-		return ms, ms.LocalSDP()
-	})
-}
-
-// reInviteMedia re-INVITEs with the fork of the installed media session that
-// fork returns, and its offer, and installs the fork with the answer. Each attempt waits
-// first for a re-INVITE in progress to end, and marks ours in progress, see
-// beginOwnMediaUpdate. A 491 is retried after the wait RFC 3261 section 14.1
-// gives, with no re-INVITE of ours in progress meanwhile.
-func (d *DialogServerSession) reInviteMedia(ctx context.Context, fork func(cur *media.MediaSession) (*media.MediaSession, []byte)) error {
-	for {
-		end, err := d.beginOwnMediaUpdate(ctx)
-		if err != nil {
-			return err
-		}
-		ms, sdp := fork(d.MediaSession())
-		pending, err := d.reInviteMediaOnce(ctx, ms, sdp)
-		end()
-		if !pending {
-			return err
-		}
-		// The caller generated the Call-ID.
-		if err := reInviteRetryWait(ctx, false); err != nil {
-			d.mu.Lock()
-			derr := d.discardForkUnsafe(ms)
-			d.mu.Unlock()
-			return errors.Join(err, derr)
-		}
+	d.dialogCallbacks.mu.Lock()
+	mediaHanshaker := d.mediaHanshaker
+	d.dialogCallbacks.mu.Unlock()
+	if mediaHanshaker == nil {
+		return fmt.Errorf("dialog media is not initialized")
 	}
-}
-
-// reInviteMediaOnce sends one re-INVITE with sdp, the offer of ms, and installs
-// ms with the answer, unless the dialog media is closed or the dialog has ended
-// by then. ms is discarded when it is not installed. It reports a 491, for the
-// caller to retry. While the session timer runs, the re-INVITE carries its
-// headers and its 2xx sets the timer (RFC 4028 sections 7.1, 7.2 and 7.4). A
-// 2xx without SDP leaves the media session as it was and returns
-// errReInviteAnswerWithoutSDP.
-func (d *DialogServerSession) reInviteMediaOnce(ctx context.Context, ms *media.MediaSession, sdp []byte) (bool, error) {
-	// NOTE: we do not change original invite request
-	d.mu.Lock()
-	contact := d.remoteContactUnsafe()
-	d.mu.Unlock()
-
+	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, "")
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			d.dialogCallbacks.abortMedia()
+		}
+	}()
+	contact := d.RemoteContact()
 	req := sip.NewRequest(sip.INVITE, contact.Address)
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	timer := d.timer.Load()
-	var weRefresh bool
-	if timer != nil {
-		var hdrs []sip.Header
-		hdrs, weRefresh = timer.requestHeaders()
-		for _, h := range hdrs {
-			req.AppendHeader(h)
-		}
-	}
 	req.SetBody(sdp)
 
-	res, err := d.reInviteSend(ctx, req)
-	if res != nil && res.StatusCode == sip.StatusRequestPending {
-		return true, nil
-	}
+	res, err := d.Do(ctx, req)
 	if err != nil {
-		d.mu.Lock()
-		derr := d.discardForkUnsafe(ms)
-		d.mu.Unlock()
-		return false, errors.Join(err, derr)
-	}
-	if timer != nil {
-		timer.answered(res, weRefresh)
+		return err
 	}
 
-	// Save new remote target contact and update media
-	err = func() error {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		if d.DialogMedia.closed || d.Context().Err() != nil {
-			return errors.Join(errMediaClosed, d.discardForkUnsafe(ms))
-		}
-		d.remoteContactTarget = res.Contact()
-
-		remoteSDP := res.Body()
-		if len(remoteSDP) == 0 {
-			return errors.Join(errReInviteAnswerWithoutSDP, d.discardForkUnsafe(ms))
-		}
-		// The 200 OK answers the offer we sent on the re-INVITE.
-		ms.RemoteSDPIsAnswer = true
-		if err := ms.RemoteSDP(remoteSDP); err != nil {
-			return errors.Join(fmt.Errorf("sdp update media remote SDP applying failed: %w", err), d.discardForkUnsafe(ms))
-		}
-
-		// The answer completes a new DTLS association, whose handshake runs
-		// before ms carries any media.
-		if ms.FinalizePending() {
-			if err := d.finalizeAndReplaceUnsafe(d.Context(), ms); err != nil {
-				if errors.Is(err, errMediaClosed) {
-					return err
-				}
-				return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
-			}
-			return nil
-		}
-		if err := d.mediaUpdateUnsafe(d.Context(), ms); err != nil {
-			return errors.Join(err, d.discardForkUnsafe(ms))
-		}
-		return nil
-	}()
-	if errors.Is(err, errMediaUpdateAfterAnswer) {
-		return false, errors.Join(err, d.hangupNoMedia())
-	}
-	if err == nil {
-		d.runMediaUpdateHooks()
-	}
-	return false, err
-}
-
-// reInviteSend sends req, a re-INVITE, and acknowledges its 2xx. A final
-// response other than 2xx is returned with sipgo.ErrDialogResponse.
-func (d *DialogServerSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	res, err := d.Do(ctx, req.Clone())
-	if err != nil {
-		return nil, err
-	}
 	if !res.IsSuccess() {
-		return res, sipgo.ErrDialogResponse{
+		return sipgo.ErrDialogResponse{
 			Res: res,
 		}
 	}
 
-	// Now do ACK on new Contact
 	cont := res.Contact()
 	if cont == nil {
-		return res, fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
+		return fmt.Errorf("reinvite: no contact header present")
 	}
-	if err := d.ack(ctx, cont.Address, nil); err != nil {
-		return res, err
+
+	ack := sip.NewRequest(sip.ACK, cont.Address)
+	if err := d.WriteRequest(ack); err != nil {
+		return err
 	}
-	return res, nil
+	d.setRemoteContact(cont)
+	if err := mediaHanshaker.onRemoteSDP(ctx, res.Body(), true); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (d *DialogServerSession) reInviteSDP(ctx context.Context, sdp []byte) ([]byte, error) {
+	// NOTE: we do not change original invite request
+	contact := d.RemoteContact()
+
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(sdp)
+
+	res, err := d.reInviteDo(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return res.Body(), nil
+}
+
+func (d *DialogServerSession) reInviteDo(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+
+	for {
+		res, err := d.Do(ctx, req.Clone())
+		if err != nil {
+			return nil, err
+		}
+
+		if !res.IsSuccess() {
+			// https://datatracker.ietf.org/doc/html/rfc3261#section-14.1
+			// If a UAC receives a 491 response to a re-INVITE, it SHOULD start a
+			//    timer with a value T chosen as follows:
+			//       1. If the UAC is the owner of the Call-ID of the dialog ID
+			//          (meaning it generated the value), T has a randomly chosen value
+			//          between 2.1 and 4 seconds in units of 10 ms.
+
+			//       2. If the UAC is not the owner of the Call-ID of the dialog ID, T
+			//          has a randomly chosen value of between 0 and 2 seconds in units
+			//          of 10 ms.
+
+			if res.StatusCode == sip.StatusRequestPending {
+				select {
+				case <-time.After(time.Duration(2000+mrand.IntN(200)*10) * time.Millisecond):
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+
+			return nil, sipgo.ErrDialogResponse{
+				Res: res,
+			}
+		}
+
+		contact := res.Contact()
+		// TODO: Is it regular that contact header is not present
+		if contact == nil {
+			contact = d.RemoteContact()
+			if contact == nil {
+				return res, fmt.Errorf("not sure where to send ack")
+			}
+		}
+
+		// Now do ACK on new Contact
+		if err := d.ack(ctx, contact.Address, nil); err != nil {
+			return res, err
+		}
+
+		return res, nil
+	}
 }
 
 func (d *DialogServerSession) ack(ctx context.Context, remoteTarget sip.Uri, body []byte) error {
@@ -1308,18 +467,10 @@ func (d *DialogServerSession) ack(ctx context.Context, remoteTarget sip.Uri, bod
 }
 
 func (d *DialogServerSession) remoteContactUnsafe() *sip.ContactHeader {
-	if d.remoteContactTarget != nil {
-		// Invite update can change contact
-		return d.remoteContactTarget
-	}
-	return d.InviteRequest.Contact()
+	return d.remoteContact(d.InviteRequest.Contact())
 }
 
 // Refer tries todo refer (blind transfer) on call. For more control use ReferOptions
-//
-// It blocks until the transfer outcome is known: the terminal sipfrag NOTIFY, or
-// the end of the refer subscription, or of ctx, without one. A transfer that did
-// not succeed returns *ReferFailureError.
 //
 // NOTE: It is expected that after calling this you are hanguping call to send BYE
 func (d *DialogServerSession) Refer(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
@@ -1331,67 +482,31 @@ func (d *DialogServerSession) Refer(ctx context.Context, referTo sip.Uri, header
 }
 
 type ReferServerOptions struct {
-	Headers []sip.Header
-	// OnNotify sends notify status code.
-	// Setting this returns from refer as soon as it is accepted, leaving the
-	// transfer outcome to the callback.
+	Headers  []sip.Header
 	OnNotify func(statusCode int)
 }
 
-// ReferOptions sends a REFER. With OnNotify set it returns once the REFER is
-// accepted and reports outcomes to the callback. Without one it blocks for the
-// transfer outcome and returns *ReferFailureError if it did not succeed.
 func (d *DialogServerSession) ReferOptions(ctx context.Context, referTo sip.Uri, opts ReferServerOptions) error {
-	d.mu.Lock()
-	cont := d.remoteContactUnsafe()
+	cont := d.RemoteContact()
+	d.dialogCallbacks.mu.Lock()
 	if opts.OnNotify != nil {
 		d.onReferNotify = opts.OnNotify
 	}
-	d.mu.Unlock()
-	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.OnNotify == nil, opts.Headers...)
-}
-
-// ReferAndObserve sends a blind REFER for referTo and returns what the far end
-// sent back: the REFER's final response, the status line of each NOTIFY and how
-// the attempt ended. The attempt lives as long as the refer subscription the
-// REFER created, at most 64×T1 plus one hour from the REFER's 2xx (see ReferEnd),
-// past a BYE on the dialog, or until ctx ends; a NOTIFY after that is answered 481
-// and reported through
-// DialogMedia.OnReferNotifyUnmatched. Neither this method nor any NOTIFY ends
-// the dialog, so what follows the outcome is the caller's decision. Referred-By names this side: the Contact of the 200 OK we
-// answered with. It installs no callback on the dialog, so it does not change
-// what a later Refer or ReferOptions call reports.
-func (d *DialogServerSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {
-	d.mu.Lock()
-	recipient := d.remoteContactUnsafe()
-	ourContact := d.InviteResponse.Contact()
-	d.mu.Unlock()
-	if recipient == nil {
-		return ReferObservation{}, fmt.Errorf("refer: dialog has no remote contact")
-	}
-	if ourContact == nil {
-		return ReferObservation{}, fmt.Errorf("refer: dialog has no local contact")
-	}
-	obs, _, err := dialogReferObserve(ctx, d, recipient.Address, referTo, ourContact.Address, opts)
-	return obs, err
+	d.dialogCallbacks.mu.Unlock()
+	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.Headers...)
 }
 
 func (d *DialogServerSession) handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
-	if respondNotifyDialogEnded(ctx, d, req, tx) {
-		return
-	}
-	dialogHandleReferNotify(ctx, d, req, tx)
+	d.dialogCallbacks.mu.Lock()
+	onReferNotify := d.onReferNotify
+	d.dialogCallbacks.mu.Unlock()
+	dialogHandleReferNotify(ctx, d, req, tx, onReferNotify)
 }
 
 func (d *DialogServerSession) handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
-	// A REFER asks to transfer this call, which an ended dialog no longer has.
-	if ended, _ := respondDialogEnded(ctx, d, req, tx); ended {
-		return
-	}
-
-	d.mu.Lock()
+	d.dialogCallbacks.mu.Lock()
 	onRefDialog := d.onReferDialog
-	d.mu.Unlock()
+	d.dialogCallbacks.mu.Unlock()
 	if onRefDialog == nil {
 		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 		return
@@ -1400,48 +515,13 @@ func (d *DialogServerSession) handleRefer(ctx context.Context, dg *Diago, req *s
 	dialogHandleRefer(ctx, d, dg, req, tx, onRefDialog)
 }
 
-func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) (err error) {
-	// A re-INVITE that arrives after our 2xx but before its ACK is handled once
-	// the answer is complete, as RFC 5407 section 3.1.4 recommends. It cannot be
-	// read ahead of the ACK: ReadRequest below moves the remote CSeq past the
-	// ACK's, and the ACK would then never confirm the dialog. Nor can its media
-	// update run before the answer's media is finalized and started. When the
-	// answer does not complete in time, RFC 5407 permits 491, which asks the
-	// peer to retry.
-	if !d.awaitAnswer(tx) {
+func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	// Check is current pending dialog
+	if state := d.LoadState(); state == sip.DialogStateEstablished {
+		// RFC 3261 §14.2 — UAS Behavior
+		// If a UAS receives an INVITE request for an existing dialog while another INVITE transaction is in progress, it MUST return a 491 (Request Pending) response to the new INVITE.”
 		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
-
-	d.requestMu.Lock()
-	defer d.requestMu.Unlock()
-
-	// A re-INVITE for an ended dialog is answered 481 without reaching the
-	// media. A live one is answered through respondPeerReInvite, or 487 by a
-	// BYE that ends the dialog first.
-	if answered, err := d.beginPeerReInvite(ctx, &d.Dialog, req, tx); answered {
-		return err
-	}
-	// RFC 4028 section 9: while the session timer runs, the 2xx to the
-	// re-INVITE carries the timer it sets, which takes effect as it is sent.
-	if timer := d.timer.Load(); timer != nil {
-		d.onPeerReInvite2xx(tx, func(res *sip.Response) {
-			for _, h := range timer.answerPeer(req) {
-				res.AppendHeader(h)
-			}
-		})
-	}
-	// Once a 2xx has been sent, its ACK is waited for, and only then is the
-	// re-INVITE no longer in progress. A 2xx whose ACK does not come ends the
-	// call (RFC 3261 section 13.3.1.4).
-	var endUpdate func()
-	defer func() {
-		if ackErr := d.endPeerReInvite(tx); ackErr != nil {
-			err = errors.Join(err, ackErr, d.hangupNoMedia())
-		}
-		if endUpdate != nil {
-			endUpdate()
-		}
-	}()
 
 	// NOTE: Calling ReadRequest increases remote CSEQ.
 	// We should not call this until dialog is confirmed, otherwise any intermidiate response
@@ -1456,50 +536,45 @@ func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Reque
 			//    randomly chosen value of between 0 and 10 seconds.
 			res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
 			res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(rand.IntN(10))))
-			_, err := d.respondPeerReInvite(ctx, tx, res)
+			return tx.Respond(ctx, res)
+		}
+
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+	}
+
+	d.dialogCallbacks.mu.Lock()
+	mediaHanshaker := d.mediaHanshaker
+	d.dialogCallbacks.mu.Unlock()
+	if mediaHanshaker != nil {
+		d.setRemoteContact(req.Contact())
+		if err := mediaHanshaker.onRemoteSDP(d.Context(), req.Body(), false); err != nil {
+			return errors.Join(
+				err,
+				tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil)),
+			)
+		}
+		localSDP, err := mediaHanshaker.onLocalSDP(d.Context(), true, "")
+		if err != nil {
+			d.dialogCallbacks.abortMedia()
+			return errors.Join(
+				err,
+				tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil)),
+			)
+		}
+		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", localSDP)
+		res.AppendHeader(d.InviteResponse.Contact())
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		if err := tx.Respond(ctx, res); err != nil {
+			d.dialogCallbacks.abortMedia()
 			return err
 		}
-
-		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
-		return err
+		return nil
 	}
 
-	// RFC 3261 section 14.2: a re-INVITE arriving while one of ours is in
-	// progress is answered 491.
-	var ok bool
-	endUpdate, ok = d.beginPeerMediaUpdate()
-	if !ok {
-		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
-		return err
-	}
-
-	if err := d.handleMediaUpdate(ctx, &d.Dialog, req, tx, d.InviteResponse.Contact()); err != nil {
-		if errors.Is(err, errMediaUpdateAfterAnswer) {
-			return errors.Join(err, d.hangupNoMedia())
-		}
-		return err
-	}
-	return nil
-}
-
-// hangupNoMedia ends a call left without usable media by an answer that could
-// not be applied or never came, or by a failed DTLS handshake. The offer/answer exchange was
-// complete by then, so the peer has moved to the new session. RFC 5763 section
-// 5 has the media session torn down at once on a fingerprint mismatch, and with
-// a single audio stream that is the call.
-func (d *DialogServerSession) hangupNoMedia() error {
-	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
-	defer cancel()
-	return d.Hangup(ctx)
+	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 }
 
 func (d *DialogServerSession) readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
-	if ended, err := respondDialogEnded(ctx, d, req, tx); ended {
-		return err
-	}
-	// DTMF relay is not read yet, so an INFO on a live dialog is refused
-	// whatever it carries, without a body and so without a Content-Type (RFC
-	// 3261 section 20.15) too.
 	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 	// if err := d.ReadRequest(req, tx); err != nil {
 	// 	tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
@@ -1517,17 +592,60 @@ func (d *DialogServerSession) readSIPInfoDTMF(ctx context.Context, req *sip.Requ
 }
 
 func (d *DialogServerSession) Hold(ctx context.Context) error {
-	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
-		m := cur.Fork()
-		m.Mode = sdp.ModeSendonly
-		return m, m.LocalSDP()
-	})
+	d.dialogCallbacks.mu.Lock()
+	mediaHanshaker := d.mediaHanshaker
+	d.dialogCallbacks.mu.Unlock()
+	if mediaHanshaker == nil {
+		return fmt.Errorf("dialog media is not initialized")
+	}
+	if err := d.reInviteMode(ctx, mediaHanshaker, sdp.ModeSendonly); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (d *DialogServerSession) Unhold(ctx context.Context) error {
-	return d.reInviteMedia(ctx, func(cur *media.MediaSession) (*media.MediaSession, []byte) {
-		m := cur.Fork()
-		m.Mode = sdp.ModeSendrecv
-		return m, m.LocalSDP()
-	})
+	d.dialogCallbacks.mu.Lock()
+	mediaHanshaker := d.mediaHanshaker
+	d.dialogCallbacks.mu.Unlock()
+	if mediaHanshaker == nil {
+		return fmt.Errorf("dialog media is not initialized")
+	}
+	if err := d.reInviteMode(ctx, mediaHanshaker, sdp.ModeSendrecv); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DialogServerSession) reInviteMode(
+	ctx context.Context,
+	mediaHanshaker mediaHanshaker,
+	mode string,
+) error {
+	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, mode)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			d.dialogCallbacks.abortMedia()
+		}
+	}()
+	contact := d.RemoteContact()
+
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(sdp)
+
+	res, err := d.reInviteDo(ctx, req)
+	if err != nil {
+		return err
+	}
+	d.setRemoteContact(res.Contact())
+	if err := mediaHanshaker.onRemoteSDP(ctx, res.Body(), true); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }

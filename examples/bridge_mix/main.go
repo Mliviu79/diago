@@ -60,13 +60,15 @@ func BridgeCall(ctx context.Context, d *diago.Diago, inDialog *diago.DialogServe
 
 	inCtx := inDialog.Context()
 
-	if err := inDialog.Answer(); err != nil {
+	med, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
 		return err
 	}
-	if err := bridge.AddDialogSession(inDialog); err != nil {
+	defer med.Close()
+	if err := bridge.AddDialogMedia(med); err != nil {
 		return err
 	}
 
 	<-inCtx.Done()
-	return bridge.RemoveDialogSession(inDialog)
+	return bridge.RemoveDialogMedia(med)
 }

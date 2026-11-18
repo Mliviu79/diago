@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -19,7 +18,6 @@ import (
 	"github.com/emiago/diago/audio"
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
-	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
 
@@ -31,26 +29,7 @@ var (
 	}
 
 	errNoRTPSession = errors.New("no rtp session")
-
-	// ErrNoMediaSetup is returned when the dialog's audio is asked for before
-	// its media is set up: before the answer, or before ProgressMedia keys early
-	// media, and so after ErrEarlyMediaNotKeyed.
-	ErrNoMediaSetup = errors.New("no media setup")
-
-	// errMediaUpdateAfterAnswer marks a media update that failed after its
-	// answer was sent. The peer has moved to the new session by then, so the
-	// call has no media left.
-	errMediaUpdateAfterAnswer = errors.New("media update failed after its answer")
-
-	// errMediaClosed refuses to install a media session once the dialog media
-	// is closed or the dialog has ended, since nothing would close it.
-	errMediaClosed = errors.New("dialog media closed")
 )
-
-// jitterBufferStopTimeout bounds how long Close waits for a jitter buffer's
-// read loop once the sockets it reads are closed. Closing them fails its read
-// at once, so the bound only matters for a read Close did not end.
-const jitterBufferStopTimeout = 5 * time.Second
 
 func init() {
 	if HTTPDebug {
@@ -63,42 +42,18 @@ func init() {
 type DialogMedia struct {
 	mu sync.Mutex
 
-	// requestMu makes the peer's re-INVITEs take turns, each held for the
-	// whole of its handling. It is taken before mu and answerMu.
-	requestMu sync.Mutex
-
-	// answerMu makes the peer's BYE and the final response to its re-INVITE
-	// take turns. The BYE holds it while it ends the dialog and answers, and
-	// answers a re-INVITE still pending 487 (RFC 3261 section 15.1.2); a
-	// re-INVITE is answered under it only while the dialog is live. A
-	// re-INVITE is then answered either before a BYE ends the dialog or with
-	// 487, never with a 200 behind the BYE's, and the BYE never waits for the
-	// re-INVITE's media update. It is never taken with mu held, since ending
-	// the dialog runs the state callbacks, which may take mu.
-	answerMu sync.Mutex
-	// peerReInvite is the peer's re-INVITE being handled, until its handling
-	// ends. Guarded by answerMu.
-	peerReInvite *pendingReInvite
-
 	// media session is RTP local and remote
 	// it is forked on media changes and updated on writer and reader
 	// must be mutex protected
 	// It MUST be always created on Media Session Init
 	// Only safe to use after dialog Answered (Completed state)
 	mediaSession *media.MediaSession
+	// Pending fork used while a locally initiated SDP offer waits for its answer.
+	pendingMediaSession *media.MediaSession
 
 	// rtp session is created for usage with RTPPacketReader and RTPPacketWriter
 	// it adds RTCP layer and RTP monitoring before passing packets to MediaSession
 	rtpSession *media.RTPSession
-
-	// iceAgentOwner is the media session that created this dialog's ICE agent,
-	// kept after a re-INVITE replaced it with a fork. The fork shares the ICE
-	// pair but not the agent, and closing the pair does not release the UDP
-	// mux or the socket it wraps; only the owner's Close does. Dropping the
-	// owner on the swap would leak that socket and its mux goroutine for the
-	// life of the process, and hand the port back to the allocator while it is
-	// still bound. Nil until a swap, and for a dialog without ICE.
-	iceAgentOwner *media.MediaSession
 	// Packet reader is default reader for RTP audio stream
 	// Use always AudioReader to get current Audio reader
 	// Use this only as read only
@@ -111,684 +66,36 @@ type DialogMedia struct {
 	// Use this only as read only
 	RTPPacketWriter *media.RTPPacketWriter
 
-	// jitterBuffer is the buffer WithAudioReaderJitterBuffer put between the
-	// RTP session and RTPPacketReader, nil without one. A media update moves it
-	// onto the new RTP session rather than taking it off the packet reader.
-	jitterBuffer *media.RTPJitterBuffer
-
 	// In case we are chaining audio readers
 	audioReader io.Reader
 	audioWriter io.Writer
 
-	// remoteContactTarget is actual target changed caused by incomign or outgoing REINVITE
-	// We do not use sipgo as this needs mutex but also keeping original invite
-	remoteContactTarget *sip.ContactHeader
-
-	onReferNotify func(statusCode int)
-
-	// referMu guards referAttempts, referHighestCSeq, referLatest, the
-	// attempts they hold and onReferNotifyUnmatched. It is separate from mu so
-	// observing a REFER NOTIFY never contends with media state.
-	referMu sync.Mutex
-	// referAttempts are the open REFER attempts, oldest first: each lives as
-	// long as its refer subscription, up to its deadline (see referAttempt),
-	// past the dialog's BYE and its media's close (RFC 5057 section 5.5).
-	referAttempts []*referAttempt
-	// referHighestCSeq is the highest CSeq recorded for a REFER sent on this
-	// dialog, retired attempts included. In-dialog CSeqs only grow, so an Event
-	// id at or below it belongs to an earlier REFER.
-	referHighestCSeq uint32
-	// referLatest is the attempt begun most recently. It is kept after it is
-	// retired, so a NOTIFY without an Event id is never given to an older
-	// attempt once a newer one has started.
-	referLatest *referAttempt
-	// onReferNotifyUnmatched is told of a refer NOTIFY no open attempt holds.
-	// Set by OnReferNotifyUnmatched.
-	onReferNotifyUnmatched func(ReferNotify)
-
-	// releaseRTPPort returns this dialog RTP port to the allocator that handed
-	// it out. Nil when no allocator is installed, as the OS takes the port back
-	// when the socket closes. Set next to mediaSession and consumed by Close.
-	releaseRTPPort func()
-
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
 
-	// ackTimers are the timers of the retransmission of a 2xx to a re-INVITE
-	// of the peer's. They are set before the dialog is used, and zero outside
-	// tests.
-	ackTimers ackTimers
-
-	// mediaUpdateHooks are told of every media update, as onMediaUpdate is,
-	// for the package's own use: a bridge mixing or proxying the dialog's audio
-	// has to know when its codec changes, and onMediaUpdate belongs to the
-	// application.
-	mediaUpdateHooks []*mediaUpdateHook
-
-	// mediaUpdating is set while a media update waits, with mu released, for
-	// the handshake of a new DTLS association. Another update is kept out
-	// until it is done.
-	mediaUpdating bool
-
-	// ackOffer is the offer we sent in the 2xx to a re-INVITE of the peer's
-	// that carried none, until the ACK to that 2xx brings the answer (RFC 3261
-	// section 14.2). Guarded by mu.
-	ackOffer *ackOffer
-
-	// mediaUpdateDone is set while a re-INVITE of the peer's or one of ours
-	// is in progress, and closed when it ends. Our re-INVITE waits for the
-	// peer's to end, and the peer's finding ours in progress is answered 491
-	// (RFC 3261 sections 14.1 and 14.2). Guarded by mu.
-	mediaUpdateDone chan struct{}
-
-	// closed latches the first Close. closeDone is closed once that Close has
-	// released the port, so a Close made after it returns only once the media
-	// is released. Both are guarded by mu.
-	closed    bool
-	closeDone chan struct{}
+	closed bool
 }
 
-// ackOffer is an offer we sent in a 2xx to a re-INVITE, awaiting its answer in
-// the ACK.
-type ackOffer struct {
-	// cseq is the CSeq of the re-INVITE, which the ACK to its 2xx carries.
-	cseq uint32
-	// msess is the fork that made the offer, which the answer is applied to.
-	msess *media.MediaSession
-}
-
-// pendingReInvite is a re-INVITE of the peer's being handled. Every field is
-// guarded by DialogMedia.answerMu, but for ackErr, which retransmitted
-// publishes.
-type pendingReInvite struct {
-	req *sip.Request
-	tx  sip.ServerTransaction
-	// cseq is the CSeq of the re-INVITE, which the ACK to its 2xx carries.
-	cseq uint32
-	// dialog is the dialog the re-INVITE belongs to. Once it has ended the
-	// re-INVITE is answered 487.
-	dialog *sipgo.Dialog
-	// answered is set once the re-INVITE has its final response.
-	answered bool
-	// on2xx, when set, is called with the 2xx to the re-INVITE just before it
-	// is sent, see onPeerReInvite2xx.
-	on2xx func(res *sip.Response)
-	// acked is made when a 2xx is sent, and closed once its ACK is read.
-	acked chan struct{}
-	// retransmitted is made when a 2xx is sent, and closed once its
-	// retransmission has ended; ackErr then says why, nil for an ACK or the
-	// end of the dialog.
-	retransmitted chan struct{}
-	ackErr        error
-}
-
-// errReInviteAckTimeout is why a re-INVITE of the peer's ended when the ACK to
-// our 2xx did not come within 64*T1. RFC 3261 section 13.3.1.4 has the dialog
-// confirmed, and the session ended with a BYE.
-var errReInviteAckTimeout = errors.New("no ACK received for the 2xx to a re-INVITE")
-
-// ackTimers are the timers of the retransmission of a 2xx to a re-INVITE of
-// the peer's: the first interval, the interval it doubles up to, and how long
-// it waits for the ACK. Zero values take T1, T2 and 64*T1 (RFC 3261 section
-// 13.3.1.4).
-type ackTimers struct {
-	t1, t2, timeout time.Duration
-}
-
-func (t ackTimers) values() (t1, t2, timeout time.Duration) {
-	t1, t2, timeout = t.t1, t.t2, t.timeout
-	if t1 <= 0 {
-		t1 = sip.T1
-	}
-	if t2 <= 0 {
-		t2 = sip.T2
-	}
-	if timeout <= 0 {
-		timeout = 64 * sip.T1
-	}
-	return t1, t2, timeout
-}
-
-// beginPeerReInvite answers req 481 when dialog has ended, and otherwise
-// records it as the peer's re-INVITE being handled, until endPeerReInvite. It
-// reports whether it answered. An ended dialog stays in the dialog cache until
-// its call handler returns, for an inbound call, or until it is closed, for an
-// outbound one, so a re-INVITE can still find it. It matches no live dialog,
-// and RFC 3261 section 12.2.2 has it answered 481.
-func (d *DialogMedia) beginPeerReInvite(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction) (bool, error) {
-	d.answerMu.Lock()
-	defer d.answerMu.Unlock()
-	if dialog.LoadState() == sip.DialogStateEnded {
-		res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
-		return true, tx.Respond(ctx, res)
-	}
-	p := &pendingReInvite{req: req, tx: tx, dialog: dialog}
-	if cseq := req.CSeq(); cseq != nil {
-		p.cseq = cseq.SeqNo
-	}
-	d.peerReInvite = p
-	return false, nil
-}
-
-// onPeerReInvite2xx has f called with the 2xx to the re-INVITE
-// beginPeerReInvite recorded for tx just before it is sent, with answerMu
-// held: f may add headers to it and act on its being sent, and must not block.
-func (d *DialogMedia) onPeerReInvite2xx(tx sip.ServerTransaction, f func(res *sip.Response)) {
-	d.answerMu.Lock()
-	defer d.answerMu.Unlock()
-	if p := d.peerReInvite; p != nil && p.tx == tx {
-		p.on2xx = f
-	}
-}
-
-// endPeerReInvite waits until the retransmission of a 2xx sent to the
-// re-INVITE beginPeerReInvite recorded for tx has ended, and then forgets the
-// re-INVITE. It returns errReInviteAckTimeout when the ACK did not come, for
-// the caller to end the call.
-func (d *DialogMedia) endPeerReInvite(tx sip.ServerTransaction) error {
-	d.answerMu.Lock()
-	p := d.peerReInvite
-	if p == nil || p.tx != tx {
-		d.answerMu.Unlock()
-		return nil
-	}
-	retransmitted := p.retransmitted
-	d.answerMu.Unlock()
-
-	var err error
-	if retransmitted != nil {
-		<-retransmitted
-		err = p.ackErr
-	}
-
-	d.answerMu.Lock()
-	if d.peerReInvite == p {
-		d.peerReInvite = nil
-	}
-	d.answerMu.Unlock()
-	return err
-}
-
-// ackPeerReInvite tells the re-INVITE of the peer's being handled that ack,
-// the ACK to our 2xx, has been read, which ends the retransmission of the 2xx.
-func (d *DialogMedia) ackPeerReInvite(ack *sip.Request) {
-	cseq := ack.CSeq()
-	if cseq == nil {
-		return
-	}
-	d.answerMu.Lock()
-	defer d.answerMu.Unlock()
-	p := d.peerReInvite
-	if p == nil || p.acked == nil || p.cseq != cseq.SeqNo {
-		return
-	}
-	select {
-	case <-p.acked:
-	default:
-		close(p.acked)
-	}
-}
-
-// retransmitReInvite2xx passes res, the 2xx sent to the re-INVITE p, to the
-// transaction again until its ACK is read: the server transaction does not
-// retransmit a 2xx, the UAS core does (RFC 3261 section 13.3.1.4, RFC 6026
-// section 7.1). The interval starts at T1 and doubles up to T2. It gives up
-// with errReInviteAckTimeout after 64*T1, and stops once the dialog has ended:
-// a retransmission is sent under answerMu while the dialog is live, so none
-// follows the 200 to a BYE.
-func (d *DialogMedia) retransmitReInvite2xx(p *pendingReInvite, res *sip.Response) {
-	defer close(p.retransmitted)
-	t1, t2, timeout := d.ackTimers.values()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	interval := t1
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-p.acked:
-			return
-		case <-p.dialog.Context().Done():
-			return
-		case <-deadline.C:
-			p.ackErr = errReInviteAckTimeout
-			return
-		case <-timer.C:
-			d.answerMu.Lock()
-			ended := p.dialog.LoadState() == sip.DialogStateEnded
-			var err error
-			if !ended {
-				err = p.tx.Respond(p.dialog.Context(), res)
-			}
-			d.answerMu.Unlock()
-			if ended {
-				return
-			}
-			if err != nil {
-				// Timer L ends the transaction 64*T1 after the 2xx, when
-				// the wait is over too.
-				p.ackErr = errors.Join(errReInviteAckTimeout, err)
-				return
-			}
-			interval = min(2*interval, t2)
-			timer.Reset(interval)
-		}
-	}
-}
-
-// respondPeerReInvite sends res as the final response to the peer's re-INVITE
-// on tx, and reports whether res was sent. A re-INVITE the end of the dialog
-// has answered gets nothing more, and one found pending once the dialog has
-// ended is answered 487 instead (RFC 3261 section 15.1.2). A request
-// beginPeerReInvite did not record is answered res as it is.
-func (d *DialogMedia) respondPeerReInvite(ctx context.Context, tx sip.ServerTransaction, res *sip.Response) (bool, error) {
-	d.answerMu.Lock()
-	defer d.answerMu.Unlock()
-	p := d.peerReInvite
-	if p == nil || p.tx != tx {
-		return true, tx.Respond(ctx, res)
-	}
-	if p.answered {
-		return false, nil
-	}
-	p.answered = true
-	if p.dialog.LoadState() == sip.DialogStateEnded {
-		return false, tx.Respond(ctx, sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
-	}
-	if !res.IsSuccess() {
-		return true, tx.Respond(ctx, res)
-	}
-	if p.on2xx != nil {
-		p.on2xx(res)
-	}
-	// The re-INVITE is a target refresh request, which moves the remote
-	// target as its 2xx is sent, and never when it is refused (RFC 6141
-	// section 4.6).
-	d.mu.Lock()
-	d.remoteContactTarget = p.req.Contact().Clone()
-	d.mu.Unlock()
-	// Made before the 2xx goes out, which its ACK can follow at once.
-	p.acked = make(chan struct{})
-	if err := tx.Respond(ctx, res); err != nil {
-		return true, err
-	}
-	p.retransmitted = make(chan struct{})
-	go d.retransmitReInvite2xx(p, res)
-	return true, nil
-}
-
-// terminatePeerReInviteLocked answers the peer's re-INVITE 487 when it is
-// still pending once a BYE has ended the dialog: RFC 3261 section 15.1.2 has
-// every pending request answered, and recommends 487. Called with answerMu
-// held.
-func (d *DialogMedia) terminatePeerReInviteLocked(ctx context.Context) error {
-	p := d.peerReInvite
-	if p == nil || p.answered {
-		return nil
-	}
-	p.answered = true
-	return p.tx.Respond(ctx, sip.NewResponseFromRequest(p.req, sip.StatusRequestTerminated, "Request Terminated", nil))
-}
-
-// referAttempt is one REFER sent on the dialog, the refer subscription it
-// created, and what has been observed for it. Every field is guarded by
-// DialogMedia.referMu.
-//
-// The attempt lives as long as its subscription (RFC 6665 section 4.1.3; RFC
-// 3515 section 2.4.4), and we end it ourselves when its deadline passes. The
-// deadline is 64×T1 from the REFER's 2xx until a NOTIFY arrives. The first NOTIFY
-// that does not end the subscription replaces it with that NOTIFY's duration,
-// counted from its arrival (see referSubscriptionBound), at most
-// referSubscriptionMaxBound. Each later NOTIFY may only bring the deadline
-// earlier (RFC 6665 section 4.2.2), so the subscription ends at most 64×T1 plus
-// referSubscriptionMaxBound after the 2xx. The attempt is registered before its
-// REFER is sent and retired when it ends. A BYE on the dialog's INVITE usage does
-// not end it (RFC 5057 section 5.5), so the dialog's media close leaves it
-// registered.
-type referAttempt struct {
-	// cseq is the CSeq of the sent REFER. RFC 3515 makes the NOTIFY's Event id
-	// the CSeq of the REFER that created the subscription, so this is what an
-	// id-carrying NOTIFY is matched against.
-	cseq uint32
-	// cseqKnown is false until setReferAttemptCSeq records the sent REFER's CSeq.
-	// Until then an id-carrying NOTIFY cannot be told apart from this attempt's.
-	cseqKnown bool
-	// registered is true while the attempt is in referAttempts.
-	registered bool
-	// end is how the attempt ended, zero while it is open.
-	end ReferEnd
-	// notifies are the NOTIFYs recorded while the attempt was open, at most
-	// maxReferNotifies, and dropped counts the ones not kept.
-	notifies []ReferNotify
-	dropped  int
-	// notified is true once a NOTIFY was recorded, so the deadline passing ends
-	// the attempt as ReferEndSubscriptionExpired rather than ReferEndNoNotify.
-	notified bool
-	// deadline is the instant the subscription ends on our side. It is 64×T1 after
-	// the REFER's 2xx until a NOTIFY arrives; the first NOTIFY that does not end
-	// the subscription sets it to that NOTIFY's duration from its arrival, capped
-	// at referSubscriptionMaxBound; a later NOTIFY can only move it earlier. Zero
-	// until the subscription begins.
-	deadline time.Time
-	// bound is the timer that ends the attempt at deadline. Nil until the
-	// subscription begins; stopped when the attempt ends. boundArmed counts the
-	// times it was armed, so a timer that fired as it was being replaced ends
-	// nothing.
-	bound      *time.Timer
-	boundArmed uint64
-	// done is closed when the attempt is retired: ended on a NOTIFY, after the
-	// 200 to it has been sent, or at its deadline.
-	done chan struct{}
-}
-
-// beginReferAttempt registers a new REFER attempt as the most recent one and
-// returns it. Called before the REFER is sent so a NOTIFY that races ahead of
-// the REFER's response is recorded rather than lost.
-func (d *DialogMedia) beginReferAttempt() *referAttempt {
-	a := &referAttempt{registered: true, done: make(chan struct{})}
-	d.referMu.Lock()
-	d.referAttempts = append(d.referAttempts, a)
-	d.referLatest = a
-	d.referMu.Unlock()
-	return a
-}
-
-// setReferAttemptCSeq records the sent REFER's CSeq on the dialog's high-water
-// mark and on a, whatever a's state: a NOTIFY that raced ahead of the REFER's
-// response may already have ended and retired a, and the CSeq still belongs to
-// what a observed. Routing reads registered attempts only, so a retired one's
-// CSeq takes no NOTIFY.
-func (d *DialogMedia) setReferAttemptCSeq(a *referAttempt, cseq uint32) {
-	d.referMu.Lock()
-	if cseq > d.referHighestCSeq {
-		d.referHighestCSeq = cseq
-	}
-	a.cseq = cseq
-	a.cseqKnown = true
-	d.referMu.Unlock()
-}
-
-// startReferSubscription begins a's subscription at its REFER's 2xx (RFC 6665
-// section 8.3.1, which RFC 7647 section 5 applies to a REFER): Timer N, 64×T1,
-// bounds the wait for its first NOTIFY (section 4.1.2.4). A NOTIFY that raced
-// ahead of the 2xx has already begun it (RFC 3515 section 2.4.4), and its
-// deadline stands.
-func (d *DialogMedia) startReferSubscription(a *referAttempt) {
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-	if a.end != 0 || a.bound != nil {
-		return
-	}
-	d.armReferBoundLocked(a, time.Now().Add(64*sip.T1))
-}
-
-// armReferBoundLocked sets a's deadline to deadline and arms its bound to end
-// the attempt then, replacing the bound it had. Called with referMu held, on an
-// open attempt.
-func (d *DialogMedia) armReferBoundLocked(a *referAttempt, deadline time.Time) {
-	if a.bound != nil {
-		a.bound.Stop()
-	}
-	a.boundArmed++
-	armed := a.boundArmed
-	a.deadline = deadline
-	a.bound = time.AfterFunc(time.Until(deadline), func() { d.endReferAttemptOnItsBound(a, armed) })
-}
-
-// endReferAttemptOnItsBound ends a when its deadline passes with the attempt
-// still open and the bound still the one armed as armed.
-func (d *DialogMedia) endReferAttemptOnItsBound(a *referAttempt, armed uint64) {
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-	if a.end != 0 || a.boundArmed != armed {
-		return
-	}
-	d.endReferAttemptOnItsBoundLocked(a)
-}
-
-// endReferAttemptOnItsBoundLocked ends the open attempt a whose deadline has
-// passed: as expired when a NOTIFY set the deadline, else as no NOTIFY came
-// within Timer N. Called with referMu held.
-func (d *DialogMedia) endReferAttemptOnItsBoundLocked(a *referAttempt) {
-	if a.notified {
-		a.end = ReferEndSubscriptionExpired
-	} else {
-		a.end = ReferEndNoNotify
-	}
-	d.retireReferAttemptLocked(a)
-}
-
-// recordReferNotify routes one parsed NOTIFY to the open REFER attempt it
-// belongs to and records it there, and returns that attempt, or nil when none
-// holds it. With an Event id that is the registered attempt whose known CSeq
-// equals it, or else the most recent attempt while its CSeq is still unknown,
-// provided no other attempt awaits its CSeq and the id is above every REFER
-// CSeq the dialog has recorded; without an id it is the most recent attempt.
-//
-// A NOTIFY that does not end the attempt sets its deadline. The first one sets
-// it to its duration from now, which replaces the 64×T1 wait. A later one sets
-// it to the earlier of its own duration from now and the deadline already set,
-// so a NOTIFY can shorten the subscription but never lengthen it (RFC 6665
-// section 4.2.2). A NOTIFY that arrives after the deadline passed is refused, as
-// one after the end is: the attempt ends as the deadline's timer would have ended
-// it, and nil is returned.
-//
-// A NOTIFY that ends the attempt sets its end here, so neither its deadline nor
-// its caller can end it another way; the attempt is retired by
-// retireEndedReferAttempt once the NOTIFY has been answered.
-func (d *DialogMedia) recordReferNotify(n ReferNotify) *referAttempt {
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-
-	a := d.referNotifyTargetLocked(n)
-	if a == nil || a.end != 0 {
-		return nil
-	}
-	now := time.Now()
-	if !a.deadline.IsZero() && !now.Before(a.deadline) {
-		// The deadline has passed but its timer has not ended the attempt yet.
-		d.endReferAttemptOnItsBoundLocked(a)
-		return nil
-	}
-	first := !a.notified
-	a.recordLocked(n)
-	if a.end == 0 {
-		deadline := now.Add(referSubscriptionBound(n))
-		if !first && a.deadline.Before(deadline) {
-			deadline = a.deadline
-		}
-		d.armReferBoundLocked(a, deadline)
-	}
-	return a
-}
-
-// retireEndedReferAttempt retires a if the NOTIFY just answered ended it, which
-// RFC 6665 section 4.4.1 places after that NOTIFY's 200.
-func (d *DialogMedia) retireEndedReferAttempt(a *referAttempt) {
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-	if a.end != 0 {
-		d.retireReferAttemptLocked(a)
-	}
-}
-
-// referNotifyExpected reports whether a NOTIFY carrying req's Event header has
-// a REFER sent on this dialog to go to: the OnNotify callback of ReferOptions,
-// or an open attempt it is routed to.
-func (d *DialogMedia) referNotifyExpected(req *sip.Request) bool {
-	d.mu.Lock()
-	onNotify := d.onReferNotify
-	d.mu.Unlock()
-	if onNotify != nil {
-		return true
-	}
-
-	var n ReferNotify
-	n.EventID, n.HasEventID = parseReferNotifyEventID(req)
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-	a := d.referNotifyTargetLocked(n)
-	return a != nil && a.end == 0
-}
-
-// referNotifyTargetLocked returns the registered attempt n belongs to, or nil.
-// Called with referMu held.
-func (d *DialogMedia) referNotifyTargetLocked(n ReferNotify) *referAttempt {
-	if n.HasEventID {
-		awaitingCSeq := 0
-		for _, a := range d.referAttempts {
-			if !a.cseqKnown {
-				awaitingCSeq++
-				continue
-			}
-			if a.cseq == n.EventID {
-				return a
-			}
-		}
-		// The NOTIFY may have raced ahead of the REFER's response, while the
-		// most recent attempt's CSeq is not known yet. In-dialog CSeqs only
-		// grow, so an id at or below the highest REFER CSeq recorded belongs to
-		// an earlier REFER, even one already retired. With a second attempt
-		// also awaiting its CSeq the id may be that attempt's, so it is given
-		// to neither.
-		if latest := d.referLatest; latest != nil && latest.registered && !latest.cseqKnown &&
-			awaitingCSeq == 1 && n.EventID > d.referHighestCSeq {
-			return latest
-		}
-		return nil
-	}
-	if latest := d.referLatest; latest != nil && latest.registered {
-		return latest
-	}
-	return nil
-}
-
-// recordLocked records n on an open attempt, marks the subscription begun, and
-// ends the attempt when n is terminal. Past maxReferNotifies a non-terminal
-// NOTIFY is only counted, and a terminal one takes the last slot so it is
-// always last. Called with referMu held.
-func (a *referAttempt) recordLocked(n ReferNotify) {
-	switch {
-	case len(a.notifies) < maxReferNotifies:
-		a.notifies = append(a.notifies, n)
-	case n.endsSubscription():
-		a.notifies[len(a.notifies)-1] = n
-		a.dropped++
-	default:
-		a.dropped++
-	}
-	a.notified = true
-
-	switch {
-	case n.isFinal():
-		a.end = ReferEndFinalNotify
-	case n.endsSubscription():
-		a.end = ReferEndSubscriptionEnded
-	}
-}
-
-// finishReferAttempt ends a with end unless a NOTIFY or its deadline already ended
-// it, or with ReferEndRefused regardless, retires it, and returns what a
-// observed. The caller giving the attempt up, ReferEndCancelled, retires it at
-// once, so a NOTIFY for it after that is answered 481.
-func (d *DialogMedia) finishReferAttempt(a *referAttempt, end ReferEnd) ReferObservation {
-	d.referMu.Lock()
-	defer d.referMu.Unlock()
-
-	// A refused REFER created no subscription, so its response decides the end
-	// even if a NOTIFY claiming an outcome raced ahead of it.
-	if a.end == 0 || end == ReferEndRefused {
-		a.end = end
-	}
-	d.retireReferAttemptLocked(a)
-	return ReferObservation{
-		End:             a.end,
-		CSeq:            a.cseq,
-		CSeqKnown:       a.cseqKnown,
-		Notifies:        slices.Clone(a.notifies),
-		NotifiesDropped: a.dropped,
-	}
-}
-
-// dropReferAttempt retires a, whose REFER could not be carried. Dropping an
-// attempt never affects another.
-func (d *DialogMedia) dropReferAttempt(a *referAttempt) {
-	d.referMu.Lock()
-	d.retireReferAttemptLocked(a)
-	d.referMu.Unlock()
-}
-
-// retireReferAttemptLocked stops a's bound, unregisters it, leaving referLatest
-// as it is, and closes its done once. Called with referMu held.
-func (d *DialogMedia) retireReferAttemptLocked(a *referAttempt) {
-	if a.bound != nil {
-		a.bound.Stop()
-	}
-	if !a.registered {
-		return
-	}
-	a.registered = false
-	d.referAttempts = slices.DeleteFunc(d.referAttempts, func(r *referAttempt) bool { return r == a })
-	close(a.done)
-}
-
-// OnReferNotifyUnmatched sets f as the function told of a refer NOTIFY that no
-// open REFER attempt of this dialog holds: one whose subscription has ended,
-// one for a REFER its caller gave up, or one for no REFER sent here. diago
-// answers such a NOTIFY 481 (RFC 6665 section 4.1.3) and never applies it; f
-// then receives it with its sipfrag status, once per NOTIFY, on the SIP
-// transaction goroutine and outside every lock, on a live dialog and on an
-// ended one still held. f must not block. Each call replaces the function set
-// before; nil, the default, reports nothing.
-func (d *DialogMedia) OnReferNotifyUnmatched(f func(ReferNotify)) {
-	d.referMu.Lock()
-	d.onReferNotifyUnmatched = f
-	d.referMu.Unlock()
-}
-
-// reportUnmatchedReferNotify hands n to the function OnReferNotifyUnmatched
-// set, if any. Called with no lock held.
-func (d *DialogMedia) reportUnmatchedReferNotify(n ReferNotify) {
-	d.referMu.Lock()
-	f := d.onReferNotifyUnmatched
-	d.referMu.Unlock()
-	if f != nil {
-		f(n)
-	}
-}
+var _ mediaHanshaker = (*DialogMedia)(nil)
 
 func (d *DialogMedia) Close() error {
 	// Any hook attached
 	// Prevent double exec
 	d.mu.Lock()
 	if d.closed {
-		done := d.closeDone
 		d.mu.Unlock()
-		// The first Close is still releasing the media. This one must not report
-		// it closed before the release has run: a caller that acts on the close
-		// (the port pool, the media's owner) would find the port still held.
-		<-done
 		return nil
 	}
 	d.closed = true
-	d.closeDone = make(chan struct{})
-	done := d.closeDone
-	defer close(done)
 
 	onClose := d.onClose
 	d.onClose = nil
 	m := d.mediaSession
 	rtpSess := d.rtpSession
-	iceOwner := d.iceAgentOwner
-	d.iceAgentOwner = nil
-	releasePort := d.releaseRTPPort
-	d.releaseRTPPort = nil
-	jitter := d.jitterBuffer
 
 	d.mu.Unlock()
 
-	var e1, e2, e3, e4, e5 error
+	var e1, e2, e3 error
 	if onClose != nil {
 		e1 = onClose()
 	}
@@ -800,85 +107,7 @@ func (d *DialogMedia) Close() error {
 	if m != nil {
 		e3 = m.Close()
 	}
-
-	// The agent goes after the session using its pair, so nothing is still
-	// reading or writing on the socket it releases, and before the port is
-	// returned below.
-	if iceOwner != nil && iceOwner != m {
-		e4 = iceOwner.Close()
-	}
-
-	// The jitter buffer was closed with the hooks above, but its read loop may
-	// still be in a read on the session. Closing the sockets fails that read,
-	// and the loop has stopped reading them once Done is closed.
-	if jitter != nil {
-		select {
-		case <-jitter.Done():
-		case <-time.After(jitterBufferStopTimeout):
-			e5 = errors.New("jitter buffer read loop did not stop")
-		}
-	}
-
-	// After the sockets are closed, never before. An allocator may hold the port
-	// for a drain window so late RTP from this call can not land on the next
-	// call socket, and that window has to start when the wire is actually down.
-	// The closed latch above makes this exactly once.
-	if releasePort != nil {
-		releasePort()
-	}
-	return errors.Join(e1, e2, e3, e4, e5)
-}
-
-// mediaUpdateHook is one function addMediaUpdateHook registered.
-type mediaUpdateHook struct {
-	f func()
-}
-
-// addMediaUpdateHook has f called after every update that replaces the media
-// session, once the session is in place and with the dialog's lock released,
-// and before the application's OnMediaUpdate. It returns the function that
-// removes f again. f runs on the goroutine that handled the update, which a
-// re-INVITE may hold until f returns.
-func (d *DialogMedia) addMediaUpdateHook(f func()) (remove func()) {
-	h := &mediaUpdateHook{f: f}
-	d.mu.Lock()
-	d.mediaUpdateHooks = append(d.mediaUpdateHooks, h)
-	d.mu.Unlock()
-	return func() {
-		d.mu.Lock()
-		d.mediaUpdateHooks = slices.DeleteFunc(d.mediaUpdateHooks, func(x *mediaUpdateHook) bool { return x == h })
-		d.mu.Unlock()
-	}
-}
-
-// runMediaUpdateHooks calls the media update hooks. It is called without the
-// dialog's lock, after an update that has replaced the media session.
-func (d *DialogMedia) runMediaUpdateHooks() {
-	d.mu.Lock()
-	hooks := slices.Clone(d.mediaUpdateHooks)
-	d.mu.Unlock()
-	for _, h := range hooks {
-		h.f()
-	}
-}
-
-// mediaUpdatedUnsafe calls the media update hooks and then the application's
-// OnMediaUpdate, with the dialog's lock released while they run. It is called
-// with the lock held, after an update that has replaced the media session.
-func (d *DialogMedia) mediaUpdatedUnsafe() {
-	hooks := slices.Clone(d.mediaUpdateHooks)
-	onMediaUpdate := d.onMediaUpdate
-	if len(hooks) == 0 && onMediaUpdate == nil {
-		return
-	}
-	d.mu.Unlock()
-	defer d.mu.Lock()
-	for _, h := range hooks {
-		h.f()
-	}
-	if onMediaUpdate != nil {
-		onMediaUpdate(d)
-	}
+	return errors.Join(e1, e2, e3)
 }
 
 func (d *DialogMedia) OnClose(f func() error) {
@@ -917,7 +146,7 @@ func (d *DialogMedia) initRTPSessionUnsafe(m *media.MediaSession, rtpSess *media
 	d.RTPPacketWriter = media.NewRTPPacketWriterSession(rtpSess)
 }
 
-func (d *DialogMedia) initMediaSessionFromConf(ctx context.Context, conf MediaConfig) error {
+func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
 	if d.mediaSession != nil {
 		// To allow testing or customizing current underhood session, this may be
 		// precreated, so we want to return if already initialized.
@@ -934,49 +163,21 @@ func (d *DialogMedia) initMediaSessionFromConf(ctx context.Context, conf MediaCo
 		}
 	}
 
-	// Port 0 leaves the choice to the OS or to the media package port range. An
-	// allocator, when installed, makes it instead, so the port comes from a range
-	// the operator has bounded and opened on the firewall.
-	rtpPort := 0
-	var releasePort func()
-	if alloc := conf.RTPPortAllocator; alloc != nil {
-		port, err := alloc.AllocateRTPPort(ctx)
-		if err != nil {
-			return err
-		}
-		rtpPort = port
-		releasePort = func() { alloc.ReleaseRTPPort(port) }
-	}
-
-	// The session takes DTLS by value, so an unset config is the zero one. That
-	// keeps a caller that never touched DTLS on the path it had before.
-	var dtlsConf media.DTLSConfig
-	if conf.DTLSConfig != nil {
-		dtlsConf = *conf.DTLSConfig
-	}
-
 	sess := &media.MediaSession{
 		Codecs:     slices.Clone(conf.Codecs),
-		Laddr:      net.UDPAddr{IP: bindIP, Port: rtpPort},
+		Laddr:      net.UDPAddr{IP: bindIP, Port: 0},
 		ExternalIP: conf.externalIP,
 		Mode:       sdp.ModeSendrecv,
 		SecureRTP:  conf.secureRTP,
 		SRTPAlg:    conf.SecureRTPAlg,
 		RTPNAT:     conf.rtpNAT,
-		DTLSConf:   dtlsConf,
-		ICEConf:    conf.ICEConfig,
+		DTLSConf:   conf.dtlsConf,
 	}
 
 	if err := sess.Init(); err != nil {
-		// Nothing was bound, so the port goes straight back rather than wait for
-		// a Close that will not come: this dialog has no media session.
-		if releasePort != nil {
-			releasePort()
-		}
 		return err
 	}
 	d.mediaSession = sess
-	d.releaseRTPPort = releasePort
 	return nil
 }
 
@@ -994,394 +195,90 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 	return d.mediaSession
 }
 
-// endsWithDialog derives from ctx a ctx that also ends when dialog does, with
-// the dialog's cause, and the func that releases it. The release waits for the
-// callback that carries the dialog's end across, when it has started.
-func endsWithDialog(ctx context.Context, dialog *sipgo.Dialog) (context.Context, func()) {
-	dialogCtx := dialog.Context()
-	ctx, cancel := context.WithCancelCause(ctx)
-	done := make(chan struct{})
-	stop := context.AfterFunc(dialogCtx, func() {
-		defer close(done)
-		cancel(context.Cause(dialogCtx))
-	})
-	return ctx, func() {
-		if !stop() {
-			<-done
-		}
-		cancel(nil)
-	}
-}
+func (d *DialogMedia) setupRTPSession(sdp []byte, rtpSess *media.RTPSession) error {
+	sess := rtpSess.Sess
 
-// handleMediaUpdate answers an in-dialog INVITE and applies its offer, if it
-// has one, to a fork of the media session. ctx is the request handler's: the
-// answer goes out on it, and a DTLS handshake the offer asks for runs on it and
-// ends with dialog as well. The RTCP monitors of the installed session run as
-// long as dialog does. An error wrapping errMediaUpdateAfterAnswer means the
-// update failed after the 2xx was sent, and the caller ends the call.
-//
-// The answer is sent through respondPeerReInvite with mu released, so a BYE
-// that ends the dialog meanwhile has it answered 487 instead.
-func (d *DialogMedia) handleMediaUpdate(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
-	respond := func(res *sip.Response) error {
-		_, err := d.respondPeerReInvite(ctx, tx, res)
+	if err := sess.RemoteSDP(sdp, false); err != nil {
 		return err
 	}
 
 	d.mu.Lock()
-	// A BYE handled while this request was pending has closed the media. The
-	// request is still answered, with the 487 RFC 3261 section 15.1.2
-	// recommends, and nothing is negotiated on the closed session.
-	if d.closed {
-		d.mu.Unlock()
-		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
-	}
-	// The previous update is still running the handshake of a new DTLS
-	// association. RFC 3261 section 14.2 lets a request that cannot be taken
-	// now be retried after a 491.
-	if d.mediaUpdating {
-		d.mu.Unlock()
-		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
-	}
+	d.initRTPSessionUnsafe(sess, rtpSess)
+	// Close RTP session
+	// d.onCloseUnsafe(func() error {
+	// 	return rtpSess.Close()
+	// })
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *DialogMedia) handleMediaUpdate(remoteSDP []byte) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	// When body is not present this can mean client is doing keep alive
-	// Still offer needs to be responded.
-	// Content-Length: 0 can reach us as an empty but non nil body, so length is
-	// checked rather than nilness.
-	if len(req.Body()) > 0 {
-		msess, err := d.sdpReInviteUnsafe(req.Body())
-		if err == nil && msess.FinalizePending() {
-			d.mediaUpdating = true
+	// Still offer needs to be responded
+	if remoteSDP != nil {
+		if err := d.sdpReInviteUnsafe(remoteSDP); err != nil {
+			return nil, err
+		}
+
+		if d.onMediaUpdate != nil {
 			d.mu.Unlock()
-			return d.answerNewAssociation(ctx, dialog, req, tx, contactHDR, msess)
-		}
-		if err == nil {
-			err = d.replaceRTPSessionUnsafe(dialog.Context(), msess)
-		}
-		if err != nil {
-			d.mu.Unlock()
-			// The offer is well formed but needs an ICE restart, to restart ICE
-			// or to run a new DTLS association over it (RFC 8842 section 6),
-			// which this session cannot perform. The fork was never installed,
-			// so the call carries on over its current pair. The reason phrase
-			// is fixed and carries no error text, so nothing internal reaches
-			// the peer.
-			if errors.Is(err, media.ErrICERestartUnsupported) {
-				return respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
-			}
-			return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
-		}
-
-		d.mediaUpdatedUnsafe()
-	}
-
-	// A request for an offer can not be answered with an SDP we never built.
-	// The bodied path rejects this inside sdpReInviteUnsafe.
-	if d.mediaSession == nil {
-		d.mu.Unlock()
-		return respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - no media session present", nil))
-	}
-
-	var sd []byte
-	var offer *ackOffer
-	if len(req.Body()) > 0 {
-		// The installed fork answers the peer's offer.
-		sd = d.mediaSession.LocalSDP()
-	} else {
-		// Our 2xx carries an offer, which the ACK answers (RFC 3261 section
-		// 14.2). A fork makes it and takes the answer, so neither changes the
-		// installed session, which carries the media meanwhile.
-		offer = &ackOffer{msess: d.mediaSession.Fork()}
-		if cseq := req.CSeq(); cseq != nil {
-			offer.cseq = cseq.SeqNo
-		}
-		sd = negotiatedOffer(offer.msess, d.mediaSession)
-		d.ackOffer = offer
-	}
-	d.mu.Unlock()
-	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sd)
-	res.AppendHeader(contactHDR)
-	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	sent, err := d.respondPeerReInvite(ctx, tx, res)
-	if offer != nil && !sent {
-		// No 2xx went out, so no ACK will answer the offer.
-		d.mu.Lock()
-		if d.ackOffer == offer {
-			d.ackOffer = nil
-		}
-		d.mu.Unlock()
-	}
-	return err
-}
-
-// applyAckAnswer applies the answer an ACK carries to the offer we sent in the
-// 2xx to a re-INVITE of the peer's, on the fork that made the offer, and
-// installs the fork. It reports whether req is the ACK to that 2xx. An ACK
-// without an answer, or once the media is closed, drops the offer. ctx is the
-// dialog's: it bounds a DTLS handshake the answer asks for.
-//
-// An ACK cannot be refused, so an error means the answer could not be applied
-// or keyed, the media is left as it was, and the caller ends the call, as RFC
-// 3261 section 14.2 has a UAC do with an offer it cannot accept.
-func (d *DialogMedia) applyAckAnswer(ctx context.Context, req *sip.Request) (bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	offer := d.ackOffer
-	cseq := req.CSeq()
-	if offer == nil || cseq == nil || cseq.SeqNo != offer.cseq {
-		return false, nil
-	}
-	d.ackOffer = nil
-	msess := offer.msess
-
-	contentType := req.ContentType()
-	if d.closed || len(req.Body()) == 0 || contentType == nil || contentType.Value() != "application/sdp" {
-		return true, d.discardForkUnsafe(msess)
-	}
-	msess.RemoteSDPIsAnswer = true
-	if err := msess.RemoteSDP(req.Body()); err != nil {
-		return true, errors.Join(fmt.Errorf("sdp update media remote SDP applying failed: %w", err), d.discardForkUnsafe(msess))
-	}
-	if msess.FinalizePending() {
-		return true, d.finalizeAndReplaceUnsafe(ctx, msess)
-	}
-	return true, d.replaceRTPSessionUnsafe(ctx, msess)
-}
-
-// answerNewAssociation answers a re-INVITE whose offer msess found to ask for
-// a new DTLS association, runs the handshake, and only then installs msess.
-// The handshake needs the answer, which tells the peer where msess is and
-// which certificate it presents (RFC 8842 section 5.3), and msess has no SRTP
-// keys until it completes, so the current session carries the media
-// meanwhile. It is called without mu and with mediaUpdating set, which keeps
-// other media updates out until it clears it.
-//
-// A dialog that ends before the answer has the re-INVITE answered 487 by the
-// BYE, and one that ends while the handshake runs ends it: the handshake runs
-// on ctx ended with dialog. Either way nothing is installed and the fork is
-// discarded.
-func (d *DialogMedia) answerNewAssociation(ctx context.Context, dialog *sipgo.Dialog, req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header, msess *media.MediaSession) error {
-	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", msess.LocalSDP())
-	res.AppendHeader(contactHDR)
-	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	sent, err := d.respondPeerReInvite(ctx, tx, res)
-	if err != nil || !sent {
-		d.mu.Lock()
-		d.mediaUpdating = false
-		err = errors.Join(err, d.discardForkUnsafe(msess))
-		d.mu.Unlock()
-		return err
-	}
-
-	handshakeCtx, release := endsWithDialog(ctx, dialog)
-	defer release()
-	err = msess.FinalizeContext(handshakeCtx)
-
-	d.mu.Lock()
-	d.mediaUpdating = false
-	switch {
-	case handshakeCtx.Err() != nil:
-		// The dialog ended, which is no failure of the update.
-		err = d.discardForkUnsafe(msess)
-		d.mu.Unlock()
-		return err
-	case err == nil && d.closed:
-		err = fmt.Errorf("media closed during the media update")
-	}
-	if err != nil {
-		err = errors.Join(err, d.discardForkUnsafe(msess))
-	} else {
-		err = d.replaceRTPSessionUnsafe(dialog.Context(), msess)
-	}
-	onMediaUpdate := d.onMediaUpdate
-	d.mu.Unlock()
-	if err != nil {
-		return fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err)
-	}
-
-	d.runMediaUpdateHooks()
-	if onMediaUpdate != nil {
-		onMediaUpdate(d)
-	}
-	return nil
-}
-
-// finalizeAndReplaceUnsafe runs the negotiation msess has pending and then
-// installs it. d.mu is released while the negotiation waits for the peer, and
-// mediaUpdating keeps other media updates out meanwhile. ctx is the dialog's.
-// When the negotiation fails, or the dialog media is closed or the dialog ends
-// meanwhile, msess is not installed and is discarded.
-func (d *DialogMedia) finalizeAndReplaceUnsafe(ctx context.Context, msess *media.MediaSession) error {
-	d.mediaUpdating = true
-	d.mu.Unlock()
-	err := msess.FinalizeContext(ctx)
-	d.mu.Lock()
-	d.mediaUpdating = false
-
-	if err == nil && (d.closed || ctx.Err() != nil) {
-		err = errMediaClosed
-	}
-	if err == nil {
-		err = d.replaceRTPSessionUnsafe(ctx, msess)
-	}
-	if err != nil {
-		return errors.Join(err, d.discardForkUnsafe(msess))
-	}
-	return nil
-}
-
-// beginOwnMediaUpdate waits, bounded by ctx, until no re-INVITE is in
-// progress, and marks one of ours in progress until the returned func is
-// called. RFC 3261 section 14.1 has a UAC start no re-INVITE while another
-// INVITE transaction is in progress in either direction.
-func (d *DialogMedia) beginOwnMediaUpdate(ctx context.Context) (func(), error) {
-	for {
-		d.mu.Lock()
-		if d.closed {
-			d.mu.Unlock()
-			return nil, errMediaClosed
-		}
-		done := d.mediaUpdateDone
-		if done == nil {
-			done = make(chan struct{})
-			d.mediaUpdateDone = done
-			d.mu.Unlock()
-			return func() { d.endMediaUpdate(done) }, nil
-		}
-		d.mu.Unlock()
-
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+			d.onMediaUpdate(d)
+			d.mu.Lock()
 		}
 	}
+
+	// Reply with updated SDP
+	return d.mediaSession.LocalSDP(true), nil
 }
 
-// beginPeerMediaUpdate marks a re-INVITE of the peer's in progress until the
-// returned func is called, and reports false when one of ours is in progress
-// instead, which RFC 3261 section 14.2 has the peer's answered 491. The peer's
-// re-INVITEs take turns under requestMu, so only ours can be in progress.
-func (d *DialogMedia) beginPeerMediaUpdate() (func(), bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.mediaUpdateDone != nil {
-		return nil, false
-	}
-	done := make(chan struct{})
-	d.mediaUpdateDone = done
-	return func() { d.endMediaUpdate(done) }, true
-}
-
-// reInviteRetryWait waits, bounded by ctx, before a re-INVITE of ours answered
-// 491 is sent again. callIDOwner tells whether we generated the dialog's
-// Call-ID, as the caller does. RFC 3261 section 14.1:
-//
-//	If a UAC receives a 491 response to a re-INVITE, it SHOULD start a
-//	timer with a value T chosen as follows:
-//	   1. If the UAC is the owner of the Call-ID of the dialog ID
-//	      (meaning it generated the value), T has a randomly chosen value
-//	      between 2.1 and 4 seconds in units of 10 ms.
-//	   2. If the UAC is not the owner of the Call-ID of the dialog ID, T
-//	      has a randomly chosen value of between 0 and 2 seconds in units
-//	      of 10 ms.
-func reInviteRetryWait(ctx context.Context, callIDOwner bool) error {
-	wait := time.Duration(mrand.IntN(201)) * 10 * time.Millisecond
-	if callIDOwner {
-		wait = time.Duration(210+mrand.IntN(191)) * 10 * time.Millisecond
-	}
-	select {
-	case <-time.After(wait):
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (d *DialogMedia) endMediaUpdate(done chan struct{}) {
-	d.mu.Lock()
-	if d.mediaUpdateDone == done {
-		d.mediaUpdateDone = nil
-	}
-	d.mu.Unlock()
-	close(done)
-}
-
-// discardForkUnsafe closes a fork that is not going to be installed, if it was
-// moved to sockets of its own. A fork on the sockets of the installed session
-// is only dropped, since closing it would close them.
-func (d *DialogMedia) discardForkUnsafe(msess *media.MediaSession) error {
-	cur := d.mediaSession
-	if cur != nil && cur.Laddr.IP.Equal(msess.Laddr.IP) && cur.Laddr.Port == msess.Laddr.Port {
-		return nil
-	}
-	return msess.Close()
-}
-
-// sdpReInviteUnsafe applies the offer of an inbound re-INVITE to a fork of the
-// media session, and returns the fork without installing it.
 // Must be protected with lock
-func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) (*media.MediaSession, error) {
+func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
 	if d.mediaSession == nil {
-		return nil, fmt.Errorf("no media session present")
+		return fmt.Errorf("no media session present")
 	}
 
-	// An inbound re-INVITE carries an offer, whichever side of the dialog we are.
-	d.mediaSession.RemoteSDPIsAnswer = false
-	msess := d.mediaSession.Fork()
-	if err := msess.RemoteSDP(sdp); err != nil {
-		return nil, fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+	if err := d.sdpUpdateUnsafe(sdp, false); err != nil {
+		return err
 	}
-	return msess, nil
+	return nil
 }
 
-// negotiatedOffer returns the offer of fork, a fork of the installed session
-// cur, made to renegotiate nothing. It carries the codecs cur runs on, with the
-// payload types they were negotiated with, as the offer of cur itself would,
-// so the peer is not asked to move the call to another codec. fork keeps every
-// codec it was set up with for the answer and what follows.
-func negotiatedOffer(fork, cur *media.MediaSession) []byte {
-	codecs := fork.Codecs
-	if negotiated := cur.CommonCodecs(); len(negotiated) > 0 {
-		fork.Codecs = slices.Clone(negotiated)
-	}
-	offer := fork.LocalSDP()
-	fork.Codecs = codecs
-	return offer
-}
-
-func (d *DialogMedia) checkEarlyMedia(ctx context.Context, remoteSDP []byte) error {
+func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	// RTP Session is only created when negotiation is finished. We use this to detect existing media
 	if d.rtpSession == nil {
 		return errNoRTPSession
 	}
-	return d.sdpUpdateUnsafe(ctx, remoteSDP)
+	if d.mediaSession == nil {
+		return fmt.Errorf("no media session present")
+	}
+	if err := d.mediaSession.RemoteSDP(remoteSDP, true); err != nil {
+		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+	}
+	return nil
 }
 
-func (d *DialogMedia) sdpUpdateUnsafe(ctx context.Context, sdp []byte) error {
+func (d *DialogMedia) sdpUpdateUnsafe(sdp []byte, offered bool) error {
 	msess := d.mediaSession.Fork()
-	if err := msess.RemoteSDP(sdp); err != nil {
+	if err := msess.RemoteSDP(sdp, offered); err != nil {
 		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 	}
 
-	return d.replaceRTPSessionUnsafe(ctx, msess)
+	return d.replaceRTPSessionUnsafe(msess)
 }
 
-func (d *DialogMedia) mediaUpdateUnsafe(ctx context.Context, msess *media.MediaSession) error {
-	return d.replaceRTPSessionUnsafe(ctx, msess)
+func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
+	return d.replaceRTPSessionUnsafe(msess)
 }
 
 // replaceRTPSessionUnsafe replaces the RTP session after the old monitor has
 // fully stopped. A fork preserves statistics and shared connections; a new
-// session is used when media connections were recreated. The new RTCP monitors
-// run on ctx, the dialog's.
-func (d *DialogMedia) replaceRTPSessionUnsafe(ctx context.Context, msess *media.MediaSession) error {
-	// Close has taken what it closes already, and would not close msess.
-	if d.closed {
-		return errMediaClosed
-	}
+// session is used when media connections were recreated.
+func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	oldRTPSess := d.rtpSession
 	if oldRTPSess == nil {
 		return fmt.Errorf("RTP Session is nil while trying to update it")
@@ -1393,54 +290,82 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(ctx context.Context, msess *media.
 
 	// Same as media, we are forking RTP Session
 	rtpSess := oldRTPSess.Fork(msess)
-	if err := rtpSess.MonitorBackground(ctx); err != nil {
+	if err := rtpSess.MonitorBackground(); err != nil {
 		return errors.Join(err, rtpSess.Close())
 	}
 
-	// Make sure any current reader is not consuming old media session. A
-	// jitter buffer stays in front of the packet reader and reads the new
-	// session itself, so its queue and playout carry over and no read loop is
-	// left on the old session.
-	if d.jitterBuffer != nil {
-		d.jitterBuffer.UpdateRTPSession(rtpSess)
-	} else {
-		d.RTPPacketReader.UpdateRTPSession(rtpSess)
-	}
+	// Make sure any current reader is not consuming old media session.
+	d.RTPPacketReader.UpdateRTPSession(rtpSess)
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
 
-	old := d.mediaSession
-	// Every path forks from the session installed at setup, so exactly one
-	// session ever owns an ICE agent, and it is the one replaced first. It is
-	// kept for Close rather than closed here, because the fork's media still
-	// runs on the pair that agent holds open.
-	if old != nil && old != msess && old.OwnsICEAgent() && d.iceAgentOwner == nil {
-		d.iceAgentOwner = old
-	}
 	d.mediaSession = msess
 	d.rtpSession = rtpSess
+	return nil
+}
 
-	// A read or write deadline set to end a read or write on the replaced
-	// session ends the one the packet reader or writer carries on over the new
-	// socket. It is taken over before the old socket is closed below, which is
-	// what moves a waiting read.
-	if old != nil && old != msess {
-		if err := msess.CarryRTPDeadlines(old); err != nil {
-			return fmt.Errorf("carrying RTP deadlines to the new media session: %w", err)
-		}
+func (d *DialogMedia) registerDialogCallbacks(c *dialogCallbacks) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.mediaHanshaker = d
+	c.onClose = append(c.onClose, d.Close)
+}
+
+func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
+	if remoteSDP == nil {
+		return nil
 	}
 
-	// A fork rebound to a new local address runs on sockets of its own, and the
-	// reader and writer were moved off the replaced session above, so its
-	// sockets carry nothing any more. Closing them releases the ports and fails
-	// a read still blocked on the old RTP socket, which the packet reader then
-	// retries on the new session. Without it that read never returns, because
-	// the peer now sends to the new address.
-	if old != nil && old != d.iceAgentOwner && (!old.Laddr.IP.Equal(msess.Laddr.IP) || old.Laddr.Port != msess.Laddr.Port) {
-		if err := old.Close(); err != nil {
-			return fmt.Errorf("closing replaced media session: %w", err)
+	d.mu.Lock()
+	var err error
+	if offered && d.pendingMediaSession != nil {
+		err = d.pendingMediaSession.RemoteSDP(remoteSDP, true)
+		if err == nil {
+			err = d.mediaUpdateUnsafe(d.pendingMediaSession)
+			d.pendingMediaSession = nil
 		}
+	} else {
+		err = d.sdpUpdateUnsafe(remoteSDP, offered)
+	}
+	onMediaUpdate := d.onMediaUpdate
+	d.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if onMediaUpdate != nil {
+		onMediaUpdate(d)
 	}
 	return nil
+}
+
+func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.mediaSession == nil {
+		return nil, fmt.Errorf("dialog media is not initialized")
+	}
+
+	if answered {
+		return d.mediaSession.LocalSDP(true), nil
+	}
+
+	ms := d.mediaSession.Fork()
+	if mode != "" {
+		ms.Mode = mode
+	}
+	d.pendingMediaSession = ms
+	return ms.LocalSDP(false), nil
+}
+
+func (d *DialogMedia) onFinalize(ctx context.Context) error {
+	d.mu.Lock()
+	ms := d.mediaSession
+	d.mu.Unlock()
+	if ms == nil {
+		return nil
+	}
+	return ms.Finalize()
 }
 
 type AudioReaderOption func(d *DialogMedia) error
@@ -1453,9 +378,6 @@ type MediaProps struct {
 
 func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		if d.mediaSession == nil {
-			return ErrNoMediaSetup
-		}
 		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()
@@ -1464,18 +386,11 @@ func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 }
 
 // WithAudioReaderJitterBuffer inserts an RTP jitter buffer before the payload reader.
-// Playout starts at the packet duration of the negotiated audio codec and then
-// follows the duration of the peer's packets, learned from their RTP timestamps
-// in the codec's clock rate, or in opts.ClockRate when it is set.
-// The buffer stays in place across media updates, reading each new RTP session.
-// A dialog has at most one; asking for a second is an error.
+// Packet duration is derived from the negotiated audio codec.
 func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderOption {
 	return func(d *DialogMedia) error {
 		if d.mediaSession == nil || d.RTPPacketReader == nil {
 			return fmt.Errorf("no media setup")
-		}
-		if d.jitterBuffer != nil {
-			return fmt.Errorf("jitter buffer already set up")
 		}
 
 		codec := media.CodecAudioFromSession(d.mediaSession)
@@ -1488,61 +403,72 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 			return fmt.Errorf("no RTP reader setup")
 		}
 
-		if opts.ClockRate == 0 {
-			opts.ClockRate = codec.SampleRate
-		}
 		jitter := media.NewRTPJitterBuffer(reader, codec.SampleDur, opts)
 		d.RTPPacketReader.UpdateReader(jitter)
-		d.jitterBuffer = jitter
+
+		// UpdateReader interrupts a potentially blocked RTPSession read. The new
+		// jitter reader uses that same session, so restore normal network reading.
+		if session, ok := reader.(*media.RTPSession); ok {
+			if err := session.Sess.StartRTP(1); err != nil {
+				d.RTPPacketReader.UpdateReader(reader)
+				_ = jitter.Close()
+				return fmt.Errorf("failed to start jitter buffer RTP reader: %w", err)
+			}
+		}
 
 		d.onCloseUnsafe(jitter.Close)
 		return nil
 	}
 }
 
-// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader.
-// The statistics are those of the dialog's current RTP session, which a media
-// update replaces with one that carries them on.
+// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
 func WithAudioReaderRTPStats(hook media.OnRTPReadStats) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		if d.rtpSession == nil {
-			return ErrNoMediaSetup
+		r := &media.RTPStatsReader{
+			Reader:         d.getAudioReader(),
+			RTPSession:     d.rtpSession,
+			OnRTPReadStats: hook,
 		}
-		d.audioReader = &rtpStatsReader{
-			reader: d.getAudioReader(),
-			dialog: d,
-			hook:   hook,
-		}
+		d.audioReader = r
 		return nil
 	}
-}
-
-// rtpStatsReader passes the read statistics of the dialog's current RTP
-// session to hook after each read.
-type rtpStatsReader struct {
-	reader io.Reader
-	dialog *DialogMedia
-	hook   media.OnRTPReadStats
-}
-
-func (r *rtpStatsReader) Read(b []byte) (int, error) {
-	n, err := r.reader.Read(b)
-	if err != nil {
-		return n, err
-	}
-	if sess := r.dialog.RTPSession(); sess != nil {
-		r.hook(sess.ReadStats())
-	}
-	return n, nil
 }
 
 // WithAudioReaderDTMF creates DTMF interceptor
 func WithAudioReaderDTMF(r *DTMFReader) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		if err := d.initDTMFReaderUnsafe(r); err != nil {
+		codec, err := d.dtmfCodec(true)
+		if err != nil {
 			return err
 		}
+		r.dtmfReader = media.NewRTPDTMFReader(codec, d.RTPPacketReader, d.getAudioReader())
+		r.rtpDeadline = d.mediaSession
+
 		d.audioReader = r
+		return nil
+	}
+}
+
+// WithAudioReaderMuter adds a controllable mute stage to the audio reader pipeline.
+func WithAudioReaderMuter(muter *AudioMuterReader) AudioReaderOption {
+	return func(d *DialogMedia) error {
+		if muter == nil {
+			return fmt.Errorf("audio reader muter is nil")
+		}
+		muter.Reader = d.getAudioReader()
+		d.audioReader = muter
+		return nil
+	}
+}
+
+// WithAudioReaderStopper adds a controllable stop stage to the audio reader pipeline.
+func WithAudioReaderStopper(stopper *AudioStopperReader) AudioReaderOption {
+	return func(d *DialogMedia) error {
+		if stopper == nil {
+			return fmt.Errorf("audio reader stopper is nil")
+		}
+		stopper.Reader = d.getAudioReader()
+		d.audioReader = stopper
 		return nil
 	}
 }
@@ -1565,49 +491,30 @@ func WithAudioReaderPCMMonitor(mon *audio.MonitorPCMReader, w io.Writer) AudioRe
 // NOTE: AudioReader must be called after negotiation is finished, like Answer()
 // Reading buffer should be equal or bigger of media.RTPBufSize
 // Use AuidioListen for optimized reading.
-//
-// Before the media is set up it returns ErrNoMediaSetup.
 func (d *DialogMedia) AudioReader(opts ...AudioReaderOption) (io.Reader, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// The options read the media session and the packet reader.
-	if len(opts) > 0 && (d.mediaSession == nil || d.RTPPacketReader == nil) {
-		return nil, ErrNoMediaSetup
-	}
 	for _, o := range opts {
 		if err := o(d); err != nil {
 			return nil, err
 		}
 	}
-	r := d.getAudioReader()
-	if r == nil {
-		return nil, ErrNoMediaSetup
-	}
-	return r, nil
+	return d.getAudioReader(), nil
 }
 
-// getAudioReader returns the audio reader, or nil when there is none.
 func (d *DialogMedia) getAudioReader() io.Reader {
 	if d.audioReader != nil {
 		return d.audioReader
 	}
-	if d.RTPPacketReader == nil {
-		return nil
-	}
 	return d.RTPPacketReader
 }
 
-// audioReaderProps fills p from the media session and returns the audio
-// reader. It returns nil when there is no reader, and without a media session,
-// which describes the audio.
+// audioReaderProps
 func (d *DialogMedia) audioReaderProps(p *MediaProps) io.Reader {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.mediaSession == nil {
-		return nil
-	}
 	WithAudioReaderMediaProps(p)(d)
 	return d.getAudioReader()
 }
@@ -1624,9 +531,6 @@ type AudioWriterOption func(d *DialogMedia) error
 
 func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		if d.mediaSession == nil {
-			return ErrNoMediaSetup
-		}
 		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()
@@ -1634,49 +538,65 @@ func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	}
 }
 
-// WithAudioWriterRTPStats creates RTP Statistics interceptor on audio writer.
-// The statistics are those of the dialog's current RTP session, which a media
-// update replaces with one that carries them on.
+// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
 func WithAudioWriterRTPStats(hook media.OnRTPWriteStats) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		if d.rtpSession == nil {
-			return ErrNoMediaSetup
+		w := media.RTPStatsWriter{
+			Writer:          d.getAudioWriter(),
+			RTPSession:      d.rtpSession,
+			OnRTPWriteStats: hook,
 		}
-		d.audioWriter = &rtpStatsWriter{
-			writer: d.getAudioWriter(),
-			dialog: d,
-			hook:   hook,
-		}
+		d.audioWriter = &w
 		return nil
 	}
-}
-
-// rtpStatsWriter passes the write statistics of the dialog's current RTP
-// session to hook after each write.
-type rtpStatsWriter struct {
-	writer io.Writer
-	dialog *DialogMedia
-	hook   media.OnRTPWriteStats
-}
-
-func (w *rtpStatsWriter) Write(b []byte) (int, error) {
-	n, err := w.writer.Write(b)
-	if err != nil {
-		return n, err
-	}
-	if sess := w.dialog.RTPSession(); sess != nil {
-		w.hook(sess.WriteStats())
-	}
-	return n, nil
 }
 
 // WithAudioWriterDTMF adds DTMF into audio pipeline
 func WithAudioWriterDTMF(r *DTMFWriter) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		if err := d.initDTMFWriterUnsafe(r); err != nil {
+		codec, err := d.dtmfCodec(false)
+		if err != nil {
 			return err
 		}
+		r.dtmfWriter = media.NewRTPDTMFWriter(codec, d.RTPPacketWriter, d.getAudioWriter())
 		d.audioWriter = r
+		return nil
+	}
+}
+
+// WithAudioWriterMuter adds a controllable mute stage to the audio writer pipeline.
+func WithAudioWriterMuter(muter *AudioMuterWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		if muter == nil {
+			return fmt.Errorf("audio writer muter is nil")
+		}
+		muter.Writer = d.getAudioWriter()
+		d.audioWriter = muter
+		return nil
+	}
+}
+
+// WithAudioWriterStopper adds a controllable stop stage to the audio writer pipeline.
+func WithAudioWriterStopper(stopper *AudioStopperWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		if stopper == nil {
+			return fmt.Errorf("audio writer stopper is nil")
+		}
+		stopper.Writer = d.getAudioWriter()
+		d.audioWriter = stopper
+		return nil
+	}
+}
+
+// WithAudioWriterComfortNoise adds explicit RFC 3389 comfort-noise writes to
+// the audio pipeline. It does not advertise CN in SDP or schedule packets.
+func WithAudioWriterComfortNoise(w *ComfortNoiseWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		if w == nil {
+			return fmt.Errorf("comfort noise writer is nil")
+		}
+		w.comfortNoiseWriter = media.NewRTPComfortNoiseWriter(d.RTPPacketWriter, d.getAudioWriter())
+		d.audioWriter = w
 		return nil
 	}
 }
@@ -1697,65 +617,32 @@ func WithAudioWriterMonitor(mon *audio.MonitorPCMWriter, w io.Writer) AudioWrite
 // AudioWriter returns io.Writer on which you can write your ENCODED audio.
 // By default it is RTPPacketWriter unless overwritten with SetAudioWriter().
 // NOTE: RTPPacketWriter has running sample clock, but it expects samples sent, match sample duration of codec.
-//
-// Before the media is set up it returns ErrNoMediaSetup.
 func (d *DialogMedia) AudioWriter(opts ...AudioWriterOption) (io.Writer, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// The options read the media session and the packet writer.
-	if len(opts) > 0 && (d.mediaSession == nil || d.RTPPacketWriter == nil) {
-		return nil, ErrNoMediaSetup
-	}
 	for _, o := range opts {
 		if err := o(d); err != nil {
 			return nil, err
 		}
 	}
 
-	w := d.getAudioWriter()
-	if w == nil {
-		return nil, ErrNoMediaSetup
-	}
-	return w, nil
+	return d.getAudioWriter(), nil
 }
 
-// getAudioWriter returns the audio writer, or nil when there is none.
 func (d *DialogMedia) getAudioWriter() io.Writer {
 	if d.audioWriter != nil {
 		return d.audioWriter
 	}
-	if d.RTPPacketWriter == nil {
-		return nil
-	}
 	return d.RTPPacketWriter
 }
 
-// audioWriterProps fills p from the media session and returns the audio
-// writer. It returns nil when there is no writer, and without a media session,
-// which describes the audio.
 func (d *DialogMedia) audioWriterProps(p *MediaProps) io.Writer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.mediaSession == nil {
-		return nil
-	}
 	WithAudioWriterMediaProps(p)(d)
 	return d.getAudioWriter()
-}
-
-// audioReaderWriterProps returns the dialog's audio reader and writer, and in p
-// the props of the media session they run on, read in one hold of the lock, so
-// a re-INVITE can not give the reader and the writer different codecs.
-func (d *DialogMedia) audioReaderWriterProps(p *MediaProps) (io.Reader, io.Writer, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if err := WithAudioReaderMediaProps(p)(d); err != nil {
-		return nil, nil, err
-	}
-	return d.getAudioReader(), d.getAudioWriter(), nil
 }
 
 // SetAudioWriter adds/changes audio reader.
@@ -1790,38 +677,23 @@ func (d *DialogMedia) PlaybackCreate() (AudioPlayback, error) {
 	mprops := MediaProps{}
 	w := d.audioWriterProps(&mprops)
 	if w == nil {
-		return AudioPlayback{}, ErrNoMediaSetup
+		return AudioPlayback{}, fmt.Errorf("no media setup")
 	}
 	p := NewAudioPlayback(w, mprops.Codec)
 	// On each play it needs reset RTP timestamp
-	d.mu.Lock()
-	packetWriter := d.RTPPacketWriter
-	d.mu.Unlock()
-	if packetWriter != nil {
-		p.onPlay = packetWriter.ResetTimestamp
-	}
+	p.onPlay = d.RTPPacketWriter.ResetTimestamp
 	return p, nil
 }
 
 // PlaybackControlCreate creates playback for audio with controls like mute unmute
 func (d *DialogMedia) PlaybackControlCreate() (AudioPlaybackControl, error) {
-	// NOTE we should avoid returning pointers for any IN dialplan to avoid heap
-	mprops := MediaProps{}
-	w := d.audioWriterProps(&mprops)
-
-	if w == nil {
-		return AudioPlaybackControl{}, ErrNoMediaSetup
+	p, err := d.PlaybackCreate()
+	if err != nil {
+		return AudioPlaybackControl{}, err
 	}
 	// Audio is controled via audio reader/writer
-	control := &audioControl{
-		Writer: w,
-	}
-
-	p := AudioPlaybackControl{
-		AudioPlayback: NewAudioPlayback(control, mprops.Codec),
-		control:       control,
-	}
-	return p, nil
+	control := NewAudioPlaybackControl(p)
+	return control, nil
 }
 
 // PlaybackRingtoneCreate is creating playback for ringtone
@@ -1831,7 +703,7 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 	mprops := MediaProps{}
 	w := d.audioWriterProps(&mprops)
 	if w == nil {
-		return AudioRingtone{}, ErrNoMediaSetup
+		return AudioRingtone{}, fmt.Errorf("no media setup")
 	}
 
 	ringtone, err := audio.RingtoneLoadPCM(mprops.Codec)
@@ -1845,10 +717,10 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 	}
 
 	ar := AudioRingtone{
-		writer:     &encoder,
-		ringtone:   ringtone,
-		sampleSize: mprops.Codec.Samples16(),
-		dialog:     d,
+		writer:       &encoder,
+		ringtone:     ringtone,
+		sampleSize:   mprops.Codec.Samples16(),
+		mediaSession: d.mediaSession,
 	}
 	return ar, nil
 }
@@ -1864,13 +736,13 @@ func (d *DialogMedia) AudioStereoRecordingCreate(wavFile *os.File) (AudioStereoR
 	mpropsW := MediaProps{}
 	aw := d.audioWriterProps(&mpropsW)
 	if aw == nil {
-		return AudioStereoRecordingWav{}, ErrNoMediaSetup
+		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
 	}
 
 	mpropsR := MediaProps{}
 	ar := d.audioReaderProps(&mpropsR)
 	if ar == nil {
-		return AudioStereoRecordingWav{}, ErrNoMediaSetup
+		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
 	}
 
 	return newDialogRecordingWav(wavFile, ar, mpropsR, aw, mpropsW)
@@ -1919,11 +791,11 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 	}()
 
 	return func() error {
-		if err := d.StopRTP(1, 0); err != nil {
+		if err := d.mediaSession.StopRTP(1, 0); err != nil {
 			return err
 		}
 		wg.Wait() // This makes sure we have exited reading
-		if err := d.StartRTP(1, 0); err != nil {
+		if err := d.mediaSession.StartRTP(1); err != nil {
 			return err
 		}
 		return readErr
@@ -1931,29 +803,21 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 }
 
 // ListenContext listens until context is canceled.
-//
-// The context's end stops the read with a read deadline, which is cleared
-// again before ListenContext returns.
-func (d *DialogMedia) ListenContext(ctx context.Context) (err error) {
+func (d *DialogMedia) ListenContext(pctx context.Context) error {
 	buf := make([]byte, media.RTPBufSize)
+	ctx, cancel := context.WithCancel(pctx)
+	defer cancel()
+
+	go func() {
+		<-ctx.Done()
+		if pctx.Err() != nil {
+			d.mediaSession.StopRTP(1, 0)
+		}
+	}()
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-
-	stopped := make(chan error, 1)
-	stop := context.AfterFunc(ctx, func() { stopped <- d.StopRTP(1, 0) })
-	defer func() {
-		if stop() {
-			return
-		}
-		stopErr := <-stopped
-		startErr := d.StartRTP(1, 0)
-		if err == nil {
-			err = errors.Join(stopErr, startErr)
-		}
-	}()
-
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -1965,23 +829,14 @@ func (d *DialogMedia) ListenContext(ctx context.Context) (err error) {
 	}
 }
 
-// ListenUntil listens for dur, and returns the read deadline's error when dur
-// has passed. The read deadline is cleared again before it returns.
-func (d *DialogMedia) ListenUntil(dur time.Duration) (err error) {
+func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 	buf := make([]byte, media.RTPBufSize)
 
+	d.mediaSession.StopRTP(1, dur)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-	if err := d.StopRTP(1, dur); err != nil {
-		return err
-	}
-	defer func() {
-		if startErr := d.StartRTP(1, 0); startErr != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-			err = errors.Join(err, startErr)
-		}
-	}()
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -1990,91 +845,56 @@ func (d *DialogMedia) ListenUntil(dur time.Duration) (err error) {
 	}
 }
 
-// StopRTP sets a read or write deadline, as MediaSession.StopRTP does, on the
-// dialog's current media session. It holds the dialog's lock while it does,
-// since a re-INVITE replaces the session under it, so the deadline is set
-// either on the session replaced, which hands it to its replacement, or on the
-// replacement. Without a media session it returns ErrNoMediaSetup.
 func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.mediaSession == nil {
-		return ErrNoMediaSetup
-	}
 	return d.mediaSession.StopRTP(rw, dur)
 }
 
-// StartRTP clears the deadline StopRTP sets, on the dialog's current media
-// session.
 func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.mediaSession == nil {
-		return ErrNoMediaSetup
-	}
 	return d.mediaSession.StartRTP(rw)
 }
 
-// dtmfCodec returns the telephone-event codec DTMF is carried on for this
-// session. It is the negotiated one: telephone-event is a dynamic format, so the
-// number on the wire is the peer's rather than our default (RFC 3264 section
-// 6.1).
-//
-// A session that negotiated no telephone-event keeps the package default, which
-// is the behaviour every caller had before.
-func dtmfCodec(s *media.MediaSession) media.Codec {
-	if codec, ok := media.CodecTelephoneEventFromSession(s); ok {
-		return codec
-	}
-	return media.CodecTelephoneEvent8000
+type rtpDTMFDeadline interface {
+	StopRTP(rw int8, dur time.Duration) error
+	StartRTP(rw int8) error
 }
 
-// DTMFReader reads a dialog's audio and the DTMF carried with it. It follows
-// the dialog's media: it reads DTMF on the telephone-event payload type of the
-// dialog's current media session, and sets its read deadlines there.
 type DTMFReader struct {
-	dialog *DialogMedia
-	// mediaSession is the media session the telephone-event codec was taken
-	// from. Read and Listen use it, one at a time.
-	mediaSession *media.MediaSession
-	dtmfReader   *media.RTPDtmfReader
-	onDTMF       func(dtmf rune) error
+	rtpDeadline rtpDTMFDeadline
+	dtmfReader  *media.RTPDtmfReader
+	onDTMF      func(dtmf rune) error
 }
 
-// initDTMFReaderUnsafe sets r up over the dialog's audio reader. Must be called
-// with the dialog's lock held.
-func (d *DialogMedia) initDTMFReaderUnsafe(r *DTMFReader) error {
-	ar := d.getAudioReader()
-	if ar == nil || d.mediaSession == nil || d.RTPPacketReader == nil {
-		return ErrNoMediaSetup
+func (d *DialogMedia) dtmfCodec(receive bool) (media.Codec, error) {
+	if d.mediaSession == nil {
+		return media.Codec{}, fmt.Errorf("no media setup")
 	}
-	r.dialog = d
-	r.mediaSession = d.mediaSession
-	r.dtmfReader = media.NewRTPDTMFReader(dtmfCodec(d.mediaSession), d.RTPPacketReader, ar)
-	return nil
+	for _, codec := range d.mediaSession.CommonCodecs() {
+		if !codec.Matches(media.CodecTelephoneEvent8000) {
+			continue
+		}
+		if receive {
+			codec.PayloadType = codec.PayloadTypeRecv()
+		}
+		return codec, nil
+	}
+	return media.Codec{}, fmt.Errorf("telephone-event/8000 codec is not negotiated")
 }
 
 // AudioReaderDTMF is DTMF over RTP. It reads audio and provides hook for dtmf while listening for audio
 // Use Listen or OnDTMF after this call
 func (m *DialogMedia) AudioReaderDTMF() (*DTMFReader, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r := &DTMFReader{}
-	if err := m.initDTMFReaderUnsafe(r); err != nil {
+	ar, err := m.AudioReader()
+	if err != nil {
 		return nil, err
 	}
-	return r, nil
-}
-
-// followMedia takes the telephone-event codec of the dialog's current media
-// session when a media update has replaced the one it was taken from.
-func (d *DTMFReader) followMedia() {
-	sess := d.dialog.MediaSession()
-	if sess == nil || sess == d.mediaSession {
-		return
+	codec, err := m.dtmfCodec(true)
+	if err != nil {
+		return nil, err
 	}
-	d.mediaSession = sess
-	d.dtmfReader.UpdateCodec(dtmfCodec(sess))
+	return &DTMFReader{
+		dtmfReader:  media.NewRTPDTMFReader(codec, m.RTPPacketReader, ar),
+		rtpDeadline: m.mediaSession,
+	}, nil
 }
 
 func (d *DTMFReader) Listen(onDTMF func(dtmf rune) error, dur time.Duration) error {
@@ -2090,18 +910,13 @@ func (d *DTMFReader) Listen(onDTMF func(dtmf rune) error, dur time.Duration) err
 	}
 }
 
-// readDeadline reads once, with a read deadline dur away on the dialog's
-// media when dur is set, and clears that deadline again.
+// readDeadline(reads RTP until
 func (d *DTMFReader) readDeadline(buf []byte, dur time.Duration) (n int, err error) {
+	mediaSession := d.rtpDeadline
 	if dur > 0 {
-		if err := d.dialog.StopRTP(1, dur); err != nil {
-			return 0, err
-		}
-		defer func() {
-			if startErr := d.dialog.StartRTP(1, 0); startErr != nil && err == nil {
-				err = startErr
-			}
-		}()
+		// Stop RTP
+		mediaSession.StopRTP(1, dur)
+		defer mediaSession.StartRTP(2)
 	}
 	return d.Read(buf)
 }
@@ -2113,7 +928,6 @@ func (d *DTMFReader) OnDTMF(onDTMF func(dtmf rune) error) {
 
 // Read exposes io.Reader that can be used as AudioReader
 func (d *DTMFReader) Read(buf []byte) (n int, err error) {
-	d.followMedia()
 	// This is optimal way of reading audio and DTMF
 	dtmfReader := d.dtmfReader
 	n, err = dtmfReader.Read(buf)
@@ -2129,57 +943,27 @@ func (d *DTMFReader) Read(buf []byte) (n int, err error) {
 	return n, nil
 }
 
-// DTMFWriter writes a dialog's audio and DTMF into it. It follows the dialog's
-// media: it writes DTMF on the telephone-event payload type of the dialog's
-// current media session.
 type DTMFWriter struct {
-	dialog *DialogMedia
-	// mu guards mediaSession, the media session the telephone-event codec was
-	// taken from.
-	mu           sync.Mutex
-	mediaSession *media.MediaSession
-	dtmfWriter   *media.RTPDtmfWriter
-}
-
-// initDTMFWriterUnsafe sets w up over the dialog's audio writer. Must be called
-// with the dialog's lock held.
-func (d *DialogMedia) initDTMFWriterUnsafe(w *DTMFWriter) error {
-	aw := d.getAudioWriter()
-	if aw == nil || d.mediaSession == nil || d.RTPPacketWriter == nil {
-		return ErrNoMediaSetup
-	}
-	w.dialog = d
-	w.mediaSession = d.mediaSession
-	w.dtmfWriter = media.NewRTPDTMFWriter(dtmfCodec(d.mediaSession), d.RTPPacketWriter, aw)
-	return nil
+	dtmfWriter *media.RTPDtmfWriter
 }
 
 func (m *DialogMedia) AudioWriterDTMF() (*DTMFWriter, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	w := &DTMFWriter{}
-	if err := m.initDTMFWriterUnsafe(w); err != nil {
+	aw, err := m.AudioWriter()
+	if err != nil {
 		return nil, err
 	}
-	return w, nil
+	codec, err := m.dtmfCodec(false)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DTMFWriter{
+		dtmfWriter: media.NewRTPDTMFWriter(codec, m.RTPPacketWriter, aw),
+	}, nil
 }
 
 func (w *DTMFWriter) WriteDTMF(dtmf rune) error {
-	w.followMedia()
 	return w.dtmfWriter.WriteDTMF(dtmf)
-}
-
-// followMedia takes the telephone-event codec of the dialog's current media
-// session when a media update has replaced the one it was taken from.
-func (w *DTMFWriter) followMedia() {
-	sess := w.dialog.MediaSession()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if sess == nil || sess == w.mediaSession {
-		return
-	}
-	w.mediaSession = sess
-	w.dtmfWriter.UpdateCodec(dtmfCodec(sess))
 }
 
 // AudioReader exposes DTMF audio writer. You should use this for parallel audio processing
@@ -2190,4 +974,27 @@ func (w *DTMFWriter) AudioWriter() *media.RTPDtmfWriter {
 // Write exposes as io.Writer that can be used as AudioWriter
 func (w *DTMFWriter) Write(buf []byte) (n int, err error) {
 	return w.dtmfWriter.Write(buf)
+}
+
+// ComfortNoiseWriter exposes explicit comfort-noise writes while remaining an
+// io.Writer for ordinary encoded audio.
+type ComfortNoiseWriter struct {
+	comfortNoiseWriter *media.RTPComfortNoiseWriter
+}
+
+// WriteComfortNoise sends one PT 13 comfort-noise packet. Level is attenuation
+// in -dBov and must be between 0 and 127.
+func (w *ComfortNoiseWriter) WriteComfortNoise(level uint8) error {
+	if w.comfortNoiseWriter == nil {
+		return fmt.Errorf("comfort noise writer is not initialized")
+	}
+	return w.comfortNoiseWriter.WriteComfortNoise(level)
+}
+
+// Write forwards ordinary encoded audio through the configured pipeline.
+func (w *ComfortNoiseWriter) Write(buf []byte) (n int, err error) {
+	if w.comfortNoiseWriter == nil {
+		return 0, fmt.Errorf("comfort noise writer is not initialized")
+	}
+	return w.comfortNoiseWriter.Write(buf)
 }

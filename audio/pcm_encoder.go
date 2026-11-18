@@ -39,22 +39,6 @@ var (
 	}
 )
 
-// codecIs reports whether codec is the format described by want.
-//
-// The payload type is not compared. A dynamic format is numbered independently
-// by each side from 96-127 (RFC 3551 section 3) and an answer echoes the
-// offerer's number (RFC 3264 section 6.1), so a negotiated codec arrives here
-// carrying the peer's number rather than the one in the package constant. The
-// encoding name is what identifies the format (RFC 4855 section 3). Selecting on
-// the number meant opus never found its implementation on a call where the peer
-// numbered it anything but 96.
-//
-// Encoding names are case insensitive (RFC 4566 section 6), and InitWithSDP
-// writes peer spelled names into the codec list without passing negotiation.
-func codecIs(codec media.Codec, want media.Codec) bool {
-	return strings.EqualFold(codec.Name, want.Name)
-}
-
 type PCMDecoder struct {
 	codec       uint8
 	samplesSize int
@@ -79,19 +63,19 @@ func (dec *PCMDecoder) Init(codec media.Codec) error {
 	dec.codec = codec.PayloadType
 	dec.samplesSize = codec.SamplesPCM(16) // for now we only support 16 bit
 
-	switch {
-	case codecIs(codec, media.CodecAudioUlaw):
+	switch strings.ToLower(codec.Name) {
+	case "pcmu":
 		dec.DecoderTo = DecodeUlawTo
-	case codecIs(codec, media.CodecAudioAlaw):
+	case "pcma":
 		dec.DecoderTo = DecodeAlawTo
-	case codecIs(codec, media.CodecAudioOpus):
+	case "opus":
 		opusDec := OpusDecoder{}
 		if err := opusDec.Init(int(codec.SampleRate), codec.NumChannels, codec.Samples16()); err != nil {
 			return fmt.Errorf("failed to create opus decoder: %w", err)
 		}
 		dec.DecoderTo = opusDec.DecodeTo
 	default:
-		return fmt.Errorf("not supported codec %s", codec.Name)
+		return fmt.Errorf("not supported codec %d", codec.PayloadType)
 	}
 	return nil
 }
@@ -232,13 +216,13 @@ func NewPCMEncoder(payloadType uint8) (*PCMEncoder, error) {
 
 func (enc *PCMEncoder) Init(codec media.Codec) error {
 	enc.samplesSize = codec.SamplesPCM(16) // For now we only support 16 bit
-	switch {
-	case codecIs(codec, media.CodecAudioUlaw):
+	switch strings.ToLower(codec.Name) {
+	case "pcmu":
 		enc.EncoderTo = EncodeUlawTo
-	case codecIs(codec, media.CodecAudioAlaw):
+	case "pcma":
 		enc.EncoderTo = EncodeAlawTo
 
-	case codecIs(codec, media.CodecAudioOpus):
+	case "opus":
 		// TODO handle mono
 		opusEnc := OpusEncoder{}
 		if err := opusEnc.Init(int(codec.SampleRate), codec.NumChannels, codec.Samples16()); err != nil {
@@ -247,7 +231,7 @@ func (enc *PCMEncoder) Init(codec media.Codec) error {
 		enc.EncoderTo = opusEnc.EncodeTo
 
 	default:
-		return fmt.Errorf("not supported codec %s", codec.Name)
+		return fmt.Errorf("not supported codec %d", codec.PayloadType)
 	}
 	return nil
 }

@@ -16,16 +16,16 @@ import (
 
 var (
 	// Here are some codec constants that can be reused
-	CodecAudioUlaw          = Codec{PayloadType: 0, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "PCMU"}
-	CodecAudioAlaw          = Codec{PayloadType: 8, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "PCMA"}
+	CodecAudioUlaw = Codec{PayloadType: 0, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "pcmu"}
+	CodecAudioAlaw = Codec{PayloadType: 8, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "pcma"}
+	// G.722 uses an 8000 Hz RTP clock despite its 16000 Hz audio sample rate.
+	CodecAudioG722          = Codec{PayloadType: 9, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "g722"}
+	CodecAudioG729          = Codec{PayloadType: 18, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "g729"}
 	CodecAudioOpus          = Codec{PayloadType: 96, SampleRate: 48000, SampleDur: 20 * time.Millisecond, NumChannels: 2, Name: "opus"}
 	CodecTelephoneEvent8000 = Codec{PayloadType: 101, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "telephone-event"}
-
-	// CodecAudioG722 SampleRate is 8000 and not 16000. RFC 3551 section 4.5.2 froze
-	// the G.722 RTP clock at 8000 even though the codec samples at 16 kHz. The clock
-	// drives SampleTimestamp(), so 16000 here would advance the RTP timestamp at
-	// twice the wire rate. The 16 kHz sampling rate is a decoder concern only.
-	CodecAudioG722 = Codec{PayloadType: 9, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "G722"}
+	// CodecComfortNoise8000 describes the static RFC 3389 comfort-noise payload.
+	// It is an auxiliary RTP format and is not included in default SDP offers.
+	CodecComfortNoise8000 = Codec{PayloadType: 13, SampleRate: 8000, NumChannels: 1, Name: "cn"}
 )
 
 type Codec struct {
@@ -34,6 +34,38 @@ type Codec struct {
 	SampleRate  uint32
 	SampleDur   time.Duration
 	NumChannels int // 1 or 2
+
+	// FMTP holds the format-specific SDP parameters without the payload type.
+	FMTP string
+
+	payloadTypeRecv *uint8 // Only set for asymmetric negotiated payload mappings.
+}
+
+// PayloadTypeRecv returns the receive payload type of a negotiated codec.
+// It equals PayloadType unless the peer answered with a different mapping.
+func (c Codec) PayloadTypeRecv() uint8 {
+	if c.payloadTypeRecv != nil {
+		return *c.payloadTypeRecv
+	}
+	return c.PayloadType
+}
+
+func (c Codec) negotiatePayloadType(remote Codec, answerer bool) Codec {
+	localPayloadType := c.PayloadType
+	c.PayloadType = remote.PayloadType
+	if c.FMTP == "" {
+		c.FMTP = remote.FMTP
+	}
+	c.payloadTypeRecv = nil
+	if !answerer && localPayloadType != remote.PayloadType {
+		c.payloadTypeRecv = &localPayloadType
+	}
+	return c
+}
+
+// Matches compares codec identity independently of payload type and packet duration.
+func (c Codec) Matches(other Codec) bool {
+	return strings.EqualFold(c.Name, other.Name) && c.SampleRate == other.SampleRate && c.NumChannels == other.NumChannels
 }
 
 func (c *Codec) String() string {
@@ -64,36 +96,21 @@ func CodecAudioFromSession(s *MediaSession) Codec {
 	return codec
 }
 
+// IsAuxiliary reports whether c is an auxiliary RTP format (RFC 4733 events,
+// RFC 3389 comfort noise) carried beside the audio rather than decoded as it.
+func (c Codec) IsAuxiliary() bool {
+	return strings.EqualFold(c.Name, "telephone-event") || strings.EqualFold(c.Name, "CN")
+}
+
 func CodecAudioFromList(codecs []Codec) (Codec, bool) {
 	for _, codec := range codecs {
-		if codec.Name == "telephone-event" {
+		if codec.IsAuxiliary() {
 			continue
 		}
 
 		return codec, true
 	}
 
-	return Codec{}, false
-}
-
-// CodecTelephoneEventFromSession returns the telephone-event codec the session
-// runs on, and whether it has one at all.
-//
-// DTMF must be sent and received on the payload type negotiation settled on.
-// telephone-event is a dynamic format, so each side numbers it independently
-// (RFC 3551 section 3) and an answer echoes the offerer's number (RFC 3264
-// section 6.1). CodecTelephoneEvent8000 therefore only describes our own default
-// numbering, and is not what a peer necessarily puts on the wire.
-//
-// Encoding names are case insensitive (RFC 4566 section 6).
-//
-// NOTE: Not thread safe, same as the rest of the codec accessors.
-func CodecTelephoneEventFromSession(s *MediaSession) (Codec, bool) {
-	for _, codec := range s.activeCodecs() {
-		if strings.EqualFold(codec.Name, CodecTelephoneEvent8000.Name) {
-			return codec, true
-		}
-	}
 	return Codec{}, false
 }
 
@@ -117,6 +134,8 @@ func CodecAudioFromPayloadType(payloadType uint8) (Codec, error) {
 		return CodecAudioUlaw, nil
 	case sdp.FORMAT_TYPE_G722:
 		return CodecAudioG722, nil
+	case sdp.FORMAT_TYPE_G729:
+		return CodecAudioG729, nil
 	case sdp.FORMAT_TYPE_OPUS:
 		return CodecAudioOpus, nil
 	case sdp.FORMAT_TYPE_TELEPHONE_EVENT:
@@ -135,6 +154,8 @@ func mapSupportedCodec(f string) Codec {
 		return CodecAudioUlaw
 	case sdp.FORMAT_TYPE_G722:
 		return CodecAudioG722
+	case sdp.FORMAT_TYPE_G729:
+		return CodecAudioG729
 	case sdp.FORMAT_TYPE_OPUS:
 		return CodecAudioOpus
 	case sdp.FORMAT_TYPE_TELEPHONE_EVENT:
@@ -169,84 +190,95 @@ func mapSupportedCodec(f string) Codec {
 // 	codecs = codecs[:n]
 // }
 
-// CodecsFromSDP will try to parse as much as possible, but it will return also error in case
-// some properties could not be read
-// You can take what is parsed or return error
+// CodecsFromSDPRead parses codecs in the order listed in formats. The caller must
+// provide an output slice with at least len(formats) entries. It returns the
+// codecs parsed so far along with any errors in the codec attributes.
 func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (int, error) {
 	n := 0
 	var rerr error
 	for _, f := range formats {
-		if f == "0" {
-			codecsAudio[n] = CodecAudioUlaw
-			n++
-			continue
-		}
-
-		if f == "8" {
-			codecsAudio[n] = CodecAudioAlaw
-			n++
-			continue
-		}
-
-		// G.722 is a static payload type like ulaw and alaw above, so a peer may
-		// offer it with no a=rtpmap line. Resolving it from the payload type also
-		// keeps the RFC 3551 clock when a peer advertises the 16 kHz sampling rate
-		// in rtpmap instead.
-		if f == "9" {
-			codecsAudio[n] = CodecAudioG722
-			n++
-			continue
-		}
-
 		pt64, err := strconv.ParseUint(f, 10, 8)
 		if err != nil {
 			rerr = errors.Join(rerr, fmt.Errorf("format type failed to conv to integer, skipping f=%s: %w", f, err))
 			continue
 		}
-		pt := uint8(pt64)
 
-		for _, a := range attrs {
-			// a=rtpmap:<payload type> <encoding name>/<clock rate> [/<encoding parameters>]
-			pref := "rtpmap:" + f + " "
-			if strings.HasPrefix(a, pref) {
-				// Check properties of this codec
-				str := a[len(pref):]
-				// TODO use more efficient reading props
-				props := strings.Split(str, " ")
-				firstProp := props[0]
-				propsCodec := strings.Split(firstProp, "/")
+		var codec Codec
+		found := true
+		switch f {
+		case sdp.FORMAT_TYPE_ULAW:
+			codec = CodecAudioUlaw
+		case sdp.FORMAT_TYPE_ALAW:
+			codec = CodecAudioAlaw
+		case sdp.FORMAT_TYPE_G722:
+			codec = CodecAudioG722
+		case sdp.FORMAT_TYPE_G729:
+			codec = CodecAudioG729
+		default:
+			found = false
+		}
+
+		if !found {
+			for _, a := range attrs {
+				// a=rtpmap:<payload type> <encoding name>/<clock rate> [/<encoding parameters>]
+				pref := "rtpmap:" + f + " "
+				if !strings.HasPrefix(a, pref) {
+					continue
+				}
+				props := strings.Fields(a[len(pref):])
+				if len(props) == 0 {
+					rerr = errors.Join(rerr, fmt.Errorf("bad rtpmap property a=%s", a))
+					continue
+				}
+				propsCodec := strings.Split(props[0], "/")
 				if len(propsCodec) < 2 {
-					rerr = errors.Join(rerr, fmt.Errorf("bad rtmap property a=%s", a))
+					rerr = errors.Join(rerr, fmt.Errorf("bad rtpmap property a=%s", a))
 					continue
 				}
 
-				encodingName := propsCodec[0]
-				sampleRateStr := propsCodec[1]
-				sampleRate64, err := strconv.ParseUint(sampleRateStr, 10, 32)
+				sampleRate64, err := strconv.ParseUint(propsCodec[1], 10, 32)
 				if err != nil {
 					rerr = errors.Join(rerr, fmt.Errorf("sample rate failed to parse a=%s: %w", a, err))
 					continue
 				}
-
-				codec := Codec{
-					Name:        encodingName,
-					PayloadType: pt,
+				codec = Codec{
+					Name:        propsCodec[0],
+					PayloadType: uint8(pt64),
 					SampleRate:  uint32(sampleRate64),
 					// TODO check ptime ?
 					SampleDur:   20 * time.Millisecond,
 					NumChannels: 1,
 				}
-
 				if len(propsCodec) == 3 {
 					numChannels, err := strconv.ParseUint(propsCodec[2], 10, 32)
 					if err == nil {
 						codec.NumChannels = int(numChannels)
 					}
 				}
-				codecsAudio[n] = codec
-				n++
+				found = true
+				break
 			}
 		}
+		if !found {
+			continue
+		}
+
+		// Scan separately so fmtp may precede rtpmap and static payload types
+		// can carry parameters even when rtpmap is omitted.
+		for _, a := range attrs {
+			value, ok := strings.CutPrefix(a, "fmtp:")
+			if !ok {
+				continue
+			}
+			sep := strings.IndexAny(value, " \t")
+			if sep < 0 || value[:sep] != f {
+				continue
+			}
+			codec.FMTP = strings.TrimSpace(value[sep:])
+			break
+		}
+		codecsAudio[n] = codec
+		n++
 	}
-	return n, nil
+	return n, rerr
 }

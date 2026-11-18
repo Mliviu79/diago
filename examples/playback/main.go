@@ -48,14 +48,15 @@ func start(ctx context.Context) error {
 func Playback(ctx context.Context, inDialog *diago.DialogServerSession) error {
 	inDialog.Trying(ctx)  // Progress -> 100 Trying
 	inDialog.Ringing(ctx) // Ringing -> 180 Response
-	if err := inDialog.Answer(); err != nil {
+	med, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
 		return err
 	} // Answer -> 200 Response
 
 	playfile, _ := testdata.OpenFile("demo-echodone.wav")
 	slog.Info("Playing a file", "file", "demo-echodone.wav")
 
-	pb, err := inDialog.PlaybackCreate()
+	pb, err := med.PlaybackCreate()
 	if err != nil {
 		return err
 	}

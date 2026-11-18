@@ -4,7 +4,6 @@
 package media
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -68,10 +67,7 @@ type RTPSession struct {
 	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
 	sourceLock        bool
 	sourceLockPackets int
-	// sourceLockSeq is the sequence number of the last packet counted while
-	// the source is learned.
-	sourceLockSeq  uint16
-	sourceLockAddr *net.UDPAddr
+	sourceLockAddr    *net.UDPAddr
 }
 
 // Some of fields here are exported (as readonly) intentionally
@@ -79,6 +75,8 @@ type RTPReadStats struct {
 	SSRC                   uint32
 	FirstPktSequenceNumber uint16
 	LastSequenceNumber     uint16
+	payloadType            uint8
+	payloadTypeKnown       bool // checked against the current session's codecs
 	lastSeq                RTPExtendedSequenceNumber
 	// tracks first pkt seq in this interval to calculate loss of packets
 	IntervalFirstPktSeqNum uint16
@@ -88,9 +86,7 @@ type RTPReadStats struct {
 	OctetCount   uint64
 
 	// RTP reading stats
-	SampleRate uint32
-	// lastRTPTime       time.Time
-	// lastRTPTimestamp  uint32
+	SampleRate        uint32
 	firstRTPTime      time.Time
 	firstRTPTimestamp uint32
 	jitter            float64
@@ -107,31 +103,17 @@ type RTPReadStats struct {
 	clockReset bool
 }
 
-/*
-	 func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
-		sampleRate := float64(stats.SampleRate)
-
-		// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
-		// Jitter here will mostly be incorrect as Reading RTP can be faster slower
-		// and not actually dictated by sampling (clock)
-		Sij := readPktTimestamp - stats.lastRTPTimestamp
-		Rij := now.Sub(stats.lastRTPTime)
-		D := Rij.Seconds()*sampleRate - float64(Sij)
-		if D < 0 {
-			D = -D
-		}
-		stats.jitter = stats.jitter + (D-stats.jitter)/16
-	}
-*/
 func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
 	sampleRate := float64(stats.SampleRate)
 
 	// Calculate samples
 	// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
 	rtpSampleArrival := stats.firstRTPTimestamp + uint32(now.Sub(stats.firstRTPTime).Seconds()*sampleRate)
-	transit := int64(rtpSampleArrival) - int64(readPktTimestamp)
+	// Subtract modulo 2^32 before interpreting the difference as signed,
+	// so arrival and RTP timestamp wrap do not produce a jitter spike.
+	transit := int64(int32(rtpSampleArrival - readPktTimestamp))
 
-	D := transit - stats.transit
+	D := int64(int32(transit - stats.transit))
 	stats.transit = transit
 
 	if D < 0 {
@@ -175,17 +157,14 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 
 	fork := NewRTPSession(sess)
 	fork.readStats = s.readStats
+	// Payload mappings may change even when the SSRC and payload type stay the same.
+	fork.readStats.payloadTypeKnown = false
 	fork.writeStats = s.writeStats
 	fork.onReadRTCP = s.onReadRTCP
 	fork.onWriteRTCP = s.onWriteRTCP
 	fork.sourceLock = s.sourceLock
-	// The learned source belongs to one peer on one socket. A fork toward
-	// another address, or on a new socket, learns its source again: the peer
-	// it now talks to sends from somewhere else, and the old lock would refuse
-	// all of it.
 	if udpAddrEqual(s.Sess.Laddr, sess.Laddr) && udpAddrEqual(s.Sess.Raddr, sess.Raddr) {
 		fork.sourceLockPackets = s.sourceLockPackets
-		fork.sourceLockSeq = s.sourceLockSeq
 		if s.sourceLockAddr != nil {
 			addr := *s.sourceLockAddr
 			fork.sourceLockAddr = &addr
@@ -300,46 +279,45 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 			continue
 		}
 
-		break
+		s.rtcpMU.Lock()
+		supported := s.updateReadStats(readPkt, n, time.Now())
+		s.rtcpMU.Unlock()
+		if !supported {
+			DefaultLogger().Warn("Received RTP with unsupported payload_type. Skipping", "pt", readPkt.PayloadType)
+			continue
+		}
+
+		return n, nil
+	}
+}
+
+// updateReadStats updates the active RTP source and payload format.
+// s.rtcpMU must be held by the caller.
+func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) bool {
+	// Session codecs decide which payloads are supported. Readers above this
+	// layer handle their payload formats, including audio and telephone events.
+	stats := &s.readStats
+	ssrcChanged := stats.SSRC != readPkt.SSRC
+
+	sampleRate := stats.SampleRate
+	if ssrcChanged || !stats.payloadTypeKnown || stats.payloadType != readPkt.PayloadType {
+		codec, supported := s.Sess.localCodecByPayloadType(readPkt.PayloadType)
+		if !supported {
+			return false
+		}
+		sampleRate = codec.SampleRate
 	}
 
-	s.rtcpMU.Lock()
-	defer s.rtcpMU.Unlock()
-	// pktArrival := time.Now()
-	stats := &s.readStats
-	now := time.Now()
-
 	// For now we only track latest SSRC
-	if stats.SSRC != readPkt.SSRC {
+	if ssrcChanged {
 		// For now we will reset all our stats.
 		// We expect that SSRC only changed but MULTI RTP stream per one session is not supported
 		// NOTE: Reading codecs may be in a race while establishing session but it is expected
 		// that caller should not run reading while session is established
-		//
-		// The negotiated set is what the peer sends: for a dynamic format the
-		// payload type on the wire is the number the peer chose, and only the
-		// negotiated entry carries it. Gating on the local list dropped every
-		// packet of an opus call the peer numbered 111.
-		codecs := sess.activeCodecs()
-		codec := codecs[0]
-		if codec.PayloadType != readPkt.PayloadType {
-			for _, c := range codecs {
-				if c.PayloadType == readPkt.PayloadType {
-					codec = c
-					break
-				}
-			}
-
-			if codec.PayloadType != readPkt.PayloadType {
-				DefaultLogger().Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
-				return 0, nil
-			}
-		}
-
 		*stats = RTPReadStats{
 			SSRC:                   readPkt.SSRC,
 			FirstPktSequenceNumber: readPkt.SequenceNumber,
-			SampleRate:             codec.SampleRate,
+			SampleRate:             sampleRate,
 			firstRTPTime:           now,
 			firstRTPTimestamp:      readPkt.Timestamp,
 		}
@@ -347,9 +325,12 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 	} else {
 		stats.lastSeq.UpdateSeq(readPkt.SequenceNumber)
 
-		if stats.clockReset {
+		if stats.clockReset || stats.SampleRate != sampleRate {
+			// Transit values from different RTP clock rates cannot be compared.
+			stats.SampleRate = sampleRate
 			stats.firstRTPTime = now
 			stats.firstRTPTimestamp = readPkt.Timestamp
+			stats.jitter = 0
 			stats.transit = 0
 			stats.clockReset = false
 		} else if readPkt.Marker {
@@ -357,7 +338,7 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 			stats.firstRTPTime = now
 			stats.firstRTPTimestamp = readPkt.Timestamp
 		} else {
-			// https://datatracker.ietf.org/doc/html/rfc3550#page-39
+			// Include repeated timestamps from event updates and retransmissions.
 			stats.calcJitter(now, readPkt.Timestamp)
 		}
 
@@ -374,10 +355,32 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 		stats.IntervalFirstPktSeqNum = readPkt.SequenceNumber
 	}
 
-	// stats.lastRTPTime = now
-	// stats.lastRTPTimestamp = readPkt.Timestamp
+	stats.payloadType = readPkt.PayloadType
+	stats.payloadTypeKnown = true
 
-	return n, err
+	return true
+}
+
+func (s *MediaSession) localCodecByPayloadType(payloadType uint8) (Codec, bool) {
+	codecs := s.CommonCodecs()
+	if len(codecs) == 0 {
+		codecs = s.Codecs
+	}
+	for _, codec := range codecs {
+		if codec.PayloadTypeRecv() == payloadType {
+			return codec, true
+		}
+	}
+	return Codec{}, false
+}
+
+func codecByPayloadType(codecs []Codec, payloadType uint8) (Codec, bool) {
+	for _, codec := range codecs {
+		if codec.PayloadType == payloadType {
+			return codec, true
+		}
+	}
+	return Codec{}, false
 }
 
 // sourceLockProtection locks RTP handling only to one source change
@@ -393,14 +396,13 @@ func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
 		return s.sourceLockAddr.IP.Equal(fromAddr.IP) && s.sourceLockAddr.Port == fromAddr.Port && s.sourceLockAddr.Zone == fromAddr.Zone
 	}
 
-	// The packets counted must be in sequence with each other. They are
-	// compared with the last one counted rather than with the read statistics,
-	// which a fork carries over from the stream of its previous peer and which
-	// no packet refused here moves on.
-	if s.sourceLockPackets > 0 && s.sourceLockSeq+1 != pkt.SequenceNumber {
-		s.sourceLockPackets = 0
+	if s.readStats.lastSeq.seqNum+1 != pkt.SequenceNumber {
+		if s.readStats.lastSeq.seqNum != 0 {
+			// if not first packet then reset
+			s.sourceLockPackets = 0
+			return false
+		}
 	}
-	s.sourceLockSeq = pkt.SequenceNumber
 
 	// We wait couple packets before considering this is right source
 	s.sourceLockPackets++
@@ -425,27 +427,18 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 		return err
 	}
 
-	// Unlock on defer: the codec lookup below returns an error, and an early
-	// return that skipped the unlock left the session wedged for good. Close
-	// takes the same lock, so the dialog could not even be torn down.
 	s.rtcpMU.Lock()
 	defer s.rtcpMU.Unlock()
 	writeStats := &s.writeStats
 	// For now we only track latest SSRC
 	if writeStats.SSRC != pkt.SSRC {
-		codec, err := func() (Codec, error) {
-			// Find codec from the negotiated list of codecs. We stamp packets with
-			// the payload type negotiation settled on, which for a dynamic format is
-			// the peer's number, so the local list can not resolve it.
-			for _, c := range sess.activeCodecs() {
-				if c.PayloadType == pkt.PayloadType {
-					return c, nil
-				}
-			}
-			return Codec{}, fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
-		}()
-		if err != nil {
-			return err
+		codecs := sess.CommonCodecs()
+		if len(codecs) == 0 {
+			codecs = sess.Codecs
+		}
+		codec, supported := codecByPayloadType(codecs, pkt.PayloadType)
+		if !supported {
+			return fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
 		}
 
 		*writeStats = RTPWriteStats{
@@ -506,30 +499,19 @@ func (s *RTPSession) Monitor() error {
 	return errors.Join(err, <-errchan)
 }
 
-// MonitorBackground starts the RTCP reader and writer in the background, plus
-// the goroutine that stops them when ctx ends. All three are joined by
-// MonitorClose; ending ctx stops the monitors the same way MonitorClose does,
-// leaving the RTP/RTCP connections open and the session closed to a new
-// monitor. It must be called after the session's REMOTE SDP is parsed.
-func (s *RTPSession) MonitorBackground(ctx context.Context) error {
+// MonitorBackground is helper to keep monitoring in background
+// MUST Be called after session REMOTE SDP is parsed
+func (s *RTPSession) MonitorBackground() error {
 	sess := s.Sess
 	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
 	}
 
-	if err := s.startMonitor(3); err != nil {
+	if err := s.startMonitor(2); err != nil {
 		return err
 	}
 
 	log := DefaultLogger()
-	go func() {
-		defer s.monitorWG.Done()
-		select {
-		case <-ctx.Done():
-			_ = s.close(false)
-		case <-s.rtcpClosed:
-		}
-	}()
 	go func() {
 		defer s.monitorWG.Done()
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())

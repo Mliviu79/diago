@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -33,20 +31,10 @@ type Diago struct {
 	server     *sipgo.Server
 	transports []Transport
 
-	// transportsMu guards the elements of transports. The ready callback of a
-	// listener bound to an ephemeral port records the port there while request
-	// paths read them, so they are read through getTransport and findTransport,
-	// which hand out copies.
-	transportsMu sync.RWMutex
-
 	serveHandler ServeDialogFunc
 
 	auth      sipgo.DigestAuth
 	mediaConf MediaConfig
-
-	// sessionTimers is the RFC 4028 session-timer policy stamped onto each dialog
-	// at construction.
-	sessionTimers SessionTimerPolicy
 
 	log *slog.Logger
 
@@ -94,12 +82,7 @@ type Transport struct {
 
 	RewriteContact bool
 
-	// client is created once in WithTransport and shared by every copy of the
-	// Transport: the dg.transports elements, the copies getTransport and
-	// findTransport hand out, and serve's per-listener copy. Sharing the pointer
-	// lets the listener's ready callback replace the client while requests read
-	// it. Read it through getClient.
-	client *atomic.Pointer[sipgo.Client]
+	client *sipgo.Client
 }
 
 func WithTransport(t Transport) DiagoOption {
@@ -149,9 +132,7 @@ func WithTransport(t Transport) DiagoOption {
 		t.Transport = strings.TrimSuffix(t.Transport, "6") // udp6, tcp6
 
 		// we want to handle SIP networking better per each transport
-		// No listener is known to hold the port yet, see clientSourcePort.
-		t.client = &atomic.Pointer[sipgo.Client]{}
-		t.client.Store(dg.createClient(t, false))
+		t.client = dg.createClient(t)
 		dg.transports = append(dg.transports, t)
 
 		dg.log.Debug("Loaded transport", "t", t)
@@ -163,93 +144,16 @@ type MediaConfig struct {
 	// Currently supported Single. Check media.SRTP... constants
 	// Experimental
 	SecureRTPAlg uint16
-
-	// DTLSConfig is the DTLS-SRTP config every media session built from this
-	// config starts from. It is the Diago wide counterpart of
-	// Transport.MediaDTLSConf and, being a pointer, is opt in: when set it wins
-	// over the transport's own MediaDTLSConf, and nil leaves each transport
-	// supplying it as before.
-	//
-	// It configures DTLS but does not switch it on. That stays per transport,
-	// with MediaSRTP = media.SecureRTPModeDTLS.
-	DTLSConfig *media.DTLSConfig
-
-	// ICEConfig enables ICE (RFC 8445) on every media session built from this
-	// config. An ICE session binds a single socket and forces rtcp-mux, because
-	// ICE nominates one candidate pair.
-	//
-	// It is only honoured on transports that also set
-	// MediaSRTP = media.SecureRTPModeDTLS, the WebRTC media profile, as the media
-	// package negotiates ICE only there. Nil keeps the plain two socket layout,
-	// which is the previous behaviour.
-	ICEConfig *media.ICEConfig
-
-	// RTPPortAllocator, when non nil, chooses the local RTP port that every media
-	// session built from this config binds, instead of leaving the choice to the
-	// OS. It supersedes the media package RTPPortStart/RTPPortEnd globals, which
-	// can express only one range per process and only a linear scan over it.
-	// An allocator is per Diago and opaque, so a pool, tiers or a drain window
-	// are all possible without this package knowing about them.
-	//
-	// Nil leaves port selection to the OS or to the media package globals, which
-	// is the previous behaviour.
-	RTPPortAllocator RTPPortAllocator
-
 	// Used internally
 	secureRTP  int // 0 - none, 1 - sdes
 	bindIP     net.IP
 	externalIP net.IP
 	rtpNAT     int
-}
+	dtlsConf   media.DTLSConfig
 
-// mediaConfForTransport builds the media config a dialog running on tran starts
-// from. The transport supplies the media binding and the SRTP mode, the Diago
-// wide MediaConfig the rest. Both the server and the client dialog go through
-// here, so neither can quietly drop a field the other still carries.
-func (dg *Diago) mediaConfForTransport(tran *Transport) MediaConfig {
-	return MediaConfig{
-		Codecs:       dg.mediaConf.Codecs,
-		SecureRTPAlg: dg.mediaConf.SecureRTPAlg,
-		// A dialog binds through the allocator the caller installed on Diago.
-		// initMediaSessionFromConf reads it from the per dialog config, so a
-		// config that does not carry it leaves every dialog on the OS chosen
-		// port while the allocator sits unused.
-		RTPPortAllocator: dg.mediaConf.RTPPortAllocator,
-		secureRTP:        tran.MediaSRTP,
-		bindIP:           tran.mediaBindIP,
-		externalIP:       tran.MediaExternalIP,
-		DTLSConfig:       dg.dtlsConfForTransport(tran),
-		ICEConfig:        dg.mediaConf.ICEConfig,
-	}
-}
-
-// dtlsConfForTransport resolves the DTLS config a dialog on tran starts from.
-// A Diago wide DTLSConfig is opt in and wins; otherwise the transport keeps
-// supplying its own MediaDTLSConf, which is always a value and so cannot say
-// "unset". The transport config is copied so a dialog cannot mutate it.
-func (dg *Diago) dtlsConfForTransport(tran *Transport) *media.DTLSConfig {
-	if dg.mediaConf.DTLSConfig != nil {
-		return dg.mediaConf.DTLSConfig
-	}
-	conf := tran.MediaDTLSConf
-	return &conf
-}
-
-// RTPPortAllocator hands out and takes back local RTP ports for media sessions.
-//
-// AllocateRTPPort receives the context of the call the port is for: the dialog's
-// own context on a server dialog, and the context of Invite on a client dialog.
-// It returns an even port whose RTCP companion, port+1, the allocator must
-// consider taken as well, as MediaSession binds the pair. An ended context must
-// fail the allocation, with context.Cause(ctx) or an error wrapping it, and
-// allocate nothing. The error surfaces as the media session init failure.
-//
-// ReleaseRTPPort is called exactly once per successful allocation, from
-// DialogMedia.Close, after the sockets are closed. It must tolerate a port it
-// does not recognise, as it runs on teardown and so on error paths.
-type RTPPortAllocator interface {
-	AllocateRTPPort(ctx context.Context) (int, error)
-	ReleaseRTPPort(port int)
+	// TODO, For now it is global on media package
+	// RTPPortStart int
+	// RTPPortEnd   int
 }
 
 func (conf *MediaConfig) update(codecs []media.Codec, rtpNAT int) {
@@ -262,16 +166,6 @@ func (conf *MediaConfig) update(codecs []media.Codec, rtpNAT int) {
 func WithMediaConfig(conf MediaConfig) DiagoOption {
 	return func(dg *Diago) {
 		dg.mediaConf = conf
-	}
-}
-
-// WithSessionTimers sets the RFC 4028 session-timer policy stamped onto each
-// dialog at construction. The policy drives negotiation, the refresh loop and
-// the peer-refresh watchdog. Without this option session timers stay disabled
-// and diago neither advertises nor enforces them.
-func WithSessionTimers(p SessionTimerPolicy) DiagoOption {
-	return func(dg *Diago) {
-		dg.sessionTimers = p
 	}
 }
 
@@ -341,15 +235,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	errHandler := func(f func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error) sipgo.RequestHandler {
 		handler := func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			if err := f(ctx, req, tx); err != nil {
-				// The request may have failed because From or To is absent
-				var from, to string
-				if h := req.From(); h != nil {
-					from = h.String()
-				}
-				if h := req.To(); h != nil {
-					to = h.Value()
-				}
-				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", from, "req.to", to)
+				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", req.From().String(), "req.to", req.To().Value())
 				return
 			}
 			// Termination gracefull will be done by sipgo now
@@ -381,20 +267,6 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return dg.handleReInvite(ctx, req, tx, id)
 		}
 
-		if reason := describeMissingInviteHeader(req); reason != "" {
-			res := sip.NewResponseFromRequest(req, sip.StatusBadRequest, reason, nil)
-			return errors.Join(fmt.Errorf("%w: %s", errInviteMissingHeader, reason), tx.Respond(ctx, res))
-		}
-
-		if tags := unsupportedRequiredExtensions(req, dg.sessionTimers); len(tags) > 0 {
-			// RFC 3261 section 8.2.2.3: a UAS that does not understand an
-			// option tag in Require MUST answer 420 listing it in Unsupported.
-			unsupported := strings.Join(tags, ", ")
-			res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
-			res.AppendHeader(sip.NewHeader("Unsupported", unsupported))
-			return errors.Join(fmt.Errorf("%w: %s", errInviteRequiresUnsupportedExtension, unsupported), tx.Respond(ctx, res))
-		}
-
 		tran, _ := dg.getTransport(req.Transport())
 
 		// Proceed as new call
@@ -412,11 +284,14 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		// TODO authentication
 		dWrap := &DialogServerSession{
 			DialogServerSession: dialog,
-			DialogMedia:         DialogMedia{},
 			// TODO we may actually just build media session with this conf here
-			mediaConf:     dg.mediaConfForTransport(tran),
-			sessionTimers: dg.sessionTimers,
-			log:           dg.log,
+			mediaConf: MediaConfig{
+				Codecs:     dg.mediaConf.Codecs,
+				secureRTP:  tran.MediaSRTP,
+				bindIP:     tran.mediaBindIP,
+				externalIP: tran.MediaExternalIP,
+				dtlsConf:   tran.MediaDTLSConf,
+			},
 		}
 
 		defer closeAndLog(dWrap, "closing dialog server returned error")
@@ -484,29 +359,21 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return handleNoDialog(ctx, req, tx, err)
 		}
 
-		// Respond to BYE
-		// Terminate our media processing
-		// As user may stuck in playing or reading media, this unblocks that goroutine
-		// A BYE refused as out of order leaves the call, and its media, going.
 		if cd != nil {
-			err = cd.ReadBye(ctx, req, tx)
-			if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
-				closeAndLog(&cd.DialogMedia, "failed to close client media")
-			}
-			return err
+			err := cd.ReadBye(ctx, req, tx)
+			return errors.Join(err, cd.Close())
 		}
-
 		err = sd.ReadBye(ctx, req, tx)
-		if !errors.Is(err, sipgo.ErrDialogInvalidCseq) {
-			closeAndLog(&sd.DialogMedia, "failed to close server media")
-		}
-		return err
+		return errors.Join(err, sd.Close())
 	}))
 
 	server.OnInfo(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// Handle DTMF out of band
-		// The dialog is matched first: an INFO for no live dialog is answered
-		// 481 (RFC 3261 section 12.2.2), whatever it carries.
+		contentType := req.ContentType()
+		if contentType == nil || contentType.Value() != "application/dtmf-relay" {
+			return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+		}
+
 		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
 			return handleNoDialog(ctx, req, tx, err)
@@ -609,54 +476,6 @@ func (dg *Diago) handleReInvite(ctx context.Context, req *sip.Request, tx sip.Se
 	return s.handleReInvite(ctx, req, tx)
 }
 
-var errInviteMissingHeader = errors.New("new INVITE rejected with 400 Bad Request")
-
-var errInviteRequiresUnsupportedExtension = errors.New("new INVITE rejected with 420 Bad Extension")
-
-// unsupportedRequiredExtensions returns the option tags of the request's
-// Require headers that diago does not support, in the order they appear. The
-// only extension diago supports is timer (RFC 4028), and only while the
-// session-timer policy is enabled.
-func unsupportedRequiredExtensions(req *sip.Request, timers SessionTimerPolicy) []string {
-	var tags []string
-	for _, h := range req.GetHeaders("Require") {
-		for _, tag := range strings.Split(h.Value(), ",") {
-			tag = strings.TrimSpace(tag)
-			if tag == "" || (timers.Enabled && strings.EqualFold(tag, "timer")) {
-				continue
-			}
-			tags = append(tags, tag)
-		}
-	}
-	return tags
-}
-
-// describeMissingInviteHeader returns the reason phrase for the first header a
-// new INVITE lacks among those sipgo.DialogUA.ReadInvite needs: From, the From
-// tag, To, Call-ID, CSeq and Contact. It returns "" when all are present. The
-// check runs before ReadInvite so a malformed INVITE is answered, because most
-// of the errors ReadInvite returns for these headers carry no type to match on.
-func describeMissingInviteHeader(req *sip.Request) string {
-	from := req.From()
-	switch {
-	case from == nil:
-		return "Missing From Header Field"
-	case !from.Params.Has("tag"):
-		return "Missing From Tag"
-	case req.To() == nil:
-		return "Missing To Header Field"
-	case req.CallID() == nil:
-		return "Missing Call-ID Header Field"
-	case req.CSeq() == nil:
-		// The transaction layer answers a request without CSeq before any
-		// handler runs; the case keeps the list complete for ReadInvite.
-		return "Missing CSeq Header Field"
-	case req.Contact() == nil:
-		return "Missing Contact Header Field"
-	}
-	return ""
-}
-
 // ServeRequests serves the SIP requests the transports receive until ctx ends
 // or the user agent closes. ctx is the ctx every request handler runs on, and the
 // ServeDialogFunc set by HandleFunc receives it. It returns nil once the user
@@ -678,31 +497,11 @@ func (dg *Diago) Serve(ctx context.Context) error {
 	return dg.serve(ctx, func() {})
 }
 
-// ServeWithReady serves like Serve: it blocks until serving ends and returns
-// Serve's error. It also calls ready exactly once, after every transport's
-// listener has reported ready and that transport's client has been rebuilt for
-// its listener, so a request built once ready has run uses the rebuilt client.
-// ready runs on a listener goroutine and must not block. If serving fails before
-// every listener is up, ready is never called.
-func (dg *Diago) ServeWithReady(ctx context.Context, ready func()) error {
-	var pending atomic.Int64
-	pending.Store(int64(len(dg.transports)))
-	return dg.serve(ctx, func() {
-		if pending.Add(-1) == 0 {
-			ready()
-		}
-	})
-}
-
 func (dg *Diago) serve(ctx context.Context, readyCh func()) error {
 	server := dg.server
 
-	dg.transportsMu.RLock()
-	transports := slices.Clone(dg.transports)
-	dg.transportsMu.RUnlock()
-
-	errCh := make(chan error, len(transports))
-	for i, tran := range transports {
+	errCh := make(chan error, len(dg.transports))
+	for i, tran := range dg.transports {
 		hostport := net.JoinHostPort(tran.BindHost, strconv.Itoa(tran.BindPort))
 
 		go func(i int, tran Transport) {
@@ -713,22 +512,10 @@ func (dg *Diago) serve(ctx context.Context, readyCh func()) error {
 				_, port, _ := sip.ParseAddr(addr)
 				if tran.BindPort == 0 {
 					tran.BindPort = port
-					// WithTransport defaults ExternalPort to BindPort, which is
-					// 0 here, so a non-zero ExternalPort was set by the caller,
-					// for example a forwarded port, and is kept.
-					if tran.ExternalPort == 0 {
-						tran.ExternalPort = port
-					}
-					dg.transportsMu.Lock()
+					tran.ExternalPort = port
+					tran.client = dg.createClient(tran)
 					dg.transports[i] = tran
-					dg.transportsMu.Unlock()
 				}
-				// This callback is itself the proof that the listener holds
-				// tran.BindPort. Not every sipgo release has recorded the port in
-				// ListenPorts by the time it fires, so ListenPorts cannot vouch for
-				// it: tell createClient directly, and swap the client before anyone
-				// is told we are ready.
-				tran.client.Store(dg.createClient(tran, true))
 				readyCh()
 
 				dg.log.Info("Listening on transport", "addr", addr, "protocol", tran.network)
@@ -785,6 +572,8 @@ type InviteOptions struct {
 	Password string
 	// Custom headers to pass. DO NOT SET THIS to nil
 	Headers []sip.Header
+	// RTPNAT is media.MediaSession.RTPNAT. Check media.RTPNAT... options
+	RTPNAT int
 }
 
 // Invite makes outgoing call leg and waits for answer.
@@ -794,64 +583,65 @@ type InviteOptions struct {
 //
 // For better control more details use above functions instead.
 // If you want to bridge call then use helper InviteBridge
-func (dg *Diago) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptions) (d *DialogClientSession, err error) {
+func (dg *Diago) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptions) (d *DialogClientSession, med *DialogMedia, err error) {
 	d, err = dg.NewDialog(recipient, NewDialogOptions{Transport: opts.Transport})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if err := d.Invite(ctx, InviteClientOptions{
+	med, err = d.Invite(ctx, InviteClientOptions{
 		Originator: opts.Originator,
 		OnResponse: opts.OnResponse,
 		Headers:    opts.Headers,
 		Username:   opts.Username,
 		Password:   opts.Password,
-	}); err != nil {
+		RTPNAT:     opts.RTPNAT,
+	})
+	if err != nil {
 		closeErr := d.Close()
-		return nil, errors.Join(err, closeErr)
+		return nil, nil, errors.Join(err, closeErr)
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		return nil, errors.Join(err, d.ackAndBye(), d.Close())
+		closeErr := d.Close()
+		return nil, nil, errors.Join(err, closeErr)
 	}
-	return d, nil
+	return d, med, nil
 }
 
 // InviteBridge makes outgoing call leg and does bridging.
 // Outgoing session will be added into bridge on answer
 // If bridge has Originator (first participant) it will be used for creating outgoing call leg as in B2BUA
 // When bridge is provided then this call will be bridged with any participant already present in bridge
-func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Bridge, opts InviteOptions) (d *DialogClientSession, err error) {
+func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Bridge, opts InviteOptions) (d *DialogClientSession, med *DialogMedia, err error) {
 	d, err = dg.NewDialog(recipient, NewDialogOptions{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Keep things compatible
-	if opts.Originator == nil {
-		opts.Originator = bridge.originator()
-	}
-
-	if err := d.Invite(ctx, InviteClientOptions{
+	med, err = d.Invite(ctx, InviteClientOptions{
 		Originator: opts.Originator,
 		OnResponse: opts.OnResponse,
 		Headers:    opts.Headers,
 		Username:   opts.Username,
 		Password:   opts.Password,
-	}); err != nil {
-		return nil, errors.Join(err, d.Hangup(d.Context()), d.Close())
+		RTPNAT:     opts.RTPNAT,
+	})
+	if err != nil {
+		return nil, nil, errors.Join(err, d.Hangup(d.Context()), d.Close())
 	}
 
-	// Do bridging now. The call is answered already, so a call that fails
-	// from here on is acknowledged and ended with a BYE.
-	if err := bridge.AddDialogSession(d); err != nil {
-		return nil, errors.Join(err, d.ackAndBye(), d.Close())
+	// Do bridging now
+	if err := bridge.AddDialogMedia(med); err != nil {
+		d.Close()
+		return nil, nil, err
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		return nil, errors.Join(err, d.ackAndBye(), d.Close())
+		d.Close()
+		return nil, nil, err
 	}
-	return d, nil
+	return d, med, nil
 }
 
 type NewDialogOptions struct {
@@ -904,26 +694,34 @@ func (dg *Diago) newSipDialog(recipient sip.Uri, tran *Transport, opts NewDialog
 	}
 	d.Init()
 
-	d.mediaConfig = dg.mediaConfForTransport(tran)
+	d.mediaConfig = MediaConfig{
+		Codecs:     dg.mediaConf.Codecs,
+		secureRTP:  tran.MediaSRTP,
+		bindIP:     tran.mediaBindIP,
+		externalIP: tran.MediaExternalIP,
+		dtlsConf:   tran.MediaDTLSConf,
+	}
 
-	// The dialog exists from its 2xx (RFC 3261 section 12.1.2), so it is
-	// stored then, before the ACK goes out. The peer may send an in-dialog
-	// request as soon as the ACK reaches it, and sipgo confirms the dialog only
-	// after the ACK is written, so storing on confirmation answered such a
-	// request 481.
+	// This should be run on ACK
 	d.OnState(func(s sip.DialogState) {
-		if s != sip.DialogStateEstablished {
+		if s != sip.DialogStateConfirmed {
 			return
 		}
 
+		// Now dialog is established and can be add into store
 		if err := dg.cache.client.DialogStore(context.Background(), d.ID, d); err != nil {
 			dg.log.Error("Failed to store in dialog cache", "error", err)
 		}
 	})
 
-	d.uncache = func() error {
-		return dg.cache.client.DialogDelete(context.Background(), d.ID)
-	}
+	d.Dialog.OnState(func(s sip.DialogState) {
+		if s != sip.DialogStateEnded {
+			return
+		}
+		if err := dg.cache.client.DialogDelete(context.Background(), d.ID); err != nil {
+			dg.log.Error("Failed to delete client dialog", "error", err)
+		}
+	})
 	return d, nil
 }
 
@@ -957,15 +755,12 @@ func (dg *Diago) getClient(tran *Transport) *sipgo.Client {
 		return dg.client
 	}
 
-	return tran.client.Load()
+	return tran.client
 }
 
 func (dg *Diago) getTransport(transport string) (*Transport, bool) {
-	dg.transportsMu.RLock()
-	defer dg.transportsMu.RUnlock()
 	if transport == "" {
-		t := dg.transports[0]
-		return &t, true
+		return &dg.transports[0], true
 	}
 	for _, t := range dg.transports {
 		if sip.NetworkToLower(transport) == t.Transport {
@@ -977,8 +772,6 @@ func (dg *Diago) getTransport(transport string) (*Transport, bool) {
 
 func (dg *Diago) findTransport(transport string, id string) (*Transport, bool) {
 	if id != "" {
-		dg.transportsMu.RLock()
-		defer dg.transportsMu.RUnlock()
 		for _, t := range dg.transports {
 			if id == t.ID {
 				return &t, true
@@ -1008,8 +801,7 @@ func (dg *Diago) Register(ctx context.Context, recipient sip.Uri, opts RegisterO
 
 	// Unregister
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
 		err := t.Unregister(ctx)
 		if err != nil {
 			dg.log.Error("Failed to unregister", "error", err)
@@ -1048,9 +840,7 @@ func (dg *Diago) Register(ctx context.Context, recipient sip.Uri, opts RegisterO
 			return err
 		}
 
-		// Only the refresh cadence, never the recorded grant: an
-		// otherwise live binding must not look already lapsed after a 503.
-		t.setExpiry(retryAfter)
+		t.expiry = retryAfter
 	}
 }
 
@@ -1081,40 +871,7 @@ func (dg *Diago) RegisterTransaction(ctx context.Context, recipient sip.Uri, opt
 	return newRegisterTransaction(client, recipient, contactHDR, dg.log, opts), nil
 }
 
-// clientSourcePort reports the local UDP port a client built without proof of a
-// listener may source requests from: want only while the transport layer already
-// listens on it. That client is the one built when the transport loads.
-//
-// Sourcing from a listened port reuses that connection. Sourcing from any other
-// port is a fresh bind, which the OS refuses as soon as another process owns the
-// port. The distinction matters because a UA may register before it serves: at
-// that moment no listener holds the configured port, so pinning it there turns
-// an unrelated process on the same port into a failed REGISTER rather than the
-// intended reuse. Returning 0 asks for an ephemeral port, which always binds.
-//
-// The serve path does not ask it. Depending on the sipgo release, a listener
-// can be reported ready before its port is recorded, so the answer there could
-// be 0 even though the port is held; the ready callback tells createClient
-// instead.
-func clientSourcePort(ua *sipgo.UserAgent, want int) int {
-	if want == 0 {
-		return 0
-	}
-	// The specific port must be listened on, not merely some port: a UA serving
-	// 5060 does not make an unheld 25000 bindable.
-	for _, p := range ua.TransportLayer().ListenPorts("udp") {
-		if p == want {
-			return want
-		}
-	}
-	return 0
-}
-
-// createClient builds the client a transport sends requests with. listening
-// reports that a listener is known to hold tran.BindPort, which only the
-// listener's ready callback can prove; without that proof clientSourcePort
-// decides whether the port may be pinned.
-func (dg *Diago) createClient(tran Transport, listening bool) (client *sipgo.Client) {
+func (dg *Diago) createClient(tran Transport) (client *sipgo.Client) {
 	ua := dg.ua
 	// When transport is not binding to specific IP
 
@@ -1134,12 +891,6 @@ func (dg *Diago) createClient(tran Transport, listening bool) (client *sipgo.Cli
 				resolvedIP = tran.mediaBindIP
 				bindPort = 0
 			}
-		}
-
-		// 3. Only source from a port we already listen on. The ready callback
-		// knows the port is held; a client built at load asks clientSourcePort.
-		if !listening {
-			bindPort = clientSourcePort(ua, bindPort)
 		}
 
 		hostname := ""

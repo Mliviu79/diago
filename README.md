@@ -1,6 +1,6 @@
 <img src="icons/diago-icon-text.svg" width="300" alt="DIAGO">
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/emiago/diago)](https://goreportcard.com/report/github.com/emiago/diago)
+[![golangci-lint](https://github.com/emiago/diago/actions/workflows/golangci-lint.yml/badge.svg?branch=main)](https://github.com/emiago/diago/actions/workflows/golangci-lint.yml)
 ![Coverage](https://img.shields.io/badge/coverage-61.1%25-blue)
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/emiago/diago)
 
@@ -22,18 +22,23 @@ Quick links:
 - [GO Docs](https://pkg.go.dev/github.com/emiago/diago)
 - [Roadmap](https://emiago.github.io/diago/docs/#core-roadmap)
 
-## Important media API change
+## WebRTC/Pion API changes
 
-`Answer` and `Invite` now return the media stack. Keep and use the returned media
-object for media operations instead of accessing media through the dialog
-session.
+For WebRTC/Pion migration details and current media API direction, read
+[WEBRTC_PION_CHANGES.md](WEBRTC_PION_CHANGES.md).
 
-**Everyone is encouraged to try the [`media-webrtc-pion` branch](https://github.com/emiago/diago/tree/media-webrtc-pion)
-and test the new returned-media API.**
+The previous combined SIP and media stack is on the `sip-media` branch, based on
+v0.32.2, and may receive patches. To use it in your Go project:
 
-See [WEBRTC_PION_CHANGES.md](https://github.com/emiago/diago/blob/webrtc-pion/WEBRTC_PION_CHANGES.md)
-for the API migration details. WebRTC is not the primary focus yet; this work
-will also bring the Pion media stack into Diago.
+```sh
+go get github.com/emiago/diago@sip-media
+```
+
+**NOTE:** SIP dialog sessions and media stacks are now separated. Use returned
+media objects such as `*DialogMedia` and `*DialogWebrtc` for media operations.
+
+**NOTE:** Existing code using dialog-owned media access should be migrated to the
+new returned-media API.
 
 *If you find this project useful and you want to support/sponzor or need help with your projects, you can contact me more on*
 [mail](mailto:emirfreelance91@gmail.com).
@@ -80,7 +85,7 @@ dg := diago.NewDiago(ua)
 
 dg.HandleFunc(func(ctx context.Context, inDialog *diago.DialogServerSession) {
 	inDialog.Trying(ctx) // 100 Trying
-	inDialog.AnswerContext(ctx) // Answer - 200 OK SDP
+	inDialog.Answer(); // Answer - 200 OK SDP
 
 	// Make sure file below exists in work dir
 	playfile, err := os.Open("demo-echotest.wav")
