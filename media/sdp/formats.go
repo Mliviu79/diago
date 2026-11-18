@@ -45,6 +45,8 @@ func (fmts Formats) String() string {
 			out[i] = "0(ulaw)"
 		case FORMAT_TYPE_ALAW:
 			out[i] = "8(alaw)"
+		case FORMAT_TYPE_G722:
+			out[i] = "9(g722)"
 		case FORMAT_TYPE_OPUS:
 			out[i] = "96(opus)"
 		default:
