@@ -44,10 +44,11 @@ type Bridge struct {
 }
 
 // NewBridge creates bridge with default settings.
-func NewBridge() Bridge {
-	b := Bridge{}
+func NewBridge() (b Bridge) {
+	// Set up in the result itself: a Bridge holds a sync.WaitGroup, which is
+	// not copied
 	b.Init(media.DefaultLogger())
-	return b
+	return
 }
 
 func (b *Bridge) Init(log *slog.Logger) {
