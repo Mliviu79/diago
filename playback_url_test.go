@@ -45,6 +45,7 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 	var errServer error
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	log := asyncLog(t)
 	err := serveBackground(t, tu, ctx, func(ctx context.Context, in *DialogServerSession) {
 		defer wg.Done()
 		in.Trying(ctx)
@@ -55,13 +56,13 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 			return
 		}
 		defer med.Close()
-		t.Log("Playing url ", urlStr)
+		log("Playing url ", urlStr)
 		pb, _ := med.PlaybackCreate()
 		if _, err := pb.PlayURL(urlStr); err != nil {
 			errServer = errors.Join(errServer, err)
 		}
 
-		t.Log("Done playing", urlStr)
+		log("Done playing", urlStr)
 		in.Hangup(in.Context())
 	})
 	require.NoError(t, err)
@@ -75,7 +76,7 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 			BindPort:  15060,
 		}))
 		// Just to have handled BYE
-		err := serveBackground(t, phone, context.TODO(), func(_ context.Context, d *DialogServerSession) {})
+		err := serveBackground(t, phone, ctx, func(_ context.Context, d *DialogServerSession) {})
 		require.NoError(t, err)
 
 		dialog, med, err := phone.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 15060}, InviteOptions{})
@@ -85,14 +86,26 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 
 		rtpReader := med.RTPPacketReader
 
+		// The call ends when the playback does; one that has not ended
+		// within 10 seconds is hung up.
+		stopped := make(chan struct{})
 		go func() {
+			defer close(stopped)
 			defer dialog.Close()
-			time.Sleep(10 * time.Second)
-			dialog.Hangup(ctx)
+			select {
+			case <-dialog.Context().Done():
+			case <-time.After(10 * time.Second):
+				dialog.Hangup(ctx)
+			}
 		}()
 		b := bytes.NewBuffer([]byte{})
 		written, err := media.CopyWithBuf(rtpReader, b, make([]byte, media.RTPBufSize))
 		// bnf, err := io.ReadAll(rtpReader)
+		select {
+		case <-stopped:
+		case <-time.After(15 * time.Second):
+			t.Error("the call was not closed")
+		}
 		require.ErrorIs(t, err, io.EOF)
 		require.Greater(t, written, int64(10000))
 		require.Greater(t, b.Len(), 10000)
@@ -113,6 +126,7 @@ func testStartAudioStreamServer(t *testing.T) string {
 		if err != nil {
 			return
 		}
+		defer fh.Close()
 
 		// Get file info
 		fileInfo, err := fh.Stat()
@@ -140,10 +154,19 @@ func testStartAudioStreamServer(t *testing.T) string {
 
 	l, err := net.Listen("tcp", srv.Addr)
 	require.NoError(t, err)
-	go srv.Serve(l)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		srv.Serve(l)
+	}()
 
 	t.Cleanup(func() {
 		srv.Shutdown(context.TODO())
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
+			t.Error("the HTTP server did not stop")
+		}
 	})
 	return "http://" + srv.Addr + "/"
 }

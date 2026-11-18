@@ -114,7 +114,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 
 	doTest := func(t *testing.T, tc testCase) {
 		tran := tc.tran
-		reqCh := make(chan *sip.Request)
+		reqCh := make(chan *sip.Request, 1)
 		dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
 			reqCh <- req
 			return sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -132,10 +132,28 @@ func TestDiagoTransportConfs(t *testing.T) {
 			}
 		}
 
-		go dg.Invite(context.TODO(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
+		// The answer carries no SDP, so the call fails once its INVITE is out;
+		// only the INVITE is examined, and the call is waited for.
+		invited := make(chan struct{})
+		go func() {
+			defer close(invited)
+			_, _, _ = dg.Invite(context.TODO(), sip.Uri{User: "alice", Host: "localhost"}, InviteOptions{})
+		}()
+		defer func() {
+			select {
+			case <-invited:
+			case <-time.After(5 * time.Second):
+				t.Error("the call did not return")
+			}
+		}()
 
 		// Now check our req passed on client
-		req := <-reqCh
+		var req *sip.Request
+		select {
+		case req = <-reqCh:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the INVITE was never sent")
+		}
 
 		// parse SDP
 		sd := sdp.SessionDescription{}
@@ -302,7 +320,7 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 
 	dg := NewDiago(ua, WithTransport(tran))
 
-	err := serveBackground(t, dg, context.TODO(), func(_ context.Context, d *DialogServerSession) {})
+	err := serveBackground(t, dg, t.Context(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	newTran, _ := dg.getTransport("udp")
@@ -323,6 +341,9 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 		NumChannels: 1,
 	}
 
+	// The handler runs on a server goroutine, so its answer's error is handed
+	// to the test rather than asserted there.
+	answered := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA()
 		defer ua.Close()
@@ -345,8 +366,9 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
+			answered <- err
 			if err != nil {
-				panic(err)
+				return
 			}
 			defer med.Close()
 
@@ -377,6 +399,12 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15066}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)
 	defer med.Close()
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer did not complete after the call was set up")
+	}
 
 	l16Audio := bytes.Repeat([]byte{0, 16, 96, 0}, l16Codec.Samples16()/4)
 	reader := bytes.NewBuffer(l16Audio)
@@ -394,6 +422,9 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 	// TODO: USE TLS as transport for more correct test
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The handler runs on a server goroutine, so its answer's error is handed
+	// to the test rather than asserted there.
+	answered := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA()
 		defer ua.Close()
@@ -417,8 +448,9 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
+			answered <- err
 			if err != nil {
-				panic(err)
+				return
 			}
 			defer med.Close()
 
@@ -454,6 +486,12 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15443}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)
 	defer med.Close()
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer did not complete after the call was set up")
+	}
 
 	// pb, err := med.PlaybackCreate()
 	// if err != nil {
@@ -479,6 +517,9 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 	// media.DTLSDebug = true
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The handler runs on a server goroutine, so its answer's error is handed
+	// to the test rather than asserted there.
+	answered := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA()
 		defer ua.Close()
@@ -506,8 +547,9 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
+			answered <- err
 			if err != nil {
-				panic(err)
+				return
 			}
 			defer med.Close()
 
@@ -545,6 +587,12 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)
 	defer med.Close()
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer did not complete after the call was set up")
+	}
 
 	// pb, err := med.PlaybackCreate()
 	// if err != nil {

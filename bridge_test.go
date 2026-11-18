@@ -6,6 +6,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -106,12 +107,13 @@ func TestIntegrationBridging(t *testing.T) {
 		},
 	))
 
+	log := asyncLog(t)
 	err := serveBackground(t, tu, ctx, func(runCtx context.Context, in *DialogServerSession) {
 		in.Trying(runCtx)
 		in.Ringing(runCtx)
 		med, err := in.Answer(AnswerOptions{})
 		if err != nil {
-			t.Log("Answer failed", err)
+			log("Answer failed", err)
 			return
 		}
 		defer med.Close()
@@ -124,13 +126,13 @@ func TestIntegrationBridging(t *testing.T) {
 		bridge := NewBridge()
 		// Add us in bridge
 		if err := bridge.AddDialogMedia(med); err != nil {
-			t.Log("Adding dialog in bridge failed", err)
+			log("Adding dialog in bridge failed", err)
 			return
 		}
 
 		out, _, err := tu.InviteBridge(ctx, sip.Uri{User: "test", Host: "127.0.0.200", Port: 5090}, &bridge, InviteOptions{})
 		if err != nil {
-			t.Log("Dialing failed", err)
+			log("Dialing failed", err)
 			return
 		}
 
@@ -151,6 +153,9 @@ func TestIntegrationBridging(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
+	// The bridged leg's handler runs on a server goroutine, so its errors are
+	// handed to the test rather than asserted there.
+	echoed := make(chan error, 1)
 	{
 		ua, _ := sipgo.NewUA()
 		defer ua.Close()
@@ -163,21 +168,30 @@ func TestIntegrationBridging(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, context.Background(), func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 			ctx := d.Context()
 			med, err := d.Answer(AnswerOptions{})
-			require.NoError(t, err)
+			if err != nil {
+				echoed <- fmt.Errorf("answer: %w", err)
+				return
+			}
 			defer med.Close()
 
 			// ms := d.mediaSession
 			buf := make([]byte, media.RTPBufSize)
 			r, _ := med.AudioReader()
 			n, err := r.Read(buf)
-			require.NoError(t, err)
+			if err != nil {
+				echoed <- fmt.Errorf("read: %w", err)
+				return
+			}
 
 			w, _ := med.AudioWriter()
-			w.Write(buf[:n])
-			require.NoError(t, err)
+			if _, err := w.Write(buf[:n]); err != nil {
+				echoed <- fmt.Errorf("write: %w", err)
+				return
+			}
+			echoed <- nil
 
 			<-ctx.Done()
 		})
@@ -207,6 +221,13 @@ func TestIntegrationBridging(t *testing.T) {
 		t.Log("Hanguping")
 		dialog.Hangup(ctx)
 	}
+
+	select {
+	case err := <-echoed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bridged leg did not echo the audio")
+	}
 }
 
 func TestIntegrationBridgingMix(t *testing.T) {
@@ -228,6 +249,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 
 	bridge := NewBridgeMix()
 	dialogExit := make(chan string, 10)
+	log := asyncLog(t)
 	err := serveBackground(t, tu, ctx, func(ctx context.Context, in *DialogServerSession) {
 		defer func() { dialogExit <- in.ID }()
 
@@ -235,19 +257,19 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		in.Ringing(ctx)
 		med, err := in.Answer(AnswerOptions{})
 		if err != nil {
-			t.Log("Answer failed", err)
+			log("Answer failed", err)
 			return
 		}
 		defer med.Close()
 
 		// Add us in bridge
-		t.Log("Adding into bridge", in.ID)
+		log("Adding into bridge", in.ID)
 		if err := bridge.AddDialogMedia(med); err != nil {
-			t.Log("Adding dialog in bridge failed", err)
+			log("Adding dialog in bridge failed", err)
 			return
 		}
 		defer func() {
-			t.Log("Removing from bridge", in.ID)
+			log("Removing from bridge", in.ID)
 			bridge.RemoveDialogMedia(med)
 		}()
 
