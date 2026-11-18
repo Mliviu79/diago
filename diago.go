@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -30,6 +32,12 @@ type Diago struct {
 	client     *sipgo.Client
 	server     *sipgo.Server
 	transports []Transport
+
+	// transportsMu guards the elements of transports. The ready callback of a
+	// listener bound to an ephemeral port records the port there while request
+	// paths read them, so they are read through getTransport and findTransport,
+	// which hand out copies.
+	transportsMu sync.RWMutex
 
 	serveHandler ServeDialogFunc
 
@@ -82,7 +90,12 @@ type Transport struct {
 
 	RewriteContact bool
 
-	client *sipgo.Client
+	// client is created once in WithTransport and shared by every copy of the
+	// Transport: the dg.transports elements, the copies getTransport and
+	// findTransport hand out, and serve's per-listener copy. Sharing the pointer
+	// lets the listener's ready callback replace the client while requests read
+	// it. Read it through getClient.
+	client *atomic.Pointer[sipgo.Client]
 }
 
 func WithTransport(t Transport) DiagoOption {
@@ -132,7 +145,9 @@ func WithTransport(t Transport) DiagoOption {
 		t.Transport = strings.TrimSuffix(t.Transport, "6") // udp6, tcp6
 
 		// we want to handle SIP networking better per each transport
-		t.client = dg.createClient(t)
+		// No listener is known to hold the port yet, see clientSourcePort.
+		t.client = &atomic.Pointer[sipgo.Client]{}
+		t.client.Store(dg.createClient(t, false))
 		dg.transports = append(dg.transports, t)
 
 		dg.log.Debug("Loaded transport", "t", t)
@@ -500,8 +515,12 @@ func (dg *Diago) Serve(ctx context.Context) error {
 func (dg *Diago) serve(ctx context.Context, readyCh func()) error {
 	server := dg.server
 
-	errCh := make(chan error, len(dg.transports))
-	for i, tran := range dg.transports {
+	dg.transportsMu.RLock()
+	transports := slices.Clone(dg.transports)
+	dg.transportsMu.RUnlock()
+
+	errCh := make(chan error, len(transports))
+	for i, tran := range transports {
 		hostport := net.JoinHostPort(tran.BindHost, strconv.Itoa(tran.BindPort))
 
 		go func(i int, tran Transport) {
@@ -512,10 +531,22 @@ func (dg *Diago) serve(ctx context.Context, readyCh func()) error {
 				_, port, _ := sip.ParseAddr(addr)
 				if tran.BindPort == 0 {
 					tran.BindPort = port
-					tran.ExternalPort = port
-					tran.client = dg.createClient(tran)
+					// WithTransport defaults ExternalPort to BindPort, which is
+					// 0 here, so a non-zero ExternalPort was set by the caller,
+					// for example a forwarded port, and is kept.
+					if tran.ExternalPort == 0 {
+						tran.ExternalPort = port
+					}
+					dg.transportsMu.Lock()
 					dg.transports[i] = tran
+					dg.transportsMu.Unlock()
 				}
+				// This callback is itself the proof that the listener holds
+				// tran.BindPort. Not every sipgo release has recorded the port in
+				// ListenPorts by the time it fires, so ListenPorts cannot vouch for
+				// it: tell createClient directly, and swap the client before anyone
+				// is told we are ready.
+				tran.client.Store(dg.createClient(tran, true))
 				readyCh()
 
 				dg.log.Info("Listening on transport", "addr", addr, "protocol", tran.network)
@@ -755,12 +786,15 @@ func (dg *Diago) getClient(tran *Transport) *sipgo.Client {
 		return dg.client
 	}
 
-	return tran.client
+	return tran.client.Load()
 }
 
 func (dg *Diago) getTransport(transport string) (*Transport, bool) {
+	dg.transportsMu.RLock()
+	defer dg.transportsMu.RUnlock()
 	if transport == "" {
-		return &dg.transports[0], true
+		t := dg.transports[0]
+		return &t, true
 	}
 	for _, t := range dg.transports {
 		if sip.NetworkToLower(transport) == t.Transport {
@@ -772,6 +806,8 @@ func (dg *Diago) getTransport(transport string) (*Transport, bool) {
 
 func (dg *Diago) findTransport(transport string, id string) (*Transport, bool) {
 	if id != "" {
+		dg.transportsMu.RLock()
+		defer dg.transportsMu.RUnlock()
 		for _, t := range dg.transports {
 			if id == t.ID {
 				return &t, true
@@ -874,7 +910,11 @@ func (dg *Diago) RegisterTransaction(ctx context.Context, recipient sip.Uri, opt
 	return newRegisterTransaction(client, recipient, contactHDR, dg.log, opts), nil
 }
 
-func (dg *Diago) createClient(tran Transport) (client *sipgo.Client) {
+// createClient builds the client a transport sends requests with. listening
+// reports that a listener is known to hold tran.BindPort, which only the
+// listener's ready callback can prove; without that proof clientSourcePort
+// decides whether the port may be pinned.
+func (dg *Diago) createClient(tran Transport, listening bool) (client *sipgo.Client) {
 	ua := dg.ua
 	// When transport is not binding to specific IP
 
@@ -894,6 +934,12 @@ func (dg *Diago) createClient(tran Transport) (client *sipgo.Client) {
 				resolvedIP = tran.mediaBindIP
 				bindPort = 0
 			}
+		}
+
+		// 3. Only source from a port we already listen on. The ready callback
+		// knows the port is held; a client built at load asks clientSourcePort.
+		if !listening {
+			bindPort = clientSourcePort(ua, bindPort)
 		}
 
 		hostname := ""
