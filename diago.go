@@ -801,7 +801,8 @@ func (dg *Diago) Register(ctx context.Context, recipient sip.Uri, opts RegisterO
 
 	// Unregister
 	defer func() {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		err := t.Unregister(ctx)
 		if err != nil {
 			dg.log.Error("Failed to unregister", "error", err)
@@ -840,7 +841,9 @@ func (dg *Diago) Register(ctx context.Context, recipient sip.Uri, opts RegisterO
 			return err
 		}
 
-		t.expiry = retryAfter
+		// Only the refresh cadence, never the recorded grant: an
+		// otherwise live binding must not look already lapsed after a 503.
+		t.setExpiry(retryAfter)
 	}
 }
 

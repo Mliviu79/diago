@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -39,7 +40,10 @@ type RegisterOptions struct {
 
 	// Expiry is for Expire header
 	Expiry time.Duration
-	// Retry interval is interval before next Register is sent
+	// RetryInterval is the interval before the next Register is sent. It can only
+	// bring the refresh forward: an interval longer than what the registrar
+	// granted is clamped to the grant, otherwise the binding lapses before the
+	// refresh fires.
 	RetryInterval time.Duration
 	AllowHeaders  []string
 
@@ -57,7 +61,21 @@ type RegisterTransaction struct {
 	client *sipgo.Client
 	log    *slog.Logger
 
+	// mu guards the registration state below. Diago.Register writes expiry from
+	// its own goroutine while the refresh loop reads it.
+	mu sync.RWMutex
+	// expiry drives the refresh cadence, see calcRetry.
 	expiry time.Duration
+	// grantedExpires and lastRegistered are written only by a successful
+	// REGISTER and describe the binding the registrar actually holds. They are
+	// deliberately kept apart from expiry, which Diago.Register repurposes as a
+	// Retry-After hint on a 503; mixing the two would make an otherwise live
+	// binding look already lapsed.
+	grantedExpires time.Duration
+	lastRegistered time.Time
+	// expiredEmitted latches the escalation so a lapsed binding is reported once
+	// per outage rather than on every subsequent refresh.
+	expiredEmitted bool
 }
 
 func newRegisterTransaction(client *sipgo.Client, recipient sip.Uri, contact sip.ContactHeader, log *slog.Logger, opts RegisterOptions) *RegisterTransaction {
@@ -179,7 +197,7 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 		req.ReplaceHeader(contact)
 	}
 
-	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
+	if isDigestChallenge(res) {
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 			Username: username,
 			Password: password,
@@ -197,66 +215,40 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 		}
 	}
 
-	// Now update server expiry
-	t.expiry = t.opts.Expiry
-	if h := res.GetHeader("Expires"); h != nil {
-		val, err := strconv.Atoi(h.Value())
-		if err != nil {
-			return fmt.Errorf("failed to parse server Expires value: %w", err)
-		}
-		t.expiry = time.Duration(val) * time.Second
-	}
+	// Record what the registrar granted, which may be far shorter than what was
+	// requested. That grant, not the request, bounds the binding's lifetime.
+	t.recordGrant(grantedExpiry(res, t.opts.Expiry))
 
 	return nil
 }
 
 func (t *RegisterTransaction) QualifyLoop(ctx context.Context) error {
-	// TODO: based on server response Expires header this must be adjusted
-	// Allows caller to adjust
-	expiry := t.expiry
-	retry := t.calcRetry(expiry)
-	return t.reregisterLoop(ctx, retry)
+	return t.reregisterLoop(ctx, t.calcRetry(t.getExpiry()))
 }
 
 func (t *RegisterTransaction) reregisterLoop(ctx context.Context, retry time.Duration) error {
-	ticker := time.NewTicker(retry)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C: // TODO make configurable
-		}
-		expiry := t.expiry
-		err := t.Qualify(ctx)
-		if err != nil {
-			return err
-		}
-
-		if t.expiry != expiry {
-			// expiry got updated
-			expiry = t.expiry
-			retry = t.calcRetry(expiry)
-
-			t.log.Info("Register expiry changed", "expiry_old", expiry, "expiry_new", t.expiry, "retry", retry)
-			ticker.Reset(retry)
-		}
-	}
+	return registerRefreshLoop(ctx, retry, registerRetryBackoffInitial, registerRetryBackoffMax, t)
 }
 
+// calcRetry derives the refresh cadence from the expiry the registrar granted,
+// so a short grant is refreshed early rather than on a caller chosen wall clock.
+//
+// RetryInterval used to short circuit this outright: whenever it was set it was
+// returned verbatim and the granted expiry was never consulted, so a caller
+// asking for 30m against a registrar granting 120s saw the binding lapse long
+// before the refresh fired. It now only brings the refresh forward.
 func (t *RegisterTransaction) calcRetry(expiry time.Duration) time.Duration {
-	// Allow caller to use own interval
-	if t.opts.RetryInterval != 0 {
-		return t.opts.RetryInterval
-	}
-
-	calc := expiry.Seconds() * 0.75
+	calc := expiry.Seconds() * registerRefreshRatio
 	retry := time.Duration(calc) * time.Second
 
-	// Set to 30 in case retry is not set
-	if retry == 0 {
-		retry = 30 * time.Second
+	// Allow caller to use own interval, but never past the grant.
+	if ri := t.opts.RetryInterval; ri > 0 && (retry <= 0 || ri < retry) {
+		retry = ri
+	}
+
+	// A zero or absent expiry must not yield a zero interval, a busy loop.
+	if retry <= 0 {
+		retry = registerRetryMin
 	}
 
 	return retry
@@ -270,14 +262,25 @@ func (t *RegisterTransaction) Unregister(ctx context.Context) error {
 	req.AppendHeader(sip.NewHeader("Contact", "*"))
 	expires := sip.ExpiresHeader(0)
 	req.AppendHeader(&expires)
-	return t.doRequest(ctx, req)
+	// Deliberately records no grant: the 200 to a de-registration echoes
+	// expires=0, which is the binding going away, not a new lifetime.
+	_, err := t.doRequest(ctx, req)
+	return err
 }
 
+// Qualify refreshes the binding and records the newly granted expiry.
 func (t *RegisterTransaction) Qualify(ctx context.Context) error {
-	return t.doRequest(ctx, t.Origin)
+	res, err := t.doRequest(ctx, t.Origin)
+	if err != nil {
+		return err
+	}
+	// A refresh regrants the binding, so reread the granted expiry every time. A
+	// registrar is free to shorten it mid registration.
+	t.recordGrant(grantedExpiry(res, t.opts.Expiry))
+	return nil
 }
 
-func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) error {
+func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) (*sip.Response, error) {
 	// log := p.getLoggerCtx(ctx, "Register")
 	client := t.client
 	username, password := t.opts.Username, t.opts.Password
@@ -286,37 +289,28 @@ func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) e
 	req.RemoveHeader("Via")
 	res, err := client.Do(ctx, req, sipgo.ClientRequestRegisterBuild)
 	if err != nil {
-		return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
+		return nil, fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 	}
 
-	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
+	if isDigestChallenge(res) {
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 			Username: username,
 			Password: password,
 		})
 		if err != nil {
-			return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
+			return nil, fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 		}
 	}
 
 	if res.StatusCode != 200 {
-		return &RegisterResponseError{
+		return nil, &RegisterResponseError{
 			RegisterReq: req,
 			RegisterRes: res,
 			Msg:         res.StartLine(),
 		}
 	}
 
-	// Check is expirese changed
-	if h := res.GetHeader("Expires"); h != nil {
-		val, err := strconv.Atoi(h.Value())
-		if err != nil {
-			return fmt.Errorf("Failed to parse server Expires value: %w", err)
-		}
-		t.expiry = time.Duration(val) * time.Second
-	}
-
-	return nil
+	return res, nil
 }
 
 func getResponse(ctx context.Context, tx sip.ClientTransaction) (*sip.Response, error) {
