@@ -1239,7 +1239,7 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 	fmts := make([]string, len(codecs))
 	formatsMap := []string{}
 	for i, f := range codecs {
-		rtpmap := fmt.Sprintf("a=rtpmap:%d %s/%d", f.PayloadType, f.Name, f.SampleRate)
+		rtpmap := fmt.Sprintf("a=rtpmap:%d %s/%d", f.PayloadType, rtpmapEncodingName(f), f.SampleRate)
 		if f.NumChannels > 1 {
 			rtpmap += fmt.Sprintf("/%d", f.NumChannels)
 		}
