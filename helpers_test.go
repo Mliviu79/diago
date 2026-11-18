@@ -92,7 +92,7 @@ func newRawInviteHarness(t *testing.T) *rawInviteHarness {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 	go func() { _ = dg.server.ServeUDP(server) }()
-	require.NoError(t, serveRequests(t.Context(), dg))
+	serveRequests(t, dg)
 	h.serverAddr = server.LocalAddr()
 	h.serverPort = server.LocalAddr().(*net.UDPAddr).Port
 

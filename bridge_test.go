@@ -106,7 +106,7 @@ func TestIntegrationBridging(t *testing.T) {
 		},
 	))
 
-	err := serveBackground(ctx, tu, func(runCtx context.Context, in *DialogServerSession) {
+	err := serveBackground(t, tu, ctx, func(runCtx context.Context, in *DialogServerSession) {
 		in.Trying(runCtx)
 		in.Ringing(runCtx)
 		med, err := in.Answer(AnswerOptions{})
@@ -163,7 +163,7 @@ func TestIntegrationBridging(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(context.Background(), dg, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, context.Background(), func(_ context.Context, d *DialogServerSession) {
 			ctx := d.Context()
 			med, err := d.Answer(AnswerOptions{})
 			require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestIntegrationBridging(t *testing.T) {
 		defer ua.Close()
 
 		dg := newDialer(ua)
-		require.NoError(t, serveRequests(ctx, dg))
+		serveRequests(t, dg)
 		dialog, med, err := dg.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 5090}, InviteOptions{})
 		require.NoError(t, err)
 		defer dialog.Close()
@@ -228,7 +228,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 
 	bridge := NewBridgeMix()
 	dialogExit := make(chan string, 10)
-	err := serveBackground(ctx, tu, func(ctx context.Context, in *DialogServerSession) {
+	err := serveBackground(t, tu, ctx, func(ctx context.Context, in *DialogServerSession) {
 		defer func() { dialogExit <- in.ID }()
 
 		in.Trying(ctx)
@@ -260,7 +260,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		defer ua.Close()
 
 		dg := newDialer(ua)
-		require.NoError(t, serveRequests(ctx, dg))
+		serveRequests(t, dg)
 
 		dialogs := make([]*DialogClientSession, 3)
 		for i := range 3 {
@@ -307,7 +307,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		defer ua.Close()
 
 		dg := newDialer(ua)
-		require.NoError(t, serveRequests(ctx, dg))
+		serveRequests(t, dg)
 
 		// Make number of calls that will have audio mixed in bridge
 		// wg := sync.WaitGroup{}

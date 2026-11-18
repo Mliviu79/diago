@@ -36,7 +36,7 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 		))
 
 		// Run listener to accepte reinvites, but it should not receive any request
-		err := serveBackground(ctx, dg, nil)
+		err := serveBackground(t, dg, ctx, nil)
 		require.NoError(t, err)
 
 		dialer = dg
@@ -54,7 +54,7 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 	))
 
 	waitDialog := make(chan *DialogServerSession)
-	err := serveBackground(ctx, dg, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		t.Log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
@@ -132,7 +132,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		))
 
 		// Run listener to accepte reinvites, but it should not receive any request
-		err := serveBackground(ctx, dg, nil)
+		err := serveBackground(t, dg, ctx, nil)
 		require.NoError(t, err)
 
 		go func() {
@@ -155,7 +155,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	))
 
 	waitDialog := make(chan *DialogServerSession)
-	err := serveBackground(ctx, dg, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		t.Log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()
@@ -183,7 +183,7 @@ func TestIntegrationDialogServerHoldUnholdKeepsAudio(t *testing.T) {
 
 	answered := make(chan *DialogServerSession, 1)
 	uas := newDiago(15077)
-	err := serveBackground(ctx, uas, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, uas, ctx, func(_ context.Context, d *DialogServerSession) {
 		med, err := d.Answer(AnswerOptions{})
 		if err != nil {
 			t.Error(err)
@@ -196,7 +196,7 @@ func TestIntegrationDialogServerHoldUnholdKeepsAudio(t *testing.T) {
 	require.NoError(t, err)
 
 	uac := newDiago(15067)
-	require.NoError(t, serveBackground(ctx, uac, func(context.Context, *DialogServerSession) {}))
+	require.NoError(t, serveBackground(t, uac, ctx, func(context.Context, *DialogServerSession) {}))
 	dialog, med, err := uac.Invite(ctx, sip.Uri{User: "echo", Host: "127.0.0.1", Port: 15077}, InviteOptions{})
 	require.NoError(t, err)
 	defer med.Close()
@@ -270,7 +270,7 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 		err    error
 	}
 	answerCh := make(chan answerResult, 1)
-	err := serveBackground(ctx, uas, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, uas, ctx, func(_ context.Context, d *DialogServerSession) {
 		// This is the reported role: the peer sends the initial INVITE and
 		// Diago answers it as the UAS. RTP NAT must not change the SIP flow.
 		med, err := d.Answer(AnswerOptions{
@@ -297,7 +297,7 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 	peerUA, _ := sipgo.NewUA(sipgo.WithUserAgent("peer"))
 	defer peerUA.Close()
 	peer := newDialer(peerUA)
-	err = serveBackground(ctx, peer, func(context.Context, *DialogServerSession) {})
+	err = serveBackground(t, peer, ctx, func(context.Context, *DialogServerSession) {})
 	require.NoError(t, err)
 
 	dialog, peerMedia, err := peer.Invite(ctx, sip.Uri{User: "service", Host: "127.0.0.1", Port: uas.transports[0].BindPort}, InviteOptions{})
@@ -364,7 +364,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 		))
 
 		// Run listener to accepte reinvites, but it should not receive any request
-		err := serveBackground(ctx, dg, nil)
+		err := serveBackground(t, dg, ctx, nil)
 		require.NoError(t, err)
 		dialer = dg
 	}
@@ -409,7 +409,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(ctx, dg, func(ctx context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			t.Log("Call INVITE due to REFER received")
 			// waitReferDialog <- d
 			switch d.ToUser() {
@@ -440,7 +440,7 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 	))
 
 	waitDialog := make(chan *DialogServerSession)
-	err := serveBackground(ctx, dg, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
 		t.Log("Call received")
 		waitDialog <- d
 		<-d.Context().Done()

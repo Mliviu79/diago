@@ -124,7 +124,7 @@ func TestDiagoTransportConfs(t *testing.T) {
 		if tc.serve {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			require.NoError(t, serveBackground(ctx, dg, func(_ context.Context, d *DialogServerSession) {}))
+			require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {}))
 			if tc.expectedContactHost != "" {
 				listenPort := dg.transports[0].BindPort
 				require.NotZero(t, listenPort)
@@ -302,7 +302,7 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 
 	dg := NewDiago(ua, WithTransport(tran))
 
-	err := serveBackground(context.TODO(), dg, func(_ context.Context, d *DialogServerSession) {})
+	err := serveBackground(t, dg, context.TODO(), func(_ context.Context, d *DialogServerSession) {})
 	require.NoError(t, err)
 
 	newTran, _ := dg.getTransport("udp")
@@ -342,7 +342,7 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(ctx, dg, func(ctx context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
 			if err != nil {
@@ -372,7 +372,7 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 				Codecs: []media.Codec{l16Codec, media.CodecAudioAlaw},
 			},
 		))
-	require.NoError(t, serveRequests(ctx, dg))
+	serveRequests(t, dg)
 
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15066}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)
@@ -414,7 +414,7 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(ctx, dg, func(ctx context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
 			if err != nil {
@@ -449,7 +449,7 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 
 	// err = dg.ServeBackground(ctx, func(d *DialogServerSession) {})
 	// require.NoError(t, err)
-	require.NoError(t, serveRequests(ctx, dg))
+	serveRequests(t, dg)
 
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15443}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)
@@ -503,7 +503,7 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 				},
 			))
 
-		err := serveBackground(ctx, dg, func(ctx context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(ctx context.Context, d *DialogServerSession) {
 			d.Trying(ctx)
 			med, err := d.Answer(AnswerOptions{})
 			if err != nil {
@@ -540,7 +540,7 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 
 	// err = dg.ServeBackground(ctx, func(d *DialogServerSession) {})
 	// require.NoError(t, err)
-	require.NoError(t, serveRequests(ctx, dg))
+	serveRequests(t, dg)
 
 	_, med, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, InviteOptions{Transport: "tcp"})
 	require.NoError(t, err)

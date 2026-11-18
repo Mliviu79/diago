@@ -59,7 +59,7 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 	defer ua.Close()
 	srv := NewDiago(ua, WithTransport(tran))
 
-	err := serveBackground(ctx, srv, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, srv, ctx, func(_ context.Context, d *DialogServerSession) {
 		wg.Add(1)
 		defer wg.Done()
 
@@ -125,7 +125,7 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 				// client, err := sipgo.NewClient(ua)
 				// require.NoError(t, err)
 				phone := NewDiago(ua)
-				require.NoError(t, serveRequests(ctx, phone))
+				serveRequests(t, phone)
 				id, _ := rand.Int(rand.Reader, big.NewInt(int64(runtime.GOMAXPROCS(0))))
 				for p.Next() {
 					t.Log("Making call goroutine=", id)

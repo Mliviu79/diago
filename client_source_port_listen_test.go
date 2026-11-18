@@ -62,7 +62,7 @@ func TestIntegrationClientSourcesFromBindPortOnceServing(t *testing.T) {
 	}))
 
 	receivedInvites := make(chan *sip.Request, 1)
-	err := serveBackground(ctx, peer, func(ctx context.Context, d *DialogServerSession) {
+	err := serveBackground(t, peer, ctx, func(ctx context.Context, d *DialogServerSession) {
 		select {
 		case receivedInvites <- d.InviteRequest:
 		default:

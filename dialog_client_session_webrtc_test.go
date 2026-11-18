@@ -42,7 +42,7 @@ func TestIntegrationDialogWebrtcBidirectionalRTP(t *testing.T) {
 
 	serverMedia := make(chan *DialogWebrtc, 1)
 	serverErr := make(chan error, 1)
-	require.NoError(t, serveBackground(ctx, server, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{
 			WebrtcConfig: webRTCConfig,
 		})
@@ -64,7 +64,7 @@ func TestIntegrationDialogWebrtcBidirectionalRTP(t *testing.T) {
 		BindPort:  0,
 	},
 	))
-	require.NoError(t, serveRequests(ctx, client))
+	serveRequests(t, client)
 	dialog, err := client.NewDialog(sip.Uri{
 		User: "media",
 		Host: "127.0.0.1",
@@ -149,7 +149,7 @@ func TestIntegrationDialogWebrtcClientReInviteKeepsMediaWrappers(t *testing.T) {
 	}))
 	serverMedia := make(chan *DialogWebrtc, 1)
 	serverErr := make(chan error, 1)
-	require.NoError(t, serveBackground(ctx, server, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{WebrtcConfig: webRTCConfig})
 		if answerErr != nil {
 			serverErr <- answerErr
@@ -167,7 +167,7 @@ func TestIntegrationDialogWebrtcClientReInviteKeepsMediaWrappers(t *testing.T) {
 		BindHost:  "127.0.0.1",
 		BindPort:  0,
 	}))
-	require.NoError(t, serveRequests(ctx, client))
+	serveRequests(t, client)
 	dialog, err := client.NewDialog(sip.Uri{
 		User: "media", Host: "127.0.0.1", Port: server.transports[0].BindPort,
 	}, NewDialogOptions{Transport: "tcp"})
@@ -303,7 +303,7 @@ func TestIntegrationDialogWebrtcEarlyMedia(t *testing.T) {
 		default:
 		}
 	}
-	require.NoError(t, serveBackground(ctx, server, func(ctx context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(ctx context.Context, dialog *DialogServerSession) {
 		conf, confErr := prepareWebrtcConfig(webRTCConfig)
 		if confErr != nil {
 			reportServerErr(confErr)
@@ -377,7 +377,7 @@ func TestIntegrationDialogWebrtcEarlyMedia(t *testing.T) {
 		BindHost:  "127.0.0.1",
 		BindPort:  0,
 	}))
-	require.NoError(t, serveRequests(ctx, client))
+	serveRequests(t, client)
 	dialog, err := client.NewDialog(sip.Uri{
 		User: "early-media",
 		Host: "127.0.0.1",
