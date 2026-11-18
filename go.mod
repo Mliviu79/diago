@@ -5,10 +5,10 @@ go 1.25.0
 replace github.com/emiago/sipgo => ../sipgo
 
 require (
-	github.com/emiago/sipgo v1.6.0
+	github.com/emiago/sipgo v1.7.4
 	github.com/go-audio/riff v1.0.0
 	github.com/google/uuid v1.6.0
-	github.com/icholy/digest v1.1.0
+	github.com/icholy/digest v1.2.0
 	github.com/pion/dtls/v3 v3.1.5
 	github.com/pion/ice/v4 v4.2.0
 	github.com/pion/logging v0.2.4
