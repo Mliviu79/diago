@@ -250,7 +250,8 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	errHandler := func(f func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error) sipgo.RequestHandler {
 		handler := func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			if err := f(ctx, req, tx); err != nil {
-				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", req.From().String(), "req.to", req.To().Value())
+				from, to := fromAndToForLog(req)
+				dg.log.Warn("Failed to handle request", "error", err, "req.method", req.Method.String(), "req.from", from, "req.to", to)
 				return
 			}
 			// Termination gracefull will be done by sipgo now
@@ -280,6 +281,10 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		id, err := sip.DialogIDFromRequestUAS(req)
 		if err == nil {
 			return dg.handleReInvite(ctx, req, tx, id)
+		}
+
+		if err := rejectInviteMissingHeader(ctx, req, tx); err != nil {
+			return err
 		}
 
 		tran, _ := dg.getTransport(req.Transport())
