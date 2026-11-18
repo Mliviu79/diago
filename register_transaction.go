@@ -61,6 +61,12 @@ type RegisterTransaction struct {
 	client *sipgo.Client
 	log    *slog.Logger
 
+	// recipient is the address-of-record as passed on construction. Origin is
+	// rewritten in place by the register loop (ClientRequestRegisterBuild strips
+	// the userinfo, doRequest drops the Via), so anything running next to that
+	// loop must not read it. Keepalive probes build from this instead.
+	recipient sip.Uri
+
 	// mu guards the registration state below. Diago.Register writes expiry from
 	// its own goroutine while the refresh loop reads it.
 	mu sync.RWMutex
@@ -109,6 +115,7 @@ func newRegisterTransaction(client *sipgo.Client, recipient sip.Uri, contact sip
 		client: client,
 		log:    log.With("caller", "Register"),
 	}
+	t.recipient = recipient
 
 	return t
 }
