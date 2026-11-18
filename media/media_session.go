@@ -516,7 +516,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	case "UDP/TLS/RTP/SAVPF":
 		// secureRequest = true
 	default:
-		return fmt.Errorf("unsupported media description protocol proto=%s", md.Proto)
+		return fmt.Errorf("%w: unsupported media description protocol proto=%s", ErrNoCommonMedia, md.Proto)
 	}
 	s.remoteProto = md.Proto
 
@@ -532,7 +532,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 		return fmt.Errorf("reading codecs from SDP was not full: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("no codecs found in SDP")
+		return fmt.Errorf("%w: no codecs found in SDP", ErrNoCommonCodec)
 	}
 
 	// https://datatracker.ietf.org/doc/html/rfc3264#section-6.1
@@ -546,15 +546,18 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	//    48, and not 48, 8.  This helps assure that the same codec is used in
 	//    both directions.
 	if s.updateRemoteCodecs(codecs[:n], !offered) == 0 {
-		return fmt.Errorf("no supported codecs found")
+		return fmt.Errorf("%w: no supported codecs found", ErrNoCommonCodec)
 	}
 
 	ci, err := sd.ConnectionInformation()
 	if err != nil {
 		return err
 	}
+	if err := checkRTPPort(md.Port); err != nil {
+		return err
+	}
 	if ci.NetworkType != "IN" || (ci.AddressType != "IP4" && ci.AddressType != "IP6") || ci.IP == nil {
-		return fmt.Errorf("unsupported SDP connection address")
+		return fmt.Errorf("%w: unsupported SDP connection address", ErrNoCommonMedia)
 	}
 	remoteAddr := net.UDPAddr{IP: ci.IP, Port: md.Port}
 
@@ -622,7 +625,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	}
 
 	if secureRequest && remoteKey == "" {
-		return fmt.Errorf("remote requested secure RTP, but no context is created proto=%s", md.Proto)
+		return fmt.Errorf("%w: remote requested secure RTP, but no context is created proto=%s", ErrNoCommonCrypto, md.Proto)
 	}
 	s.SetRemoteAddr(&remoteAddr)
 
