@@ -3,6 +3,8 @@
 package diago
 
 import (
+	"context"
+
 	"github.com/emiago/diago/media"
 )
 
@@ -12,10 +14,14 @@ import (
 // the handshaker, as it drives every later one. onMediaUpdate, when not nil,
 // is told of each later update of the media.
 //
+// ctx is the context of the call the media is for, on which its RTP port is
+// chosen when conf has an allocator. It bounds nothing else: the media runs
+// until it is closed.
+//
 // The caller closes the media, or registers it with a session that does.
-func newDialogMedia(conf MediaConfig, onMediaUpdate func(*DialogMedia)) (*DialogMedia, error) {
+func newDialogMedia(ctx context.Context, conf MediaConfig, onMediaUpdate func(*DialogMedia)) (*DialogMedia, error) {
 	med := &DialogMedia{onMediaUpdate: onMediaUpdate}
-	if err := med.initMediaSessionFromConf(conf); err != nil {
+	if err := med.initMediaSessionFromConf(ctx, conf); err != nil {
 		return nil, err
 	}
 	return med, nil

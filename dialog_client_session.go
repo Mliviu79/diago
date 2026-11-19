@@ -140,7 +140,7 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 	conf.rtpNAT = opts.RTPNAT
 
 	med := &DialogMedia{}
-	if err := med.initMediaSessionFromConf(conf); err != nil {
+	if err := med.initMediaSessionFromConf(ctx, conf); err != nil {
 		return nil, err
 	}
 	med.registerDialogCallbacks(&d.dialogCallbacks)

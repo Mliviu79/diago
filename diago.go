@@ -159,6 +159,18 @@ type MediaConfig struct {
 	// Currently supported Single. Check media.SRTP... constants
 	// Experimental
 	SecureRTPAlg uint16
+
+	// RTPPortAllocator, when non nil, chooses the local RTP port that every media
+	// session built from this config binds, instead of leaving the choice to the
+	// OS. It supersedes the media package RTPPortStart/RTPPortEnd globals, which
+	// can express only one range per process and only a linear scan over it.
+	// An allocator is per Diago and opaque, so a pool, tiers or a drain window
+	// are all possible without this package knowing about them.
+	//
+	// Nil leaves port selection to the OS or to the media package globals, which
+	// is the previous behaviour.
+	RTPPortAllocator RTPPortAllocator
+
 	// Used internally
 	secureRTP  int // 0 - none, 1 - sdes
 	bindIP     net.IP
@@ -305,13 +317,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		dWrap := &DialogServerSession{
 			DialogServerSession: dialog,
 			// TODO we may actually just build media session with this conf here
-			mediaConf: MediaConfig{
-				Codecs:     dg.mediaConf.Codecs,
-				secureRTP:  tran.MediaSRTP,
-				bindIP:     tran.mediaBindIP,
-				externalIP: tran.MediaExternalIP,
-				dtlsConf:   tran.MediaDTLSConf,
-			},
+			mediaConf:    dg.mediaConfForTransport(tran),
 			sessionState: sessionState{log: dg.log},
 		}
 
@@ -747,13 +753,7 @@ func (dg *Diago) newSipDialog(recipient sip.Uri, tran *Transport, opts NewDialog
 	}
 	d.Init()
 
-	d.mediaConfig = MediaConfig{
-		Codecs:     dg.mediaConf.Codecs,
-		secureRTP:  tran.MediaSRTP,
-		bindIP:     tran.mediaBindIP,
-		externalIP: tran.MediaExternalIP,
-		dtlsConf:   tran.MediaDTLSConf,
-	}
+	d.mediaConfig = dg.mediaConfForTransport(tran)
 
 	// The dialog exists from its 2xx (RFC 3261 section 12.1.2), so it is
 	// stored then, before the ACK goes out. The peer may send an in-dialog

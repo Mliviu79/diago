@@ -60,7 +60,9 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) (*DialogMed
 		return nil, fmt.Errorf("answer: %w", context.Cause(ctx))
 	}
 
-	med, err := newDialogMedia(d.mediaConf, nil)
+	// The media is the dialog's, not the wait's, so its port is chosen on the
+	// dialog's ctx.
+	med, err := newDialogMedia(d.Context(), d.mediaConf, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +94,9 @@ func (d *DialogServerSession) answerOfferWithin(ctx context.Context, conf MediaC
 		return nil, errNoOfferInInvite
 	}
 
-	med, err := newDialogMedia(conf, onMediaUpdate)
+	// The media is the dialog's, not the wait's, so its port is chosen on the
+	// dialog's ctx.
+	med, err := newDialogMedia(d.Context(), conf, onMediaUpdate)
 	if err != nil {
 		return nil, err
 	}

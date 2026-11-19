@@ -334,6 +334,30 @@ func newAnsweredTestClientCall(t *testing.T) (*DialogClientSession, *DialogMedia
 	return d, med, sent
 }
 
+// newTestClientDialog builds an outgoing dialog in the given state, without a
+// transport.
+func newTestClientDialog(t *testing.T, state sip.DialogState) *DialogClientSession {
+	t.Helper()
+
+	us := sip.Uri{User: "bob", Host: "127.0.0.2", Port: 5060}
+	peer := sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}
+
+	invite := sip.NewRequest(sip.INVITE, peer)
+	invite.AppendHeader(&sip.ContactHeader{Address: us})
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", "caller-tag")
+	invite.AppendHeader(&sip.FromHeader{Address: us, Params: fromParams})
+	invite.AppendHeader(&sip.ToHeader{Address: peer, Params: sip.NewParams()})
+	invite.AppendHeader(sip.NewHeader("Call-ID", "client-reinvite-test-call-id"))
+	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
+
+	d := &DialogClientSession{DialogClientSession: &sipgo.DialogClientSession{
+		Dialog: sipgo.Dialog{InviteRequest: invite},
+	}}
+	d.InitWithState(state)
+	return d
+}
+
 // newPeerInDialogRequest builds a request of the given method the peer sends
 // inside a dialog.
 func newPeerInDialogRequest(method sip.RequestMethod, seq uint32) *sip.Request {

@@ -76,7 +76,16 @@ type DialogMedia struct {
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
 
-	closed bool
+	// releaseRTPPort returns this dialog RTP port to the allocator that handed
+	// it out. Nil when no allocator is installed, as the OS takes the port back
+	// when the socket closes. Set next to mediaSession and consumed by Close.
+	releaseRTPPort func()
+
+	// closed latches the first Close. closeDone is closed once that Close has
+	// released the port, so a Close made after it returns only once the media
+	// is released. Both are guarded by mu.
+	closed    bool
+	closeDone chan struct{}
 }
 
 var _ mediaHanshaker = (*DialogMedia)(nil)
@@ -86,10 +95,19 @@ func (d *DialogMedia) Close() error {
 	// Prevent double exec
 	d.mu.Lock()
 	if d.closed {
+		done := d.closeDone
 		d.mu.Unlock()
+		// The first Close is still releasing the media. This one must not report
+		// it closed before the release has run: a caller that acts on the close
+		// (the port pool, the media's owner) would find the port still held.
+		<-done
 		return nil
 	}
 	d.closed = true
+	// Deferred, so the port goes back once the sockets are closed below, never
+	// before, and a later Close returns after that.
+	releasePort := d.takeRTPPortReleaseUnsafe()
+	defer releasePort()
 
 	onClose := d.onClose
 	d.onClose = nil
@@ -149,7 +167,7 @@ func (d *DialogMedia) initRTPSessionUnsafe(m *media.MediaSession, rtpSess *media
 	d.RTPPacketWriter = media.NewRTPPacketWriterSession(rtpSess)
 }
 
-func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
+func (d *DialogMedia) initMediaSessionFromConf(ctx context.Context, conf MediaConfig) error {
 	if d.mediaSession != nil {
 		// To allow testing or customizing current underhood session, this may be
 		// precreated, so we want to return if already initialized.
@@ -166,9 +184,17 @@ func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
 		}
 	}
 
+	// Port 0 leaves the choice to the OS or to the media package port range. An
+	// allocator, when installed, makes it instead, so the port comes from a range
+	// the operator has bounded and opened on the firewall.
+	rtpPort, releasePort, err := conf.allocateRTPPort(ctx)
+	if err != nil {
+		return err
+	}
+
 	sess := &media.MediaSession{
 		Codecs:     slices.Clone(conf.Codecs),
-		Laddr:      net.UDPAddr{IP: bindIP, Port: 0},
+		Laddr:      net.UDPAddr{IP: bindIP, Port: rtpPort},
 		ExternalIP: conf.externalIP,
 		Mode:       sdp.ModeSendrecv,
 		SecureRTP:  conf.secureRTP,
@@ -178,9 +204,15 @@ func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
 	}
 
 	if err := sess.Init(); err != nil {
+		// Nothing was bound, so the port goes straight back rather than wait for
+		// a Close that will not come: this dialog has no media session.
+		if releasePort != nil {
+			releasePort()
+		}
 		return err
 	}
 	d.mediaSession = sess
+	d.releaseRTPPort = releasePort
 	return nil
 }
 

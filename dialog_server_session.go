@@ -101,7 +101,7 @@ func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMe
 	med := &DialogMedia{}
 
 	err := func() error {
-		if err := med.initMediaSessionFromConf(conf); err != nil {
+		if err := med.initMediaSessionFromConf(d.Context(), conf); err != nil {
 			return err
 		}
 
@@ -124,7 +124,7 @@ func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMe
 func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt ProgressMediaOptions) error {
 	d.updateMediaConf(opt.Codecs, opt.RTPNAT)
 	med := &DialogMedia{}
-	if err := med.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := med.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return err
 	}
 	rtpSess := media.NewRTPSession(med.mediaSession)
@@ -216,7 +216,7 @@ func (d *DialogServerSession) Answer(opt AnswerOptions) (*DialogMedia, error) {
 	med.onMediaUpdate = opt.OnMediaUpdate
 	conf := d.mediaConf
 	conf.update(opt.Codecs, opt.RTPNAT)
-	if err := med.initMediaSessionFromConf(conf); err != nil {
+	if err := med.initMediaSessionFromConf(d.Context(), conf); err != nil {
 		return nil, err
 	}
 
@@ -296,7 +296,7 @@ func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTP
 // answer that cannot be applied or keyed.
 func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 	m := &DialogMedia{}
-	if err := m.initMediaSessionFromConf(d.mediaConf); err != nil {
+	if err := m.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return nil, err
 	}
 	sess := m.mediaSession

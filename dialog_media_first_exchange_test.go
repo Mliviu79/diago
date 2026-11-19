@@ -15,7 +15,7 @@ import (
 // part in no exchange yet, closed with the test.
 func newUnnegotiatedDialogMedia(t *testing.T) *DialogMedia {
 	t.Helper()
-	med, err := newDialogMedia(MediaConfig{
+	med, err := newDialogMedia(t.Context(), MediaConfig{
 		Codecs: []media.Codec{media.CodecAudioUlaw},
 		bindIP: net.IPv4(127, 0, 0, 1),
 	}, nil)
