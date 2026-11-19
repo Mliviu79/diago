@@ -166,7 +166,9 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 	if mode == "" && d.offersNegotiatedCodecs() {
 		offerNegotiatedCodecs(fork, current)
 	}
-	d.setPendingMediaSession(fork)
+	if err := d.setPendingMediaSession(fork); err != nil {
+		return nil, err
+	}
 	localSDP, err := fork.LocalSDP(ctx, false)
 	if err != nil {
 		d.abortPendingMediaSession()
@@ -216,8 +218,7 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 	// ICE. MediaSessionWebrtc stages those changes on the current transport.
 	// Changed credentials require a fresh ICE/DTLS/SRTP transport instead.
 	if err := current.RemoteSDP(ctx, remoteSDP, false); err == nil {
-		d.setPendingMediaSession(current)
-		return nil
+		return d.setPendingMediaSession(current)
 	} else if !errors.Is(err, media.ErrWebRTCICERestart) {
 		return err
 	}
@@ -230,8 +231,7 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 		_ = fork.Close()
 		return err
 	}
-	d.setPendingMediaSession(fork)
-	return nil
+	return d.setPendingMediaSession(fork)
 }
 
 func (d *DialogWebrtc) onFinalize(ctx context.Context) error {
@@ -252,8 +252,23 @@ func (d *DialogWebrtc) onFinalize(ctx context.Context) error {
 	return d.replaceMediaSession(pending)
 }
 
-func (d *DialogWebrtc) setPendingMediaSession(sess *media.MediaSessionWebrtc) {
+// setPendingMediaSession stores sess as the transport the exchange in progress
+// commits. The store checks for Close under the same lock: a Close made since
+// the exchange found the media open has taken what it closes already, so sess
+// is refused with errMediaClosed and closed rather than left open for good.
+func (d *DialogWebrtc) setPendingMediaSession(sess *media.MediaSessionWebrtc) error {
 	d.mu.Lock()
+	beforeStore := d.beforePendingStore
+	d.mu.Unlock()
+	if beforeStore != nil {
+		beforeStore(sess)
+	}
+	d.mu.Lock()
+	if d.closed {
+		current := d.mediaSession
+		d.mu.Unlock()
+		return refusePendingOnClosed(sess, current)
+	}
 	previous := d.pendingMediaSession
 	d.pendingMediaSession = sess
 	current := d.mediaSession
@@ -261,6 +276,7 @@ func (d *DialogWebrtc) setPendingMediaSession(sess *media.MediaSessionWebrtc) {
 	if previous != nil && previous != current && previous != sess {
 		_ = previous.Close()
 	}
+	return nil
 }
 
 func (d *DialogWebrtc) abortPendingMediaSession() {

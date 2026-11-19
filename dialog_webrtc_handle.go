@@ -39,6 +39,11 @@ type dialogWebrtcState struct {
 	// config the media was built from. Set before the media is handed out
 	// and not changed after.
 	offerNegotiatedCodecs bool
+
+	// beforePendingStore, when set, is called by setPendingMediaSession with
+	// the transport it is about to store, before it checks for Close. Tests
+	// close the media there; it is nil otherwise.
+	beforePendingStore func(*media.MediaSessionWebrtc)
 }
 
 var _ MediaHandle = (*DialogWebrtc)(nil)
