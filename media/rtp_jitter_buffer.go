@@ -104,6 +104,10 @@ type RTPJitterBuffer struct {
 	mu sync.Mutex
 	// reader is the upstream network-facing RTP source.
 	reader RTPReader
+	// moved reports that UpdateRTPSession replaced reader since the read loop
+	// last looked, ending a read on the reader replaced with a read deadline
+	// that the read loop has yet to clear.
+	moved bool
 	// packetDuration is the interval between playout decisions.
 	packetDuration time.Duration
 	// clockRate is the RTP clock rate packet durations are learned in, or 0 when
