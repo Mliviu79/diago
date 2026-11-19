@@ -28,6 +28,18 @@ func CodecTelephoneEventFromSession(s *MediaSession) (Codec, bool) {
 	if len(codecs) == 0 {
 		codecs = s.Codecs
 	}
+	return CodecTelephoneEventFromList(codecs)
+}
+
+// CodecTelephoneEventFromList returns the first telephone-event codec of
+// codecs, and whether there is one. It is [CodecAudioFromList] for DTMF: given
+// the codecs negotiation settled on, [MediaSession.CommonCodecs] or
+// [MediaSessionWebrtc.CommonCodecs], it returns telephone-event at the payload
+// type the call runs it on, which [CodecTelephoneEvent8000] only is when both
+// sides numbered it 101.
+//
+// Encoding names are case insensitive (RFC 4566 section 6).
+func CodecTelephoneEventFromList(codecs []Codec) (Codec, bool) {
 	for _, codec := range codecs {
 		if strings.EqualFold(codec.Name, CodecTelephoneEvent8000.Name) {
 			return codec, true

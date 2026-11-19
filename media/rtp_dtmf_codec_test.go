@@ -71,6 +71,56 @@ func TestCodecTelephoneEventFromSession(t *testing.T) {
 	}
 }
 
+// The telephone-event codec of a list is its first one, whatever number and
+// spelling it carries, and a list without one says so.
+func TestCodecTelephoneEventFromList(t *testing.T) {
+	te100 := telephoneEventAt(100)
+	upper := telephoneEventAt(100)
+	upper.Name = "TELEPHONE-EVENT"
+	te16k := telephoneEventAt(102)
+	te16k.SampleRate = 16000
+
+	tests := []struct {
+		name   string
+		codecs []Codec
+		want   Codec
+		wantOK bool
+	}{
+		{
+			name:   "negotiated_number",
+			codecs: []Codec{CodecAudioAlaw, te100},
+			want:   te100,
+			wantOK: true,
+		},
+		{
+			name:   "name_in_another_case",
+			codecs: []Codec{CodecAudioAlaw, upper},
+			want:   upper,
+			wantOK: true,
+		},
+		{
+			name:   "first_of_several",
+			codecs: []Codec{CodecAudioOpus, te16k, te100},
+			want:   te16k,
+			wantOK: true,
+		},
+		{
+			name:   "audio_and_comfort_noise_alone",
+			codecs: []Codec{CodecAudioAlaw, CodecComfortNoise8000},
+		},
+		{
+			name: "empty_list",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := CodecTelephoneEventFromList(tc.codecs)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // An answer may number telephone-event differently from our offer. We then send
 // on the peer's number and the peer sends on ours (RFC 3264 section 5.1), and
 // the codec carries both.
