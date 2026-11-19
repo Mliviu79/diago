@@ -54,6 +54,9 @@ type DialogMedia struct {
 	// rtp session is created for usage with RTPPacketReader and RTPPacketWriter
 	// it adds RTCP layer and RTP monitoring before passing packets to MediaSession
 	rtpSession *media.RTPSession
+	// unstartedRTPSession is the RTP session of a first offer/answer exchange
+	// made through the handshaker, until onFinalize starts its RTCP monitor.
+	unstartedRTPSession *media.RTPSession
 	// Packet reader is default reader for RTP audio stream
 	// Use always AudioReader to get current Audio reader
 	// Use this only as read only
@@ -317,6 +320,12 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 	}
 
 	d.mu.Lock()
+	if !offered && d.awaitsFirstExchangeUnsafe() {
+		// The call's first offer: there is nothing running to update.
+		err := d.stageFirstOfferUnsafe(remoteSDP)
+		d.mu.Unlock()
+		return err
+	}
 	if offered && d.awaitsFirstAnswerUnsafe() {
 		// Nothing is replaced and nothing was running, so this is no media
 		// update.
@@ -357,6 +366,12 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 		return d.mediaSession.LocalSDP(true), nil
 	}
 
+	if d.awaitsFirstExchangeUnsafe() {
+		// The call's first offer is made by the session itself, not by a
+		// fork of it, and its answer is applied there.
+		return d.firstOfferUnsafe(mode), nil
+	}
+
 	ms := d.mediaSession.Fork()
 	if mode != "" {
 		ms.Mode = mode
@@ -372,7 +387,10 @@ func (d *DialogMedia) onFinalize(ctx context.Context) error {
 	if ms == nil {
 		return nil
 	}
-	return ms.Finalize()
+	if err := ms.Finalize(); err != nil {
+		return err
+	}
+	return d.startFirstExchange()
 }
 
 type AudioReaderOption func(d *DialogMedia) error

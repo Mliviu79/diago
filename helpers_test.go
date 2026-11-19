@@ -450,6 +450,20 @@ func newRecordingServerDialog(t *testing.T, inviteTx sip.ServerTransaction, body
 	return d, sent
 }
 
+// newMediaSessionForTest returns a media session bound to loopback, offering
+// PCMU, as the peer of a call under test. It is closed with the test.
+func newMediaSessionForTest(t *testing.T) *media.MediaSession {
+	t.Helper()
+	sess := &media.MediaSession{
+		Codecs: []media.Codec{media.CodecAudioUlaw},
+		Laddr:  net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
+		Mode:   sdp.ModeSendrecv,
+	}
+	require.NoError(t, sess.Init())
+	t.Cleanup(func() { sess.Close() })
+	return sess
+}
+
 // newTestDialogMedia gives d media of its own, as an answer does: a media
 // session with no remote description yet, registered with d.
 func newTestDialogMedia(t *testing.T, d *DialogServerSession) *DialogMedia {
