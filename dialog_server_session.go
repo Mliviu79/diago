@@ -107,13 +107,14 @@ func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMe
 
 		rtpSess := media.NewRTPSession(med.mediaSession)
 		if err := med.setupRTPSession(d.InviteRequest.Body(), rtpSess); err != nil {
-			return err
+			// Not registered with the session yet, so nothing else closes it.
+			return errors.Join(err, med.Close())
 		}
 
 		headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
 		body := rtpSess.Sess.LocalSDP(true)
 		if err := d.DialogServerSession.Respond(ctx, 183, "Session Progress", body, headers...); err != nil {
-			return err
+			return errors.Join(err, med.Close())
 		}
 		med.registerDialogCallbacks(&d.dialogCallbacks)
 		return rtpSess.MonitorBackground()
@@ -130,17 +131,18 @@ func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt Prog
 	rtpSess := media.NewRTPSession(med.mediaSession)
 	sdp := d.InviteRequest.Body()
 	if sdp == nil {
-		return fmt.Errorf("no sdp present in INVITE")
+		// Not registered with the session yet, so nothing else closes it.
+		return errors.Join(fmt.Errorf("no sdp present in INVITE"), med.Close())
 	}
 
 	if err := med.setupRTPSession(sdp, rtpSess); err != nil {
-		return err
+		return errors.Join(err, med.Close())
 	}
 
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
 	body := rtpSess.Sess.LocalSDP(true)
 	if err := d.DialogServerSession.Respond(ctx, 183, "Session Progress", body, headers...); err != nil {
-		return err
+		return errors.Join(err, med.Close())
 	}
 	med.registerDialogCallbacks(&d.dialogCallbacks)
 	return rtpSess.MonitorBackground()

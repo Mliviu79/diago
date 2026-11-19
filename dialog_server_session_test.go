@@ -6,6 +6,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -717,6 +718,87 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 			case <-allocCtx.Done():
 			case <-time.After(5 * time.Second):
 				t.Fatal("the dialog's ctx did not end with the dialog")
+			}
+		})
+	}
+}
+
+// TestDialogServerEarlyMediaFailureReleasesThePort pins that an early media
+// setup that fails once its media is bound closes that media. Nothing else
+// holds it then, and the port an allocator chose goes back only from that
+// close.
+func TestDialogServerEarlyMediaFailureReleasesThePort(t *testing.T) {
+	errNotSent := errors.New("the 183 was not sent")
+	offer := func(t *testing.T, codec media.Codec) []byte {
+		t.Helper()
+		peer, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = peer.Close() })
+		peer.Codecs = []media.Codec{codec}
+		return peer.LocalSDP(false)
+	}
+
+	entries := []struct {
+		name string
+		run  func(ctx context.Context, d *DialogServerSession) error
+	}{
+		{
+			name: "ProgressMedia",
+			run: func(ctx context.Context, d *DialogServerSession) error {
+				_, err := d.ProgressMedia(ctx, ProgressMediaOptions{})
+				return err
+			},
+		},
+		{
+			name: "ProgressMediaOptions",
+			run: func(ctx context.Context, d *DialogServerSession) error {
+				return d.ProgressMediaOptions(ctx, ProgressMediaOptions{})
+			},
+		},
+	}
+	failures := []struct {
+		name string
+		// offer is the INVITE's body, nil for an INVITE that carries none.
+		offer func(t *testing.T) []byte
+		// respondErr is what sending the 183 fails with, if it fails.
+		respondErr error
+	}{
+		{name: "NoOffer"},
+		{name: "NoCommonCodec", offer: func(t *testing.T) []byte { return offer(t, media.CodecAudioAlaw) }},
+		{
+			name:       "ResponseNotSent",
+			offer:      func(t *testing.T) []byte { return offer(t, media.CodecAudioUlaw) },
+			respondErr: errNotSent,
+		},
+	}
+
+	for _, entry := range entries {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, failure := range failures {
+				t.Run(failure.name, func(t *testing.T) {
+					alloc := &funcPortAllocator{alloc: func(context.Context) (int, error) {
+						return 0, nil // 0 lets the OS pick, so the session still binds
+					}}
+					inviteTx := newByeServerTx()
+					inviteTx.respondErr = failure.respondErr
+					d := newTestDialogOver(t, inviteTx)
+					t.Cleanup(func() { _ = d.Close() })
+					if failure.offer != nil {
+						d.InviteRequest.SetBody(failure.offer(t))
+					}
+					d.mediaConf = MediaConfig{
+						Codecs:           []media.Codec{media.CodecAudioUlaw},
+						bindIP:           net.IPv4(127, 0, 0, 1),
+						RTPPortAllocator: alloc,
+					}
+
+					err := entry.run(t.Context(), d)
+					require.Error(t, err)
+					if failure.respondErr != nil {
+						require.ErrorIs(t, err, failure.respondErr)
+					}
+					require.Equal(t, []int{0}, alloc.released, "the failed setup did not hand its port back")
+				})
 			}
 		})
 	}
