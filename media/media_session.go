@@ -334,8 +334,12 @@ func (s *MediaSession) Fork() *MediaSession {
 		DTLSConf:       s.DTLSConf,
 		DTLSRole:       s.DTLSRole,
 	}
+	// The security mode and its algorithm belong to the negotiated session and
+	// not to one exchange within it: a fork without them describes a DTLS-SRTP
+	// call as plain RTP/AVP with no fingerprint, which a peer is entitled to
+	// read as a downgrade.
+	cp.SecureRTP, cp.SRTPAlg = s.SecureRTP, s.SRTPAlg
 	if s.SecureRTP == 1 {
-		cp.SecureRTP, cp.SRTPAlg = s.SecureRTP, s.SRTPAlg
 		cp.Raddr, cp.remoteProto = s.Raddr, s.remoteProto
 		cp.localCtxSRTP, cp.localSDES = s.localCtxSRTP, s.localSDES
 		cp.remoteCtxSRTP = s.remoteCtxSRTP
@@ -468,6 +472,7 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 		}
 
 	}
+	rtpProfile = s.localRTPProfile(answered, rtpProfile)
 
 	if s.sessionID == 0 {
 		// Use NTP seconds for the SDP o= session id (mainstream practice); the full 64-bit
@@ -521,15 +526,12 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 
 	// Confirm it is supported profile
 	secureRequest := s.SecureRTP == 1 && s.remoteCtxSRTP != nil
-	switch md.Proto {
-	case "RTP/AVP":
-	case "RTP/SAVP":
-		secureRequest = true
-	case "UDP/TLS/RTP/SAVP":
-	case "UDP/TLS/RTP/SAVPF":
-		// secureRequest = true
-	default:
+	prof, ok := parseRTPProfile(md.Proto)
+	if !ok {
 		return fmt.Errorf("%w: unsupported media description protocol proto=%s", ErrNoCommonMedia, md.Proto)
+	}
+	if prof.requiresInlineKeys(sd.Values("a")) {
+		secureRequest = true
 	}
 	s.remoteProto = md.Proto
 	s.remoteSDPIsAnswer = offered
