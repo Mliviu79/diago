@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/require"
@@ -250,4 +252,154 @@ func (l *recordingLogHandler) failedRequestWarnings() []recordedLog {
 		}
 	}
 	return warns
+}
+
+// sentRequests records the methods of the requests a dialog sends through a
+// client built by newRecordingDialogUA.
+type sentRequests struct {
+	mu      sync.Mutex
+	methods []sip.RequestMethod
+}
+
+func (s *sentRequests) record(req *sip.Request) *sip.Response {
+	s.mu.Lock()
+	s.methods = append(s.methods, req.Method)
+	s.mu.Unlock()
+	return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+}
+
+func (s *sentRequests) reset() {
+	s.mu.Lock()
+	s.methods = nil
+	s.mu.Unlock()
+}
+
+func (s *sentRequests) sent() []sip.RequestMethod {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sip.RequestMethod(nil), s.methods...)
+}
+
+// newRecordingDialogUA returns a DialogUA whose client answers every request
+// 200 without a transport, and what it was asked to send.
+func newRecordingDialogUA(t *testing.T) (*sipgo.DialogUA, *sentRequests) {
+	t.Helper()
+	ua, err := sipgo.NewUA()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ua.Close() })
+	client, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	sent := &sentRequests{}
+	client.TxRequester = &clientTxRequester{onRequest: sent.record}
+	return &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "dg", Host: "127.0.0.1", Port: 5060}}}, sent
+}
+
+// peerSDP is the session description the peer of newAnsweredTestClientDialog
+// answers and offers with.
+func peerSDP() []byte {
+	return sdp.GenerateForAudio(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1), 34455, sdp.ModeSendrecv, []string{sdp.FORMAT_TYPE_ULAW})
+}
+
+// newAnsweredTestClientDialog returns an outgoing call, invited, answered with
+// peerSDP and acknowledged, over a client that answers every request 200
+// without a transport, and what the dialog sent after the ACK.
+func newAnsweredTestClientDialog(t *testing.T) (*DialogClientSession, *sentRequests) {
+	t.Helper()
+	d, _, sent := newAnsweredTestClientCall(t)
+	return d, sent
+}
+
+// newAnsweredTestClientCall returns the call newAnsweredTestClientDialog
+// describes together with the media its Invite handed back.
+func newAnsweredTestClientCall(t *testing.T) (*DialogClientSession, *DialogMedia, *sentRequests) {
+	t.Helper()
+	sent := &sentRequests{}
+	dg := testDiagoClient(t, func(req *sip.Request) *sip.Response {
+		res := sent.record(req)
+		if req.IsInvite() {
+			res.SetBody(peerSDP())
+		}
+		return res
+	})
+	ctx := context.Background()
+	d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	med, err := d.Invite(ctx, InviteClientOptions{})
+	require.NoError(t, err)
+	require.NoError(t, d.Ack(ctx))
+	sent.reset()
+	return d, med, sent
+}
+
+// newPeerInDialogRequest builds a request of the given method the peer sends
+// inside a dialog.
+func newPeerInDialogRequest(method sip.RequestMethod, seq uint32) *sip.Request {
+	peer := sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", "peer-tag")
+	toParams := sip.NewParams()
+	toParams.Add("tag", "our-tag")
+	req := sip.NewRequest(method, sip.Uri{User: "dg", Host: "127.0.0.1", Port: 5060})
+	req.AppendHeader(&sip.FromHeader{Address: peer, Params: fromParams})
+	req.AppendHeader(&sip.ToHeader{Address: sip.Uri{User: "dg", Host: "127.0.0.1"}, Params: toParams})
+	req.AppendHeader(sip.NewHeader("Call-ID", "ended-dialog-request-test"))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: method})
+	req.AppendHeader(&sip.ContactHeader{Address: peer})
+	return req
+}
+
+// answeredServerTx is an INVITE transaction that closes answered when a 2xx
+// is sent on it.
+type answeredServerTx struct {
+	*byeServerTx
+	once     sync.Once
+	answered chan struct{}
+}
+
+func (tx *answeredServerTx) Respond(_ context.Context, res *sip.Response) error {
+	if res.IsSuccess() {
+		tx.once.Do(func() { close(tx.answered) })
+	}
+	return nil
+}
+
+// newAnsweredTestServerCall returns an inbound call over a fake transaction
+// that offered peerSDP, was answered after early media and acknowledged, and
+// the media its ProgressMedia handed back. That media is closed by the
+// session's close callbacks and by nothing else: an answer after early media
+// registers no close of its own on the dialog's end.
+func newAnsweredTestServerCall(t *testing.T) (*DialogServerSession, *DialogMedia) {
+	t.Helper()
+	return newAnsweredTestServerCallOverUA(t, &sipgo.DialogUA{})
+}
+
+// newAnsweredTestServerCallOverUA returns the call newAnsweredTestServerCall
+// describes, sending its own requests through ua.
+func newAnsweredTestServerCallOverUA(t *testing.T, ua *sipgo.DialogUA) (*DialogServerSession, *DialogMedia) {
+	t.Helper()
+	inviteTx := &answeredServerTx{byeServerTx: newByeServerTx(), answered: make(chan struct{})}
+	d := newTestDialogOverUA(t, inviteTx, ua)
+	t.Cleanup(func() { _ = d.Close() })
+	d.InviteRequest.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	d.InviteRequest.SetBody(peerSDP())
+	d.mediaConf = MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}, bindIP: net.IPv4(127, 0, 0, 1)}
+
+	med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{})
+	require.NoError(t, err)
+	answered := make(chan error, 1)
+	go func() { answered <- d.AnswerEarlyMedia(med, AnswerOptions{}) }()
+	select {
+	case <-inviteTx.answered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the 2xx was never sent")
+	}
+	confirm(t, d)
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer did not return once its ACK was read")
+	}
+	return d, med
 }

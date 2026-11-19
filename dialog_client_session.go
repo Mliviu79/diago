@@ -28,6 +28,7 @@ type DialogClientSession struct {
 	*sipgo.DialogClientSession
 
 	dialogCallbacks
+	sessionState
 
 	mediaConfig MediaConfig
 	closed      atomic.Uint32

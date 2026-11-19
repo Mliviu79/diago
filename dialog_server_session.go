@@ -26,6 +26,7 @@ type DialogServerSession struct {
 	*sipgo.DialogServerSession
 
 	dialogCallbacks
+	sessionState
 
 	mediaConf MediaConfig
 	closed    atomic.Uint32
@@ -299,16 +300,25 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		}
 	}
 	if err != nil {
+		// The ACK is read before the call is ended: the BYE that ends an
+		// answered call waits for the ACK to its 2xx (RFC 3261 section 15),
+		// which is the one this handler holds.
+		ackErr := d.DialogServerSession.ReadAck(req, tx)
 		e := d.Hangup(d.Context())
-		return errors.Join(err, e)
+		return errors.Join(err, ackErr, e)
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
 }
 
+// Hangup ends the call: it declines one not answered yet with 480, and ends an
+// answered one with a BYE. Once our 2xx is sent the INVITE transaction takes no
+// other final response, so a call whose 2xx awaits its ACK is ended with a BYE
+// too, which Bye sends once the ACK is read or the transaction has timed out
+// without one (RFC 3261 section 15). Until then it waits, bounded by ctx.
 func (d *DialogServerSession) Hangup(ctx context.Context) error {
 	state := d.LoadState()
-	if state >= sip.DialogStateConfirmed {
+	if state >= sip.DialogStateEstablished {
 		return d.Bye(ctx)
 	}
 	return d.Respond(ctx, sip.StatusTemporarilyUnavailable, "Temporarly unavailable", nil)

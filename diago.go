@@ -379,12 +379,15 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return handleNoDialog(ctx, req, tx, err)
 		}
 
+		// A BYE refused as out of order leaves the call, and its media, going.
+		// One that ended the call ends its media; the session stays with its
+		// owner, see endMediaOnBye.
 		if cd != nil {
 			err := cd.ReadBye(ctx, req, tx)
-			return errors.Join(err, cd.Close())
+			return errors.Join(err, cd.endMediaOnBye(err))
 		}
 		err = sd.ReadBye(ctx, req, tx)
-		return errors.Join(err, sd.Close())
+		return errors.Join(err, sd.endMediaOnBye(err))
 	}))
 
 	server.OnInfo(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
