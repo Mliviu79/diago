@@ -223,13 +223,16 @@ func (r *RTPPacketReader) readRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	}
 }
 
-// resumeRead clears the read deadline UpdateReader set, as a session may keep its connection across a swap
+// resumeRead clears the read deadline UpdateReader set, as a session may keep its connection across a swap.
+// It puts back the one StopRTP or StartRTP last asked for on the session, which is none unless a caller
+// stopped its reads: that stop is not the swap's to undo. A socket that takes no deadline is closed, and
+// the read that follows returns that.
 func resumeRead(reader RTPReader) {
 	switch r := reader.(type) {
 	case *MediaSession:
-		r.rtpConn.SetReadDeadline(time.Time{})
+		r.restoreRTPReadDeadline()
 	case *RTPSession:
-		r.Sess.rtpConn.SetReadDeadline(time.Time{})
+		r.Sess.restoreRTPReadDeadline()
 	}
 }
 

@@ -186,6 +186,10 @@ type MediaSession struct {
 
 	onFinalize func() error
 
+	// deadlines records the RTP deadlines StopRTP and StartRTP last asked
+	// for. CarryRTPDeadlines hands them to a session replacing this one.
+	deadlines atomic.Pointer[rtpDeadlines]
+
 	sessionID      uint64
 	sessionVersion uint64
 }
@@ -274,6 +278,7 @@ func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 
 func (s *MediaSession) StopRTP(rw int8, dur time.Duration) error {
 	t := time.Now().Add(dur)
+	defer s.holdRTPDeadline(rw, t)()
 	if rw&1 > 0 {
 		//Read stop
 		return s.rtpConn.SetReadDeadline(t)
@@ -286,6 +291,7 @@ func (s *MediaSession) StopRTP(rw int8, dur time.Duration) error {
 }
 
 func (s *MediaSession) StartRTP(rw int8) error {
+	defer s.holdRTPDeadline(rw, time.Time{})()
 	if rw&1 > 0 {
 		return s.rtpConn.SetReadDeadline(time.Time{})
 	}
