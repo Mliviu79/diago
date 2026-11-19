@@ -5,6 +5,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -500,6 +501,34 @@ func newMediaSessionForTest(t *testing.T) *media.MediaSession {
 	require.NoError(t, sess.Init())
 	t.Cleanup(func() { sess.Close() })
 	return sess
+}
+
+// newDTLSMediaSession returns a DTLS-SRTP media session bound to loopback,
+// offering PCMU and presenting cert, as the peer of a call under test. It is
+// closed with the test.
+func newDTLSMediaSession(t *testing.T, cert tls.Certificate) *media.MediaSession {
+	t.Helper()
+	s := &media.MediaSession{
+		Codecs:    []media.Codec{media.CodecAudioUlaw},
+		Mode:      sdp.ModeSendrecv,
+		SecureRTP: media.SecureRTPModeDTLS,
+		DTLSConf:  media.DTLSConfig{Certificates: []tls.Certificate{cert}},
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+	}
+	require.NoError(t, s.Init())
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// withSetup rewrites the a=setup of body.
+func withSetup(body []byte, setup string) []byte {
+	lines := strings.Split(string(body), "\r\n")
+	for i, l := range lines {
+		if strings.HasPrefix(l, "a=setup:") {
+			lines[i] = "a=setup:" + setup
+		}
+	}
+	return []byte(strings.Join(lines, "\r\n"))
 }
 
 // newICEDialogMedia installs sess in a DialogMedia the way an answered call

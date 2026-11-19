@@ -5,6 +5,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
@@ -77,16 +79,34 @@ func (r *firstAckRefused) Request(ctx context.Context, req *sip.Request) (sip.Cl
 
 // TestDiagoAnsweredCallRefusedAfter2xx pins what becomes of a call whose 2xx
 // arrived when it is then given up: InviteBridge whose bridge refuses the
-// call, and InviteBridge or Invite whose Ack fails. RFC 3261 section 13.2.2.4
-// has the UAC acknowledge every 2xx and end a dialog it does not want with a
-// BYE. The dialog was only closed, so the callee kept the call up, and a
-// refused call went unacknowledged, its 2xx retransmitted until the callee
+// call, and InviteBridge or Invite whose Ack fails, on a DTLS handshake the
+// callee never completes or on an ACK that could not be sent. RFC 3261 section
+// 13.2.2.4 has the UAC acknowledge every 2xx and end a dialog it does not want
+// with a BYE. The dialog was only closed, so the callee kept the call up, and
+// a refused call went unacknowledged, its 2xx retransmitted until the callee
 // gave up.
 //
 // The caller is handed no media for such a call, so the media made for it is
 // closed by then, which the release of its RTP port shows.
 func TestDiagoAnsweredCallRefusedAfter2xx(t *testing.T) {
 	plainAnswer := func([]byte) []byte { return peerSDP() }
+	silentDTLS := func(t *testing.T) (func([]byte) []byte, DiagoOption) {
+		peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+		return func(offer []byte) []byte {
+				if err := peer.RemoteSDP(offer, false); err != nil {
+					return nil
+				}
+				// Passive, so our side starts the handshake the callee ignores.
+				return withSetup(peer.LocalSDP(true), "passive")
+			}, WithTransport(Transport{
+				Transport: "udp",
+				BindHost:  "127.0.0.1",
+				MediaSRTP: media.SecureRTPModeDTLS,
+				MediaDTLSConf: media.DTLSConfig{
+					Certificates: []tls.Certificate{testdata.ClientCertificate()},
+				},
+			})
+	}
 	recipient := sip.Uri{User: "callee", Host: "127.0.0.1", Port: 5099}
 
 	t.Run("InviteBridge refused by the bridge", func(t *testing.T) {
@@ -103,6 +123,33 @@ func TestDiagoAnsweredCallRefusedAfter2xx(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
 		assert.Len(t, alloc.released, 1, "the media of the refused call was left open")
+	})
+
+	t.Run("InviteBridge whose Ack fails", func(t *testing.T) {
+		answer, transport := silentDTLS(t)
+		dg, sent := newAnsweredCallPeer(t, answer, transport)
+		alloc := recordCallMediaPort(t, dg)
+		b := NewBridge()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _, err := dg.InviteBridge(ctx, recipient, &b, InviteOptions{})
+		require.Error(t, err)
+		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
+		assert.Len(t, alloc.released, 1, "the media of the call given up was left open")
+	})
+
+	t.Run("Invite whose Ack fails", func(t *testing.T) {
+		answer, transport := silentDTLS(t)
+		dg, sent := newAnsweredCallPeer(t, answer, transport)
+		alloc := recordCallMediaPort(t, dg)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _, err := dg.Invite(ctx, recipient, InviteOptions{})
+		require.Error(t, err)
+		assert.Equal(t, []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE}, sent.sent())
+		assert.Len(t, alloc.released, 1, "the media of the call given up was left open")
 	})
 
 	// An Ack that could not send its ACK leaves the 2xx unacknowledged, so

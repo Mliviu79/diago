@@ -458,7 +458,7 @@ func (d *DialogMedia) onFinalize(ctx context.Context) error {
 	if ms == nil {
 		return nil
 	}
-	if err := ms.Finalize(); err != nil {
+	if err := ms.FinalizeContext(ctx); err != nil {
 		return err
 	}
 	return d.startFirstExchange()
