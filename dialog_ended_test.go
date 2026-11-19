@@ -16,7 +16,7 @@ import (
 // inDialogHandlers are the handlers diago runs for INFO, REFER and NOTIFY on a
 // dialog found in the cache, on either side.
 type inDialogHandlers interface {
-	DialogSession
+	referDialog
 	readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error
 	handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction)
 	handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction)
@@ -119,6 +119,27 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 			})
 
 			t.Run("NOTIFY for a tracked REFER", func(t *testing.T) {
+				d, _ := side.newEnded(t, nil, nil)
+				attempt := d.sipState().beginReferAttempt()
+				d.sipState().setReferAttemptCSeq(attempt, 7)
+
+				req := newPeerInDialogRequest(sip.NOTIFY, 500)
+				req.AppendHeader(sip.NewHeader("Event", "refer;id=7"))
+				req.AppendHeader(sip.NewHeader("Subscription-State", "terminated;reason=noresource"))
+				req.AppendHeader(sip.NewHeader("Content-Type", "message/sipfrag;version=2.0"))
+				req.SetBody([]byte("SIP/2.0 200 OK"))
+
+				tx := newByeServerTx()
+				d.handleReferNotify(t.Context(), req, tx)
+				require.Len(t, tx.responses, 1)
+				assert.Equal(t, sip.StatusOK, tx.responses[0].StatusCode)
+				d.sipState().referMu.Lock()
+				end := attempt.end
+				d.sipState().referMu.Unlock()
+				assert.Equal(t, ReferEndFinalNotify, end, "the transfer outcome was not delivered")
+			})
+
+			t.Run("NOTIFY for a REFER its callback tracks", func(t *testing.T) {
 				// The REFER is tracked by the OnNotify callback its
 				// ReferOptions set.
 				var outcome atomic.Int32

@@ -3,6 +3,7 @@
 package diago
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/emiago/sipgo/sip"
@@ -33,6 +34,27 @@ type sessionState struct {
 	// inbound one, which the handler of its INVITE removes. Set before the
 	// dialog is handed out and not changed after.
 	uncache func() error
+
+	// referMu guards referAttempts, referHighestCSeq, referLatest, the
+	// attempts they hold and onReferNotifyUnmatched. It is a lock of the
+	// session's own, so observing a REFER NOTIFY contends with nothing else of
+	// the call.
+	referMu sync.Mutex
+	// referAttempts are the open REFER attempts, oldest first: each lives as
+	// long as its refer subscription, up to its deadline (see referAttempt),
+	// past the dialog's BYE and its media's close (RFC 5057 section 5.5).
+	referAttempts []*referAttempt
+	// referHighestCSeq is the highest CSeq recorded for a REFER sent on this
+	// dialog, retired attempts included. In-dialog CSeqs only grow, so an Event
+	// id at or below it belongs to an earlier REFER.
+	referHighestCSeq uint32
+	// referLatest is the attempt begun most recently. It is kept after it is
+	// retired, so a NOTIFY without an Event id is never given to an older
+	// attempt once a newer one has started.
+	referLatest *referAttempt
+	// onReferNotifyUnmatched is told of a refer NOTIFY no open attempt holds.
+	// Set by OnReferNotifyUnmatched.
+	onReferNotifyUnmatched func(ReferNotify)
 }
 
 // leaveCache removes the dialog from the dialog cache it was stored in, if

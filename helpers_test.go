@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -416,4 +418,46 @@ func newInDialogReInvite(t *testing.T, d *DialogServerSession, seq uint32) *sip.
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.INVITE})
 	req.AppendHeader(sip.HeaderClone(inv.Contact()))
 	return req
+}
+
+// diagoRunInChildProcess runs the calling test again, alone, in a child process
+// of the test binary, and reports true once it has passed there, so the caller
+// returns. In the child it reports false and the caller runs its body. A test
+// that shortens sipgo's package-wide transaction timers needs a process of its
+// own: transactions that earlier tests leave running read those timers from
+// their own goroutines, and changing the timers under them is a data race.
+func diagoRunInChildProcess(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("DIAGO_TEST_CHILD") == t.Name() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^"+t.Name()+"$",
+		"-test.count=1",
+		"-test.v",
+		"-test.timeout=60s",
+	)
+	cmd.Env = append(os.Environ(), "DIAGO_TEST_CHILD="+t.Name())
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "child process failed:\n%s", out)
+	require.Contains(t, string(out), "--- PASS: "+t.Name(), "the child process did not run the test:\n%s", out)
+	return true
+}
+
+// peerMessage is one message a raw SIP peer read, and where it came from.
+type peerMessage struct {
+	msg  sip.Message
+	from net.Addr
+}
+
+// viaBranch returns the branch of req's topmost Via, which names its
+// transaction, or the empty string when req has none.
+func viaBranch(req *sip.Request) string {
+	if via := req.Via(); via != nil {
+		branch, _ := via.Params.Get("branch")
+		return branch
+	}
+	return ""
 }

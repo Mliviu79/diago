@@ -601,11 +601,7 @@ func (d *DialogClientSession) handleReferNotify(ctx context.Context, req *sip.Re
 	d.dialogCallbacks.mu.Lock()
 	onReferNotify := d.onReferNotify
 	d.dialogCallbacks.mu.Unlock()
-	if res := notifyDialogEndedResponse(d, req, onReferNotify != nil); res != nil {
-		tx.Respond(ctx, res)
-		return
-	}
-	dialogHandleReferNotify(ctx, d, req, tx, onReferNotify)
+	dialogRouteReferNotify(ctx, d, req, tx, onReferNotify)
 }
 
 func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction) {

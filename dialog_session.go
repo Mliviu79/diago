@@ -51,12 +51,14 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 		}
 	}
 
-	res, err := d.Do(ctx, req)
+	res, err := dialogReferDo(ctx, d, req)
 	if err != nil {
 		return err
 	}
 
-	if res.StatusCode != sip.StatusAccepted {
+	// Any 2xx accepts a REFER: RFC 7647 section 5 has a conforming peer answer
+	// 200, and RFC 6665 section 8.3.1 has a 202 treated as a 200.
+	if !referAccepted(res.StatusCode) {
 		return sipgo.ErrDialogResponse{
 			Res: res,
 		}
