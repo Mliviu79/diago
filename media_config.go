@@ -13,14 +13,18 @@ import (
 type RTPPortAllocator interface {
 	// AllocateRTPPort receives the context of the call the port is for: the
 	// dialog's own context on a server dialog, and the context of Invite on a
-	// client dialog. It returns an even port whose RTCP companion, port+1, the
+	// client dialog. For the new transport a media update of a DialogWebrtc
+	// starts, it is the context of that update. It returns an even port whose RTCP companion, port+1, the
 	// allocator must consider taken as well, as MediaSession binds the pair.
 	// An ended context must fail the allocation, with context.Cause(ctx) or an
 	// error wrapping it, and allocate nothing. The error surfaces as the media
 	// session init failure.
 	AllocateRTPPort(ctx context.Context) (int, error)
-	// ReleaseRTPPort is called exactly once per successful allocation, from
-	// DialogMedia.Close, after the sockets are closed. It must tolerate a port
+	// ReleaseRTPPort is called exactly once per successful allocation, after
+	// the sockets bound to the port are closed: from DialogMedia.Close, and
+	// for a DialogWebrtc once the socket of the ICE generation that took the
+	// port is closed, by its Close or when a new transport replaces it, or at
+	// once when nothing could be bound on it. It must tolerate a port
 	// it does not recognise, as it runs on teardown and so on error paths.
 	ReleaseRTPPort(port int)
 }

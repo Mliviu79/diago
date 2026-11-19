@@ -38,7 +38,7 @@ func (d *DialogServerSession) AnswerWebrtc(opts AnswerWebrtcOptions) (*DialogWeb
 	if remoteSDP == nil {
 		return nil, fmt.Errorf("no SDP present in INVITE")
 	}
-	conf, err := prepareWebrtcConfig(opts.WebrtcConfig)
+	conf, err := prepareWebrtcConfig(d.mediaConf.webrtcConfig(opts.WebrtcConfig))
 	if err != nil {
 		return nil, err
 	}

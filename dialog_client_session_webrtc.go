@@ -47,7 +47,7 @@ func (d *DialogClientSession) InviteWebrtc(ctx context.Context, opts InviteWebrt
 
 // inviteWebrtcWith is InviteWebrtc, waiting for the INVITE's answer with wait.
 func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteWebrtcOptions, wait inviteAnswerWait) (*DialogWebrtc, error) {
-	conf, err := prepareWebrtcConfig(opts.WebrtcConfig)
+	conf, err := prepareWebrtcConfig(d.mediaConfig.webrtcConfig(opts.WebrtcConfig))
 	if err != nil {
 		return nil, err
 	}
