@@ -24,6 +24,17 @@ type offeredStreams struct {
 	// ownOfferStreams.
 	tags []string
 
+	// formatLines holds, for each stream of media, the a=rtpmap lines it keeps
+	// when it is rejected: see offeredFormatLines. Only the WebRTC media type
+	// reads an offer for them, so the list of a MediaSession holds none and
+	// rejects a stream with its m= line and its tag alone.
+	formatLines [][]string
+
+	// audioSSRCs holds the SSRCs the offer declares for the sources of its
+	// audio stream, in its a=ssrc lines (RFC 5576). Only the WebRTC media type
+	// reads an offer for them: see MediaSessionWebrtc.declaredSourceLines.
+	audioSSRCs []uint32
+
 	// bundle is what the offer says of the BUNDLE group of its audio stream.
 	// Only the WebRTC media type reads an offer for it: a MediaSession does
 	// not carry several streams on one transport, and answers a group it
@@ -36,7 +47,8 @@ type offeredStreams struct {
 // stream, the port number in the corresponding stream in the answer MUST be
 // set to zero. Any media formats listed are ignored. At least one MUST be
 // present". The m= line keeps the offered transport and formats. A stream the
-// offer identified keeps its a=mid line, see midLine, and carries no other
+// offer identified keeps its a=mid line, see midLine, and the a=rtpmap lines
+// the list holds for it, see offeredFormatLines, and carries no other
 // attribute.
 func (o offeredStreams) rejected() (before, after []string) {
 	for i, md := range o.media {
@@ -47,6 +59,7 @@ func (o offeredStreams) rejected() (before, after []string) {
 		if tag := o.tag(i); tag != "" {
 			lines = append(lines, midLine(tag))
 		}
+		lines = append(lines, o.formatLinesOf(i)...)
 		if i < o.audio {
 			before = append(before, lines...)
 		} else {

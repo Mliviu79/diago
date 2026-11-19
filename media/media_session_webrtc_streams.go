@@ -19,8 +19,9 @@ import (
 // SDP". The session carries the audio stream alone, so every other stream of
 // an offer is written rejected, in the offer's order: see offeredStreams.
 //
-// A rejected stream is its m= line with port 0, and its a=mid line when the
-// offer identified it. That is also what RFC 8843 section 7.3.3 asks of a
+// A rejected stream is its m= line with port 0, its a=mid line when the offer
+// identified it, and the a=rtpmap lines the offer gave its formats: see
+// offeredFormatLines. That is also what RFC 8843 section 7.3.3 asks of a
 // stream rejected out of a BUNDLE group: the answerer "MUST assign a zero port
 // value" and "MUST NOT include an SDP 'bundle-only' attribute", without which
 // port 0 means rejected and not bundled.
@@ -66,21 +67,37 @@ func webRTCAudioStream(desc *webrtcsdp.SessionDescription) *webrtcsdp.MediaDescr
 	return findWebRTCAudio(desc)
 }
 
+// webRTCRTPMaps returns the values of the a=rtpmap lines of md.
+func webRTCRTPMaps(md *webrtcsdp.MediaDescription) []string {
+	var values []string
+	for _, attr := range md.Attributes {
+		if attr.Key == rtpmapAttribute {
+			values = append(values, attr.Value)
+		}
+	}
+	return values
+}
+
 // webRTCOfferedStreams returns the stream list of desc: its m= lines in order,
 // with audio, one of its media sections, as the one that carries the call, the
-// identification-tag of each stream and what desc says of the BUNDLE group of
-// the audio one.
+// identification-tag of each stream, the a=rtpmap lines each keeps when it is
+// rejected and what desc says of the BUNDLE group of the audio one.
 func webRTCOfferedStreams(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.MediaDescription) offeredStreams {
-	streams := offeredStreams{media: make([]sdp.MediaDescription, len(desc.MediaDescriptions))}
+	streams := offeredStreams{
+		media:       make([]sdp.MediaDescription, len(desc.MediaDescriptions)),
+		formatLines: make([][]string, len(desc.MediaDescriptions)),
+	}
 	tags := make([]string, len(desc.MediaDescriptions))
 	for i, md := range desc.MediaDescriptions {
 		streams.media[i] = webRTCMediaLine(md)
 		tags[i] = webRTCIdentificationTag(md)
+		streams.formatLines[i] = offeredFormatLines(streams.media[i].Formats, webRTCRTPMaps(md))
 		if md == audio {
 			streams.audio = i
 		}
 	}
 	streams.tags = streamTags(tags)
+	streams.audioSSRCs = webRTCDeclaredSSRCs(audio)
 	streams.bundle = webRTCBundledAudio(desc, audio)
 	return streams
 }

@@ -148,6 +148,7 @@ func (m *MediaSessionWebrtc) Fork(ctx context.Context) (*MediaSessionWebrtc, err
 	fork := &MediaSessionWebrtc{Codecs: codecs, Mode: mode, modePreference: modePreference}
 	fork.origin = m.sharedOrigin()
 	fork.streams.current = m.forkedStreams()
+	fork.source = m.sharedSource()
 	if err := fork.Init(ctx, conf, onICEStateChange); err != nil {
 		return nil, err
 	}
@@ -334,7 +335,14 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // The body has one m= line for each stream of the offer it answers, or of the
 // last offer of the peer the session committed to when the body is an offer
 // of ours, in that offer's order: the audio stream, and every other stream
-// rejected with port 0 (RFC 3264 sections 6 and 8).
+// rejected with port 0 (RFC 3264 sections 6 and 8). A rejected stream keeps
+// the a=rtpmap lines the offer gave the formats of its m= line.
+//
+// A body with more than one m= line declares, in an a=ssrc line of its audio
+// section, the source the session sends as (RFC 5576): the SSRC the first
+// RTPPacketWriter made over the session writes with and the CNAME of the
+// reports of its RTPSessionWebrtc. A body with one m= line declares none, and
+// neither does one whose offer declares that SSRC for a source of the peer.
 //
 // The streams are identified as that offer identified them: each under its
 // a=mid tag (RFC 5888 section 9.1), the audio stream alone in the BUNDLE group
@@ -445,7 +453,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		lines = append(lines, "a=candidate:"+c.Marshal())
 	}
 	lines = append(lines, "a=end-of-candidates", "a=msid:diago audio", "")
-	return streams.around([]byte(strings.Join(lines, "\r\n"))), nil
+	return streams.around(m.withDeclaredSource(streams, []byte(strings.Join(lines, "\r\n")))), nil
 }
 
 // RemoteSDP parses an answer when offered is true, otherwise it parses an

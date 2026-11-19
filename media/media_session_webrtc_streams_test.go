@@ -76,6 +76,34 @@ func withoutOriginLine(lines []string) []string {
 	return slices.DeleteFunc(slices.Clone(lines), func(l string) bool { return strings.HasPrefix(l, "o=") })
 }
 
+// webrtcAudioSectionAlone returns the lines of body, an SDP of a WebRTC
+// session written around more than one stream, as they describe the audio
+// stream alone: without the section of each rejected stream, which runs from
+// an m= line on port 0 to the next m= line, and without the a=ssrc line of the
+// audio section, which only an SDP of several m= sections carries. It requires
+// that line to be there once.
+func webrtcAudioSectionAlone(t *testing.T, body []byte) []string {
+	t.Helper()
+	var kept, sources []string
+	rejected := false
+	for _, l := range streamsSDPLines(body) {
+		if strings.HasPrefix(l, "m=") {
+			fields := strings.Fields(l)
+			rejected = len(fields) > 1 && fields[1] == "0"
+		}
+		if rejected {
+			continue
+		}
+		if strings.HasPrefix(l, "a=ssrc:") {
+			sources = append(sources, l)
+			continue
+		}
+		kept = append(kept, l)
+	}
+	require.Len(t, sources, 1, "the a=ssrc lines of the audio section of\n%s", body)
+	return kept
+}
+
 // webrtcReOfferMediaLines returns the m= lines of an offer of m that modifies
 // the negotiated session, and leaves nothing of that offer staged.
 func webrtcReOfferMediaLines(t *testing.T, m *MediaSessionWebrtc) []string {
@@ -92,9 +120,11 @@ func webrtcReOfferMediaLines(t *testing.T, m *MediaSessionWebrtc) []string {
 // the port number in the corresponding stream in the answer MUST be set to
 // zero". The first audio stream we can carry carries the call, read with the
 // session level and its own section alone, and every other stream is rejected
-// with its m= line and the tag the offer gave it alone. Section 8 keeps those
-// lines in every later SDP of ours: "Deleted media streams from a previous SDP
-// MUST NOT be removed in a new SDP".
+// with its m= line, the tag the offer gave it and the a=rtpmap lines of its
+// formats alone: TestMediaSessionWebrtcRejectedStreamKeepsItsRTPMaps pins the
+// lines of a rejected section. Section 8 keeps those lines in every later SDP
+// of ours: "Deleted media streams from a previous SDP MUST NOT be removed in a
+// new SDP".
 //
 // A stream rejected out of a BUNDLE group is written the same way, which is
 // what RFC 8843 section 7.3.3 asks: a zero port and no a=bundle-only. The
@@ -212,8 +242,8 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 
 			want := slices.Concat(r.wantBefore, audio, r.wantAfter)
 			assert.Equal(t, want, mediaLines(answer), "the answer's m= lines\n%s", answer)
-			assert.Equal(t, withoutOriginLine(streamsSDPLines(aloneAnswer)), withoutOriginLine(withoutRejectedStreams(t, answer)),
-				"the audio stream is answered as it is when offered alone")
+			assert.Equal(t, withoutOriginLine(streamsSDPLines(aloneAnswer)), withoutOriginLine(webrtcAudioSectionAlone(t, answer)),
+				"the audio stream is answered as it is when offered alone, apart from the source it declares")
 
 			// RFC 8843 section 7.3.3: a rejected stream has no
 			// a=bundle-only, and the group names the audio stream alone. RFC

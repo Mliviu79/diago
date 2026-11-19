@@ -58,10 +58,20 @@ type RTPSessionWebrtc struct {
 	RTCPReportInterval time.Duration
 }
 
+// NewRTPSessionWebrtc returns the RTP statistics and RTCP reporting of sess.
+// Its reports are those of the source sess declares in its SDPs: they carry
+// that source's CNAME, and its SSRC until a packet has been written.
 func NewRTPSessionWebrtc(sess *MediaSessionWebrtc) *RTPSessionWebrtc {
 	reportSSRC := rand.Uint32()
 	if reportSSRC == 0 {
 		reportSSRC = 1
+	}
+	cname := cryptorand.Text()
+	if sess != nil {
+		// The reports are those of the source the session declares in its
+		// SDPs: see webrtcSource.
+		source := sess.sharedSource()
+		reportSSRC, cname = source.ssrc, source.cname
 	}
 	rtcpTimer := time.NewTimer(5 * time.Second)
 	rtcpTimer.Stop()
@@ -70,7 +80,7 @@ func NewRTPSessionWebrtc(sess *MediaSessionWebrtc) *RTPSessionWebrtc {
 		rtcpTimer:          rtcpTimer,
 		rtcpClosed:         make(chan struct{}),
 		reportSSRC:         reportSSRC,
-		sourceDescription:  rtcp.NewCNAMESourceDescription(0, cryptorand.Text()),
+		sourceDescription:  rtcp.NewCNAMESourceDescription(0, cname),
 		onReadRTCP:         DefaultOnReadRTCP,
 		onWriteRTCP:        DefaultOnWriteRTCP,
 		RTCPReportInterval: 5 * time.Second,

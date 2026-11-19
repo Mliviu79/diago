@@ -28,6 +28,11 @@ type webrtcSessionState struct {
 	// itself.
 	origin *sdpOrigin
 
+	// source is the RTP source the session sends as and declares in its
+	// SDPs: see webrtcSource. It is nil until it is first asked for or a fork
+	// is handed it, and guards itself.
+	source *webrtcSource
+
 	// reOffer is what ReOffer staged: see stagedModePreference.
 	reOffer stagedModePreference
 

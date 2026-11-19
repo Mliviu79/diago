@@ -5,7 +5,6 @@ package media
 
 import (
 	"fmt"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -60,11 +59,15 @@ type RTPPacketWriter struct {
 // - CSRC contribution source
 // - Silence detection and marker set
 // updateClockRate- Padding and encryyption
+//
+// The first writer made over a MediaSessionWebrtc, or over an RTPSessionWebrtc
+// of it, has for SSRC the one that session declares in its SDPs. Every other
+// writer draws its own.
 func NewRTPPacketWriter(writer RTPWriter, codec Codec) *RTPPacketWriter {
 	w := RTPPacketWriter{
 		writer:    writer,
 		seqWriter: NewRTPSequencer(),
-		SSRC:      rand.Uint32(),
+		SSRC:      writerSSRC(writer),
 		codec:     codec,
 		// initTimestamp: rand.Uint32(), // TODO random start timestamp
 		// MTU:         1500,
