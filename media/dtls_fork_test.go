@@ -298,6 +298,15 @@ func TestDTLSForkNewAssociation(t *testing.T) {
 			wantNew: true,
 		},
 		{
+			// RFC 8122 section 5: a session-level fingerprint applies to media
+			// with none of its own, so beside the audio's own it is no part of
+			// the set the association was negotiated with.
+			name: "PeerAddsSessionLevelFingerprintBesideItsOwn",
+			reoffer: func(t *testing.T, offer string) string {
+				return withSessionFingerprintLines(offer, sha256FingerprintLine(testdata.ServerCertificate()))
+			},
+		},
+		{
 			// A peer that sent no tls-id starts sending one.
 			name:        "tls-id appears",
 			mutateOffer: func(s string) string { return removeSDPLine(s, "a=tls-id:") },

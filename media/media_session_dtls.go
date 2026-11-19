@@ -22,21 +22,23 @@ import (
 var DTLSHandshakeTimeout = 30 * time.Second
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose
-// attributes are attrs: it takes the peer's a=setup, a=fingerprint and
-// a=tls-id values and hands them to negotiateDTLSAssociation, which continues
-// the DTLS association the session has or arms the handshake of a new one. An
-// a=setup value other than active, passive and actpass is refused: RFC 8842
-// section 5.1 leaves a DTLS association no other. A session with neither a
-// DTLS certificate nor SecureRTP set to DTLS does nothing.
-func (s *MediaSession) negotiateDTLS(attrs []string) error {
+// attributes for the audio stream are attrs: it takes the peer's a=setup,
+// a=fingerprint and a=tls-id values and hands them to
+// negotiateDTLSAssociation, which continues the DTLS association the session
+// has or arms the handshake of a new one. The fingerprints are those of the
+// stream's own section, or those of the session level when it has none (RFC
+// 8122 section 5, see mediaDTLSFingerprints). An a=setup value other than
+// active, passive and actpass is refused: RFC 8842 section 5.1 leaves a DTLS
+// association no other. A session with neither a DTLS certificate nor
+// SecureRTP set to DTLS does nothing.
+func (s *MediaSession) negotiateDTLS(attrs streamAttributes) error {
 	if !s.dtlsSRTP() {
 		return nil
 	}
 
 	setup := ""
 	tlsID := ""
-	fingerprints := make([]DTLSFingerprint, 0, 1) // at least must be 1
-	for _, v := range attrs {
+	for _, v := range attrs.all() {
 		if strings.HasPrefix(v, "setup:") {
 			setup = strings.TrimSpace(v[len("setup:"):])
 			continue
@@ -48,22 +50,17 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 			tlsID = strings.TrimSpace(v[len("tls-id:"):])
 			continue
 		}
-
-		// This may only needed to be done when answering call
-		if strings.HasPrefix(v, "fingerprint:") {
-			vals := strings.Split(v[len("fingerprint:"):], " ")
-			if len(vals) < 2 {
-				return fmt.Errorf("sdp: bad fingerprint attribute attr=%q", v)
-			}
-			alg := vals[0]
-			fp := vals[1]
-			// TODO fingerprint validation
-			fingerprints = append(fingerprints, DTLSFingerprint{
-				Algorithm: alg,
-				Value:     fp,
-			})
-		}
 	}
+
+	sessionLevel, err := dtlsFingerprintAttributes(attrs.session)
+	if err != nil {
+		return err
+	}
+	mediaLevel, err := dtlsFingerprintAttributes(attrs.media)
+	if err != nil {
+		return err
+	}
+	fingerprints := mediaDTLSFingerprints(sessionLevel, mediaLevel)
 
 	// RFC 5763 section 5 makes a=fingerprint mandatory: the certificates are
 	// self signed, and the fingerprint is the only thing the peer's one can
@@ -87,6 +84,29 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	s.dtlsRemoteTLSID = tlsID
 
 	return s.negotiateDTLSAssociation(setup, fingerprints, tlsID)
+}
+
+// dtlsFingerprintAttributes returns the a=fingerprint values among attrs, the
+// attribute values of one level of an SDP.
+func dtlsFingerprintAttributes(attrs []string) ([]DTLSFingerprint, error) {
+	var fingerprints []DTLSFingerprint
+	for _, v := range attrs {
+		// This may only needed to be done when answering call
+		if strings.HasPrefix(v, "fingerprint:") {
+			vals := strings.Split(v[len("fingerprint:"):], " ")
+			if len(vals) < 2 {
+				return nil, fmt.Errorf("sdp: bad fingerprint attribute attr=%q", v)
+			}
+			alg := vals[0]
+			fp := vals[1]
+			// TODO fingerprint validation
+			fingerprints = append(fingerprints, DTLSFingerprint{
+				Algorithm: alg,
+				Value:     fp,
+			})
+		}
+	}
+	return fingerprints, nil
 }
 
 // armDTLSHandshake prepares the DTLS association RemoteSDP negotiated: it

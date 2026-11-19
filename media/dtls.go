@@ -148,17 +148,23 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
 // certificates are self signed, so that match is the only thing binding the
 // DTLS peer to the signalling, and a certificate matching none of them is
 // rejected. The grammar asks for upper case hex; lower case is accepted as
-// well. A fingerprint whose hash function is not supported is skipped.
+// well. A fingerprint whose hash function is not supported is skipped, and of
+// the others only those under the strongest hash function the peer offered
+// are compared (RFC 8122 section 5.1, see preferredDTLSFingerprintHash).
 func dtlsVerifyConnection(state *dtls.State, fingerprints []DTLSFingerprint) error {
 	if len(state.PeerCertificates) == 0 {
 		return fmt.Errorf("no certificate found in dtls")
 	}
 
 	remoteCert := state.PeerCertificates[0]
+	preferred := preferredDTLSFingerprintHash(fingerprints)
 	for _, fp := range fingerprints {
 		newHash, ok := dtlsFingerprintHash(fp.Algorithm)
 		if !ok {
 			DefaultLogger().Debug("Skiping fingerprint due to unsuported alg", "alg", fp.Algorithm)
+			continue
+		}
+		if !strings.EqualFold(fp.Algorithm, preferred) {
 			continue
 		}
 

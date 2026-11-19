@@ -46,23 +46,74 @@ func (conf *DTLSConfig) clientAuth() dtls.ClientAuthType {
 	return auth
 }
 
-// dtlsFingerprintHashes maps the a=fingerprint hash function names of RFC 8122
-// section 5 to their hash, leaving out MD2 and MD5, which the same section
+// dtlsFingerprintHashes lists the a=fingerprint hash functions of RFC 8122
+// section 5 with their hash, leaving out MD2 and MD5, which the same section
 // forbids verifying with. The names are case insensitive and browsers write
-// them in lower case, so they are looked up in lower case.
-var dtlsFingerprintHashes = map[string]func() hash.Hash{
-	"sha-1":   sha1.New,
-	"sha-224": sha256.New224,
-	"sha-256": sha256.New,
-	"sha-384": sha512.New384,
-	"sha-512": sha512.New,
+// them in lower case, so they are kept in lower case.
+//
+// The order is our preference among the hash functions a peer offers, the
+// strongest first: see preferredDTLSFingerprintHash.
+var dtlsFingerprintHashes = []struct {
+	name    string
+	newHash func() hash.Hash
+}{
+	{name: "sha-512", newHash: sha512.New},
+	{name: "sha-384", newHash: sha512.New384},
+	{name: "sha-256", newHash: sha256.New},
+	{name: "sha-224", newHash: sha256.New224},
+	{name: "sha-1", newHash: sha1.New},
 }
 
 // dtlsFingerprintHash returns the hash an a=fingerprint hash function name
 // stands for, and false for a name fingerprints are not compared under.
 func dtlsFingerprintHash(name string) (func() hash.Hash, bool) {
-	newHash, ok := dtlsFingerprintHashes[strings.ToLower(name)]
-	return newHash, ok
+	for _, h := range dtlsFingerprintHashes {
+		if strings.EqualFold(h.name, name) {
+			return h.newHash, true
+		}
+	}
+	return nil, false
+}
+
+// preferredDTLSFingerprintHash returns the name of the hash function the
+// peer's certificate is verified under: the strongest one we compare among
+// those the fingerprints use, and "" when they use none we compare.
+//
+// RFC 8122 section 5.1: "An endpoint MUST select the set of fingerprints that
+// use its most preferred hash function (out of those offered by the peer) and
+// verify that each certificate used matches one fingerprint out of that set."
+// A certificate is therefore not accepted for matching a fingerprint under a
+// weaker hash function while a stronger one was offered: whoever can forge a
+// certificate for the weaker digest would otherwise choose which hash function
+// authenticates it. A peer that offers sha-1 alone is verified under sha-1,
+// which the section allows.
+func preferredDTLSFingerprintHash(fingerprints []DTLSFingerprint) string {
+	for _, h := range dtlsFingerprintHashes {
+		offered := slices.ContainsFunc(fingerprints, func(fp DTLSFingerprint) bool {
+			return strings.EqualFold(fp.Algorithm, h.name)
+		})
+		if offered {
+			return h.name
+		}
+	}
+	return ""
+}
+
+// mediaDTLSFingerprints returns the fingerprints that apply to a media
+// description, given those of the session level and its own: its own when it
+// has any, and those of the session level otherwise.
+//
+// RFC 8122 section 5: "The fingerprint attribute may be either a session-level
+// or a media-level SDP attribute. If it is a session-level attribute, it
+// applies to all TLS sessions for which no media-level fingerprint attribute
+// is defined." A session-level fingerprint beside a media-level one names the
+// certificate of other media, so it neither authenticates this media's peer
+// nor belongs to the set its DTLS association was negotiated with.
+func mediaDTLSFingerprints(session, media []DTLSFingerprint) []DTLSFingerprint {
+	if len(media) > 0 {
+		return media
+	}
+	return session
 }
 
 // hasCheckableDTLSFingerprint reports whether one of the fingerprints names a

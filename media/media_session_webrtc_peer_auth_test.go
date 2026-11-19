@@ -78,11 +78,12 @@ func sha256FingerprintLine(certificate tls.Certificate) string {
 // TestDTLSWebrtcRemoteSDPRequiresFingerprint asserts a WebRTC description is
 // refused while it is applied when it gives no a=fingerprint the peer's
 // certificate can be checked against, and accepted with any that can: under
-// each hash function fingerprints are compared with, on several lines, at the
-// session level or on the audio media description. RFC 5763 section 5 makes
-// the attribute mandatory: it is what binds the self-signed certificate to the
-// signalling, so without one any certificate would complete the handshake. A
-// refused description starts no connectivity checks.
+// each hash function fingerprints are compared with, on several lines, on the
+// audio media description or, when that has none, at the session level (RFC
+// 8122 section 5). RFC 5763 section 5 makes the attribute mandatory: it is
+// what binds the self-signed certificate to the signalling, so without one any
+// certificate would complete the handshake. A refused description starts no
+// connectivity checks.
 func TestDTLSWebrtcRemoteSDPRequiresFingerprint(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -107,7 +108,10 @@ func TestDTLSWebrtcRemoteSDPRequiresFingerprint(t *testing.T) {
 		{name: "TwoFingerprints", offer: withFingerprintLines(offer, sha256Line, sha384Line)},
 		{name: "SessionLevel", offer: withSessionFingerprintLines(withFingerprintLines(offer), sha256Line)},
 		{name: "SessionLevelAndMediaLevel", offer: withSessionFingerprintLines(offer, sha384Line)},
-		{name: "UnsupportedOnMediaSupportedOnSession", offer: withSessionFingerprintLines(withFingerprintLines(offer, md5Line), sha256Line)},
+		// The session-level fingerprint applies to media with none of its
+		// own, so here nothing is left to check against.
+		{name: "UnsupportedOnMediaSupportedOnSession", offer: withSessionFingerprintLines(withFingerprintLines(offer, md5Line), sha256Line), wantErr: true},
+		{name: "SupportedOnMediaUnsupportedOnSession", offer: withSessionFingerprintLines(offer, md5Line)},
 		{name: "NoValue", offer: withFingerprintLines(offer, noValueLine), wantErr: true},
 		{name: "NoValueBesideComplete", offer: withFingerprintLines(offer, sha256Line, noValueLine), wantErr: true},
 		{
@@ -136,18 +140,28 @@ func TestDTLSWebrtcRemoteSDPRequiresFingerprint(t *testing.T) {
 	}
 }
 
-// TestDTLSWebrtcHandshakeMatchesAnyFingerprint asserts the handshake of a
-// WebRTC session checks the peer's certificate against every fingerprint its
-// SDP gave: it completes when the certificate matches one of them, under any
-// of the hash functions of RFC 8122 section 5 but MD2 and MD5, on whichever
-// line and level it stands, and it fails when the certificate matches none
-// (RFC 5763 section 5).
-func TestDTLSWebrtcHandshakeMatchesAnyFingerprint(t *testing.T) {
+// TestDTLSWebrtcHandshakeChecksPeerFingerprint asserts the handshake of a
+// WebRTC session verifies the peer's certificate against the fingerprints RFC
+// 8122 gives it, and against no other its SDP carries. It completes when the
+// certificate matches one of them, under any of the hash functions of section
+// 5 but MD2 and MD5, and fails when it matches none (RFC 5763 section 5).
+// They are:
+//
+//   - those of the strongest hash function offered (section 5.1), so a
+//     certificate that matches only under a weaker one beside it fails;
+//   - those of the audio media description, and those of the session level
+//     only when the description has none (section 5), so a certificate that
+//     matches only a session-level fingerprint beside the description's own
+//     fails.
+func TestDTLSWebrtcHandshakeChecksPeerFingerprint(t *testing.T) {
 	peer := testdata.ClientCertificate()
 	leaf := peer.Certificate[0]
 	// The answerer's own certificate is the one the offerer does not present.
+	otherLeaf := testdata.ServerCertificate().Certificate[0]
 	otherLine := sha256FingerprintLine(testdata.ServerCertificate())
-	otherSHA512Line := "a=fingerprint:sha-512 " + testCertificateFingerprint(sha512.New(), testdata.ServerCertificate().Certificate[0]) + "\r\n"
+	otherSHA1Line := "a=fingerprint:sha-1 " + testCertificateFingerprint(sha1.New(), otherLeaf) + "\r\n"
+	otherSHA512Line := "a=fingerprint:sha-512 " + testCertificateFingerprint(sha512.New(), otherLeaf) + "\r\n"
+	sha1Line := "a=fingerprint:sha-1 " + testCertificateFingerprint(sha1.New(), leaf) + "\r\n"
 	sha256Line := sha256FingerprintLine(peer)
 	sha384Line := "a=fingerprint:sha-384 " + testCertificateFingerprint(sha512.New384(), leaf) + "\r\n"
 
@@ -157,7 +171,7 @@ func TestDTLSWebrtcHandshakeMatchesAnyFingerprint(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "sha-1", rewrite: func(offer string) string {
-			return withFingerprintLines(offer, "a=fingerprint:sha-1 "+testCertificateFingerprint(sha1.New(), leaf)+"\r\n")
+			return withFingerprintLines(offer, sha1Line)
 		}},
 		{name: "sha-224", rewrite: func(offer string) string {
 			return withFingerprintLines(offer, "a=fingerprint:sha-224 "+testCertificateFingerprint(sha256.New224(), leaf)+"\r\n")
@@ -171,11 +185,26 @@ func TestDTLSWebrtcHandshakeMatchesAnyFingerprint(t *testing.T) {
 		{name: "SecondOfTwo", rewrite: func(offer string) string {
 			return withFingerprintLines(offer, otherLine, sha384Line)
 		}},
-		{name: "SessionLevelBesideOtherOnMedia", rewrite: func(offer string) string {
+		{name: "OneOfTwoCertificatesUnderStrongestHash", rewrite: func(offer string) string {
+			return withFingerprintLines(offer, otherLine, sha256Line)
+		}},
+		{name: "StrongerHashBesideWeakerOfOther", rewrite: func(offer string) string {
+			return withFingerprintLines(offer, otherSHA1Line, sha256Line)
+		}},
+		{name: "WeakerHashOnlyStrongerOffered", wantErr: true, rewrite: func(offer string) string {
+			return withFingerprintLines(offer, sha1Line, otherLine)
+		}},
+		{name: "SessionLevelAlone", rewrite: func(offer string) string {
+			return withSessionFingerprintLines(withFingerprintLines(offer), sha256Line)
+		}},
+		{name: "SessionLevelBesideOtherOnMedia", wantErr: true, rewrite: func(offer string) string {
 			return withSessionFingerprintLines(withFingerprintLines(offer, otherLine), sha256Line)
 		}},
 		{name: "MediaLevelBesideOtherOnSession", rewrite: func(offer string) string {
 			return withSessionFingerprintLines(offer, otherLine)
+		}},
+		{name: "StrongerHashOnSessionMediaHasItsOwn", rewrite: func(offer string) string {
+			return withSessionFingerprintLines(withFingerprintLines(offer, sha1Line), otherLine)
 		}},
 		{name: "NoneOfSeveral", wantErr: true, rewrite: func(offer string) string {
 			return withSessionFingerprintLines(withFingerprintLines(offer, otherLine), otherSHA512Line)
@@ -220,8 +249,10 @@ func TestDTLSWebrtcHandshakeMatchesAnyFingerprint(t *testing.T) {
 // section 3.1 asks for a new association when a fingerprint is modified, added
 // or removed, which this session builds only with a new ICE generation. Hash
 // function names and hex digits are case insensitive (RFC 8122 section 5) and
-// neither the order nor the level of the lines carries a meaning, so those do
-// not change the set.
+// the order of the lines carries no meaning, so those do not change the set.
+// The set is the one that applies to the audio: it is the same set when it
+// moves whole to the session level, and a session-level fingerprint beside the
+// audio's own is no part of it.
 func TestDTLSWebrtcSubsequentSDPFingerprintSet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -246,6 +277,9 @@ func TestDTLSWebrtcSubsequentSDPFingerprintSet(t *testing.T) {
 		}},
 		{name: "MovedToSessionLevel", first: []string{sha256Line}, reoffer: func(first string) string {
 			return withSessionFingerprintLines(withFingerprintLines(first), sha256Line)
+		}},
+		{name: "SessionLevelAddedBesideOwn", first: []string{sha256Line}, reoffer: func(first string) string {
+			return withSessionFingerprintLines(first, otherLine)
 		}},
 		{name: "AnotherCertificate", wantErr: true, first: []string{sha256Line}, reoffer: func(first string) string {
 			return withFingerprintLines(first, otherLine)

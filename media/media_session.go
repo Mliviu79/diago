@@ -269,7 +269,7 @@ func (s *MediaSession) String() string {
 // InitWithSDP allows creating media session with own SDP and bypassing other needs
 func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 	s.sdp = localSDP
-	sd, md, _, err := readAudioStream(localSDP)
+	sd, md, _, _, err := readAudioStream(localSDP)
 	if err != nil {
 		return err
 	}
@@ -503,7 +503,7 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 // NOTE: It must called ONCE or single thread while negotiation happening.
 // For multi negotiation Fork Must be called before
 func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
-	sd, md, streams, err := readAudioStream(sdpReceived)
+	sd, md, streams, levels, err := readAudioStream(sdpReceived)
 	if err != nil {
 		return err
 	}
@@ -645,7 +645,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	s.SetRemoteAddr(&remoteAddr)
 
 	// Check for DTLS
-	if err := s.negotiateDTLS(attrs); err != nil {
+	if err := s.negotiateDTLS(levels); err != nil {
 		return err
 	}
 

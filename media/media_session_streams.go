@@ -5,6 +5,7 @@ package media
 import (
 	"bytes"
 	"fmt"
+	"slices"
 
 	"github.com/emiago/diago/media/sdp"
 )
@@ -102,29 +103,62 @@ func audioStream(sections []sdp.MediaSection) int {
 	return first
 }
 
+// streamAttributes are the a= values an SDP gives one stream, apart by the
+// level they stand at: session, ahead of the first m= line, and media, in the
+// stream's own section. An attribute whose media-level value replaces the
+// session-level one instead of joining it, as RFC 8122 section 5 has
+// a=fingerprint, is read from here, since the stream's description holds both
+// levels as one list.
+type streamAttributes struct {
+	session []string
+	media   []string
+}
+
+// all returns the values of both levels, the session level first, in the
+// order the stream's description has them.
+func (a streamAttributes) all() []string {
+	return slices.Concat(a.session, a.media)
+}
+
+// attributeValues returns the values of the a= lines among lines.
+func attributeValues(lines []sdp.Line) []string {
+	var values []string
+	for _, l := range lines {
+		if l.Type == "a" {
+			values = append(values, l.Value)
+		}
+	}
+	return values
+}
+
 // readAudioStream reads body section by section and returns the stream that
 // carries the call: sd, the session level together with that stream's own
-// section, md, its m= line, and streams, the body's stream list.
+// section, md, its m= line, streams, the body's stream list, and attrs, the
+// stream's attributes by level.
 //
 // sd holds no line of another stream: a c=, a=rtpmap or a=fingerprint of a
 // video section says nothing of the audio, and a c= inside the audio section
 // governs it whatever the other sections carry (RFC 4566 section 5.7). A body
 // with no audio stream is an [ErrNoCommonMedia].
-func readAudioStream(body []byte) (sd sdp.SessionDescription, md sdp.MediaDescription, streams offeredStreams, err error) {
+func readAudioStream(body []byte) (sd sdp.SessionDescription, md sdp.MediaDescription, streams offeredStreams, attrs streamAttributes, err error) {
 	sections, err := sdp.UnmarshalSections(body)
 	if err != nil {
-		return nil, md, streams, fmt.Errorf("fail to parse received SDP: %w", err)
+		return nil, md, streams, attrs, fmt.Errorf("fail to parse received SDP: %w", err)
 	}
 	audio := audioStream(sections.Media)
 	if audio < 0 {
-		return nil, md, streams, fmt.Errorf("%w: no audio media description", ErrNoCommonMedia)
+		return nil, md, streams, attrs, fmt.Errorf("%w: no audio media description", ErrNoCommonMedia)
 	}
 
 	streams = offeredStreams{media: make([]sdp.MediaDescription, len(sections.Media)), audio: audio}
 	for i, sec := range sections.Media {
 		streams.media[i] = sec.Media
 	}
-	return sections.Description(audio), sections.Media[audio].Media, streams, nil
+	attrs = streamAttributes{
+		session: attributeValues(sections.Session),
+		media:   attributeValues(sections.Media[audio].Lines),
+	}
+	return sections.Description(audio), sections.Media[audio].Media, streams, attrs, nil
 }
 
 // keepOfferedStreams records the stream list of the body RemoteSDP is

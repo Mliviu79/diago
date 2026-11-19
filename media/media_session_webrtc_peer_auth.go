@@ -12,9 +12,11 @@ import (
 )
 
 // webRTCFingerprints returns the certificate fingerprints a remote WebRTC SDP
-// gives for its audio: every a=fingerprint of the audio media description and
-// of the session level, never one of another media description, which says
-// nothing of the audio. The peer's certificate has to match one of them.
+// gives for its audio: the a=fingerprint values of the audio media
+// description, or those of the session level when it has none of its own (RFC
+// 8122 section 5, see mediaDTLSFingerprints), never one of another media
+// description, which says nothing of the audio. The peer's certificate has to
+// match one of them, under the strongest hash function they use.
 //
 // RFC 5763 section 5 makes the attribute mandatory. The certificates are self
 // signed and the fingerprint is the only thing the peer's one can be checked
@@ -22,29 +24,42 @@ import (
 // compare is refused here, before any ICE work is done for it, instead of
 // failing the handshake after the answer was sent. A fingerprint under another
 // hash function is kept: it is part of the set a later description is compared
-// with.
+// with. An a=fingerprint line without a value is refused at either level.
 func webRTCFingerprints(session, media []webrtcsdp.Attribute) ([]DTLSFingerprint, error) {
-	var fingerprints []DTLSFingerprint
-	for _, attrs := range [][]webrtcsdp.Attribute{media, session} {
-		for _, attr := range attrs {
-			if attr.Key != "fingerprint" {
-				continue
-			}
-			fields := strings.Fields(attr.Value)
-			if len(fields) < 2 {
-				return nil, fmt.Errorf("invalid remote DTLS fingerprint %q", attr.Value)
-			}
-			fingerprints = append(fingerprints, DTLSFingerprint{
-				Algorithm: fields[0],
-				Value:     fields[1],
-			})
-		}
+	mediaLevel, err := webRTCFingerprintAttributes(media)
+	if err != nil {
+		return nil, err
 	}
+	sessionLevel, err := webRTCFingerprintAttributes(session)
+	if err != nil {
+		return nil, err
+	}
+	fingerprints := mediaDTLSFingerprints(sessionLevel, mediaLevel)
 	if len(fingerprints) == 0 {
 		return nil, errors.New("remote WebRTC SDP has no DTLS fingerprint")
 	}
 	if !hasCheckableDTLSFingerprint(fingerprints) {
 		return nil, fmt.Errorf("remote WebRTC SDP has no DTLS fingerprint with a supported hash function fingerprints=%d", len(fingerprints))
+	}
+	return fingerprints, nil
+}
+
+// webRTCFingerprintAttributes returns the a=fingerprint values among attrs,
+// the attributes of one level of a description.
+func webRTCFingerprintAttributes(attrs []webrtcsdp.Attribute) ([]DTLSFingerprint, error) {
+	var fingerprints []DTLSFingerprint
+	for _, attr := range attrs {
+		if attr.Key != "fingerprint" {
+			continue
+		}
+		fields := strings.Fields(attr.Value)
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("invalid remote DTLS fingerprint %q", attr.Value)
+		}
+		fingerprints = append(fingerprints, DTLSFingerprint{
+			Algorithm: fields[0],
+			Value:     fields[1],
+		})
 	}
 	return fingerprints, nil
 }
