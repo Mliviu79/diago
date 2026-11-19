@@ -3,7 +3,9 @@
 package media
 
 import (
+	"context"
 	"errors"
+	"net"
 
 	"github.com/pion/ice/v4"
 )
@@ -25,12 +27,38 @@ type ICEConfig struct {
 	// candidates only: [MediaSessionWebrtc.Init] refuses anything else with
 	// an *ICEError that matches ErrICEGathering.
 	Lite bool
+
+	// Socket, when not nil, gives each ICE generation of the session the UDP
+	// socket it runs on: see [ICESocketSource]. The zero value leaves the
+	// sockets to the ICE agent, which binds one for every local address it
+	// gathers, within PortMin and PortMax when those are set.
+	Socket ICESocketSource
+
+	// ExternalIP, when not nil, is the address the c= line of every SDP of
+	// the session gives, in place of the address of the default candidate.
+	// It is for a host that is reached at an address none of its interfaces
+	// carries. The candidates are left as they were gathered and none is
+	// added for it, so a peer that looks for the c= address among the
+	// candidates (RFC 8839 section 4.2.5) finds no match.
+	ExternalIP net.IP
 }
 
 // appendICEConfigOptions returns opts followed by the agent options conf.ICE
 // asks for. They go last, since a lite agent narrows the candidate types the
-// options before them chose.
-func appendICEConfigOptions(opts []ice.AgentOption, conf MediaSessionWebrtcConfig) ([]ice.AgentOption, error) {
+// options before them chose. The socket of conf.ICE.Socket is taken last of
+// all, once nothing else of conf.ICE can be refused: see takeICESocket for who
+// releases it.
+func (m *MediaSessionWebrtc) appendICEConfigOptions(ctx context.Context, opts []ice.AgentOption, conf MediaSessionWebrtcConfig) ([]ice.AgentOption, error) {
+	opts, err := appendICELiteOptions(opts, conf)
+	if err != nil {
+		return nil, err
+	}
+	return m.takeICESocket(ctx, opts, conf)
+}
+
+// appendICELiteOptions returns opts followed by the agent options of a lite
+// agent, when conf.ICE asks for one.
+func appendICELiteOptions(opts []ice.AgentOption, conf MediaSessionWebrtcConfig) ([]ice.AgentOption, error) {
 	if !conf.ICE.Lite {
 		return opts, nil
 	}

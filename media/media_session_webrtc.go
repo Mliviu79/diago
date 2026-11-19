@@ -149,7 +149,7 @@ func (m *MediaSessionWebrtc) Init(
 	ctx context.Context,
 	conf MediaSessionWebrtcConfig,
 	onICEStateChange ...func(ice.ConnectionState),
-) error {
+) (err error) {
 	if len(onICEStateChange) > 1 {
 		return fmt.Errorf("only one ICE state handler can be configured")
 	}
@@ -228,9 +228,10 @@ func (m *MediaSessionWebrtc) Init(
 		}
 		opts = append(opts, ice.WithUrls(urls))
 	}
-	if opts, err = appendICEConfigOptions(opts, conf); err != nil {
+	if opts, err = m.appendICEConfigOptions(ctx, opts, conf); err != nil {
 		return &ICEError{Phase: ICEPhaseGathering, Err: err}
 	}
+	defer func() { err = m.releaseUnusedICESocket(err) }()
 
 	agent, err := ice.NewAgentWithOptions(opts...)
 	if err != nil {
@@ -386,7 +387,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 	}
 	lines = append(lines,
 		fmt.Sprintf("m=audio %d %s %s", candidate.Port(), profile, strings.Join(formats, " ")),
-		fmt.Sprintf("c=IN %s %s", addressType, connectionIP),
+		m.connectionLine(addressType, connectionIP),
 		"a=mid:0",
 		"a=rtcp-mux",
 	)
@@ -744,7 +745,7 @@ func (m *MediaSessionWebrtc) Close() error {
 	if agent != nil {
 		agentErr = agent.Close()
 	}
-	return errors.Join(muxErr, agentErr)
+	return errors.Join(muxErr, agentErr, m.closeICESocket())
 }
 
 func (m *MediaSessionWebrtc) StartRTP(rw int8) error { return m.StopRTP(rw, 0) }

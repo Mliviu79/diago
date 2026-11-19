@@ -41,6 +41,10 @@ type webrtcSessionState struct {
 	// (RFC 8445 section 6.1.1).
 	remoteICELite bool
 
+	// iceSocket is the socket Config.ICE.Socket gave this ICE generation, nil
+	// when the agent binds its own: see takeICESocket.
+	iceSocket *iceSocket
+
 	// leftRunning is the negotiation FinalizeWithin left running. It guards
 	// itself.
 	leftRunning negotiationLeftRunning
