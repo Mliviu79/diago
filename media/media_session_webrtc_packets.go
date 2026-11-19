@@ -32,8 +32,8 @@ type webrtcPacketPath struct {
 	codecs []Codec
 
 	// mid is the header extension that carries the identification-tag of the
-	// audio stream in the packets written, as the stream list the session
-	// committed to has it: see midExtension.
+	// audio stream in the packets written, as the exchange the session
+	// committed to left it: see webrtcStreams.mid.
 	mid midExtension
 }
 
@@ -44,7 +44,7 @@ type webrtcPacketPath struct {
 func (m *MediaSessionWebrtc) packetPath() webrtcPacketPath {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	path := webrtcPacketPath{mux: m.mux, mode: m.Mode, codecs: m.Codecs, mid: m.streams.current.bundle.mid}
+	path := webrtcPacketPath{mux: m.mux, mode: m.Mode, codecs: m.Codecs, mid: m.streams.mid}
 	if !m.ready {
 		return path
 	}

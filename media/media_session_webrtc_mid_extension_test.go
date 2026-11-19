@@ -22,10 +22,10 @@ const testMIDExtmap = "urn:ietf:params:rtp-hdrext:sdes:mid"
 
 // webrtcOfferWithExtmap returns offer, an SDP with one audio section, with the
 // a=extmap lines media in that section and the lines session at the session
-// level.
+// level, in place of the a=extmap lines it has.
 func webrtcOfferWithExtmap(t *testing.T, offer []byte, session, media []string) []byte {
 	t.Helper()
-	body := string(offer)
+	body := string(sdpWithoutAttribute(offer, "extmap"))
 	for _, l := range session {
 		require.Equal(t, 1, strings.Count(body, "t=0 0\r\n"), "the offer\n%s", body)
 		body = strings.Replace(body, "t=0 0\r\n", "t=0 0\r\n"+l+"\r\n", 1)
@@ -41,11 +41,25 @@ func webrtcOfferWithExtmap(t *testing.T, offer []byte, session, media []string) 
 // session enable the RTP header extension that carries the tag of its audio
 // stream. RFC 8843 section 9.1 has it "in each bundled RTP-based "m=" section
 // in every offer and answer", and RFC 8285 section 7 lets an answer enable
-// only what the offer mapped, under the offer's identifier. So it is enabled
-// for an audio stream offered in a BUNDLE group with the extension mapped, in
-// the answer and in the offers of ours that follow, and for no other.
+// only what the offer mapped, under the offer's identifier. So an answer
+// enables it for an audio stream offered in a BUNDLE group with the extension
+// mapped, and for no other.
+//
+// An offer of ours enables it whenever its audio stream is in a BUNDLE group:
+// under the identifier the peer's offer gave the extension, also in a mapping
+// the answer could not repeat, and otherwise under one that offer mapped to
+// nothing, since "The local identifiers MUST be unique in an RTP session" and
+// the sections of a BUNDLE group share one identifier space (RFC 8285 section
+// 7).
 func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 	const bundled = "a=group:BUNDLE audio"
+	const audioLevel = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+	// oneByteTaken maps every identifier of the one-byte form to an extension
+	// that is not ours.
+	var oneByteTaken []string
+	for id := 1; id <= maxOneByteExtensionID; id++ {
+		oneByteTaken = append(oneByteTaken, "a=extmap:"+strconv.Itoa(id)+" http://example.com/ext"+strconv.Itoa(id))
+	}
 	type row struct {
 		name string
 		// group is the a=group line of the offer, whose audio stream has the
@@ -54,8 +68,11 @@ func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 		// session and media are the a=extmap lines of the offer at the
 		// session level and in its audio section.
 		session, media []string
-		// want is the a=extmap lines of our SDPs.
+		// want is the a=extmap lines of our answer.
 		want []string
+		// wantOffer is the a=extmap lines of the offer we make afterwards,
+		// when they are not those of the answer.
+		wantOffer []string
 	}
 	rows := []row{
 		{
@@ -88,13 +105,55 @@ func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 			media: []string{"a=extmap:200 " + testMIDExtmap},
 			want:  []string{"a=extmap:200 " + testMIDExtmap},
 		},
-		{name: "not_mapped", group: bundled, media: []string{"a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level"}},
-		{name: "none_mapped", group: bundled},
-		{name: "mapped_for_the_peer_to_send_alone", group: bundled, media: []string{"a=extmap:3/sendonly " + testMIDExtmap}},
-		{name: "mapped_for_the_peer_to_receive_alone", group: bundled, media: []string{"a=extmap:3/recvonly " + testMIDExtmap}},
-		{name: "mapped_inactive", group: bundled, media: []string{"a=extmap:3/inactive " + testMIDExtmap}},
-		{name: "mapped_to_the_padding_identifier", group: bundled, media: []string{"a=extmap:0 " + testMIDExtmap}},
-		{name: "mapped_to_an_identifier_to_remap", group: bundled, media: []string{"a=extmap:4096 " + testMIDExtmap}},
+		{
+			name:      "not_mapped",
+			group:     bundled,
+			media:     []string{"a=extmap:1 " + audioLevel},
+			wantOffer: []string{"a=extmap:2 " + testMIDExtmap},
+		},
+		{name: "none_mapped", group: bundled, wantOffer: []string{"a=extmap:1 " + testMIDExtmap}},
+		{
+			name:      "not_mapped_beside_extensions_at_the_session_level",
+			group:     bundled,
+			session:   []string{"a=extmap:1 " + audioLevel, "a=extmap:2/recvonly urn:ietf:params:rtp-hdrext:toffset"},
+			wantOffer: []string{"a=extmap:3 " + testMIDExtmap},
+		},
+		{
+			name:      "not_mapped_and_every_one-byte_identifier_taken",
+			group:     bundled,
+			media:     oneByteTaken,
+			wantOffer: []string{"a=extmap:16 " + testMIDExtmap},
+		},
+		{
+			name:      "mapped_for_the_peer_to_send_alone",
+			group:     bundled,
+			media:     []string{"a=extmap:3/sendonly " + testMIDExtmap},
+			wantOffer: []string{"a=extmap:3 " + testMIDExtmap},
+		},
+		{
+			name:      "mapped_for_the_peer_to_receive_alone",
+			group:     bundled,
+			media:     []string{"a=extmap:3/recvonly " + testMIDExtmap},
+			wantOffer: []string{"a=extmap:3 " + testMIDExtmap},
+		},
+		{
+			name:      "mapped_inactive",
+			group:     bundled,
+			media:     []string{"a=extmap:3/inactive " + testMIDExtmap},
+			wantOffer: []string{"a=extmap:3 " + testMIDExtmap},
+		},
+		{
+			name:      "mapped_to_the_padding_identifier",
+			group:     bundled,
+			media:     []string{"a=extmap:0 " + testMIDExtmap},
+			wantOffer: []string{"a=extmap:1 " + testMIDExtmap},
+		},
+		{
+			name:      "mapped_to_an_identifier_to_remap",
+			group:     bundled,
+			media:     []string{"a=extmap:4096 " + testMIDExtmap},
+			wantOffer: []string{"a=extmap:1 " + testMIDExtmap},
+		},
 		{name: "an_audio_stream_in_no_group", media: []string{"a=extmap:3 " + testMIDExtmap}},
 		{name: "an_audio_stream_outside_the_group", group: "a=group:BUNDLE other", media: []string{"a=extmap:3 " + testMIDExtmap}},
 	}
@@ -106,7 +165,8 @@ func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 			answerer := newSetupRoleWebrtcSession(ctx, t, testdata.ServerCertificate(), nil)
 			alone, err := offerer.LocalSDP(ctx, false)
 			require.NoError(t, err)
-			require.Empty(t, sdpLines(alone, "a=extmap:"), "an offer of ours before any of the peer's\n%s", alone)
+			require.Equal(t, []string{"a=extmap:1 " + testMIDExtmap}, audioSectionLines(t, alone, "a=extmap:"),
+				"an offer of ours before any of the peer's\n%s", alone)
 			offer := webrtcOfferWithExtmap(t, webrtcTaggedOffer(t, alone, r.group, "audio", nil, nil), r.session, r.media)
 
 			require.NoError(t, answerer.RemoteSDP(ctx, offer, false), "applying the offer\n%s", offer)
@@ -119,9 +179,14 @@ func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 					"the extension is mapped in the audio section\n%s", answer)
 			}
 
+			wantOffer := r.wantOffer
+			if wantOffer == nil {
+				wantOffer = r.want
+			}
 			ours, err := answerer.LocalSDP(ctx, false)
 			require.NoError(t, err)
-			assert.Equal(t, r.want, sdpLines(ours, "a=extmap:"), "our offer\n%s", ours)
+			assert.Equal(t, wantOffer, sdpLines(ours, "a=extmap:"), "our offer\n%s", ours)
+			assert.Equal(t, wantOffer, audioSectionLines(t, ours, "a=extmap:"), "the audio section of our offer\n%s", ours)
 		})
 	}
 }
@@ -221,9 +286,11 @@ func TestMIDExtensionTagsPackets(t *testing.T) {
 // reads what the answerer sends: every RTP packet carries the tag the offer
 // gave the stream (RFC 8843 sections 9.2 and 15.2), also after a re-offer of
 // ours, and the source description of its RTCP reports carries it as an SDES
-// MID item (section 15.1). The offering session of the test sends its packets
-// as they are until it has received an offer that maps the extension, which
-// our re-offer is.
+// MID item (section 15.1). The offering session of the test mapped the
+// extension under another identifier and for another tag than the offer its
+// peer was given, so the answer does not hold its mapping: it sends its
+// packets as they are until it has received an offer that maps the extension,
+// which our re-offer is.
 func TestMediaSessionWebrtcSendsTheTagOfItsBundledStream(t *testing.T) {
 	const id = 3
 	offerer, answerer, _, answer := newEstablishedWebrtcPair(t, func(offer string) string {
@@ -252,7 +319,7 @@ func TestMediaSessionWebrtcSendsTheTagOfItsBundledStream(t *testing.T) {
 		assert.Equal(t, []byte("audio"), got.GetExtension(id), "the tag of packet %d", seq)
 	}
 	got := read(t, offerer, answerer, 4)
-	assert.False(t, got.Header.Extension, "a session that received no offer tags nothing")
+	assert.False(t, got.Header.Extension, "a session whose mapping the answer does not hold tags nothing")
 
 	sd := rtcp.NewCNAMESourceDescription(0x5eed0000, "cname")
 	identified := []rtcp.SourceDescriptionChunk{{
@@ -264,7 +331,7 @@ func TestMediaSessionWebrtcSendsTheTagOfItsBundledStream(t *testing.T) {
 	}}
 	assert.Equal(t, identified, answerer.identifiedSource(sd).Chunks, "the source description sent")
 	assert.Equal(t, rtcp.NewCNAMESourceDescription(0x5eed0000, "cname"), sd, "the session's own description is left as it is")
-	assert.Same(t, sd, offerer.identifiedSource(sd), "a session that received no offer adds nothing")
+	assert.Same(t, sd, offerer.identifiedSource(sd), "a session whose mapping the answer does not hold adds nothing")
 
 	reoffer, err := answerer.ReOffer("")
 	require.NoError(t, err)

@@ -672,11 +672,31 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 			require.NotContains(t, l, "\r")
 		}
 
+		// The extension an offer of ours maps: for a bundled stream alone,
+		// under the identifier the body gave it or one it mapped to nothing.
+		own := streams.inOwnOffer().bundle.mid
+		if own.id != 0 {
+			require.True(t, streams.bundle.grouped, "an offer of ours maps the extension for a bundled stream alone")
+			require.Equal(t, streams.audioTag(), string(own.tag))
+			require.NotEqual(t, uint8(reservedOneByteExtensionID), own.id)
+			if streams.extensions.mid != 0 {
+				require.Equal(t, streams.extensions.mid, own.id, "the identifier the body gave the extension")
+			} else {
+				require.NotContains(t, streams.extensions.ids, own.id, "an identifier the body mapped to nothing")
+			}
+			for _, l := range streams.inOwnOffer().bundledAudioLines() {
+				require.NotContains(t, l, "\n")
+				require.NotContains(t, l, "\r")
+			}
+		}
+
 		mid := streams.bundle.mid
 		if mid.id == 0 {
 			return
 		}
 		require.True(t, streams.bundle.grouped, "an extension is in use for a bundled stream alone")
+		require.Equal(t, mid, own, "an offer of ours repeats the mapping of the body")
+		require.Equal(t, mid, mid.keptBy(streams.extensions), "the body read as an answer holds its own mapping")
 		wire, err := mid.tagged(dtlsTestPacket(1)).Marshal()
 		require.NoError(t, err)
 		var got rtp.Packet

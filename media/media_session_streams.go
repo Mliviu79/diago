@@ -40,6 +40,12 @@ type offeredStreams struct {
 	// not carry several streams on one transport, and answers a group it
 	// does not implement without the a=group line (RFC 5888 section 9.2).
 	bundle bundledAudio
+
+	// extensions is what the offer maps to RTP header extensions. Only the
+	// WebRTC media type reads a description for it, to give the extension an
+	// offer of ours maps an identifier of its own and to learn whether an
+	// answer kept that mapping: see ownOfferMID.
+	extensions mappedExtensions
 }
 
 // rejected returns the lines rejecting every stream but the audio one: those

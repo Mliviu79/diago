@@ -198,22 +198,25 @@ func TestMediaSessionWebrtcFollowsAnOfferWithoutTags(t *testing.T) {
 }
 
 // TestOwnOfferStreams pins the stream list a session writes its SDPs around
-// before any offer of its peer, in both forms: it is the list of no offer, it
-// rejects nothing, and it maps no header extension for the tag.
+// before any offer of its peer, in both forms: it is the list of no offer and
+// it rejects nothing. The bundled form maps the header extension of the tag
+// under the identifier 1 (RFC 8843 section 9.1), and the form without a
+// group maps none.
 func TestOwnOfferStreams(t *testing.T) {
 	bundled := ownOfferStreams(false)
 	assert.Equal(t, []string{"a=group:BUNDLE 0"}, bundled.bundleGroupLines())
-	assert.Equal(t, []string{"a=mid:0"}, bundled.bundledAudioLines())
+	assert.Equal(t, []string{"a=mid:0", "a=extmap:1 " + testMIDExtmap}, bundled.bundledAudioLines())
+	assert.Equal(t, midExtension{id: 1, tag: []byte("0")}, bundled.bundle.mid)
 
 	plain := ownOfferStreams(true)
 	assert.Empty(t, plain.bundleGroupLines())
 	assert.Empty(t, plain.bundledAudioLines())
+	assert.Zero(t, plain.bundle.mid.id)
 
 	for _, streams := range []offeredStreams{bundled, plain} {
 		assert.False(t, streams.ofAnOffer())
 		before, after := streams.rejected()
 		assert.Empty(t, before)
 		assert.Empty(t, after)
-		assert.Zero(t, streams.bundle.mid.id)
 	}
 }

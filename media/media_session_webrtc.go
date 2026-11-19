@@ -62,8 +62,9 @@ type MediaSessionWebrtcConfig struct {
 
 	// OfferWithoutBundle makes the first offer of the session, the one it
 	// writes before any offer of the peer, describe the audio stream with no
-	// a=group:BUNDLE line and no a=mid line. The zero value offers the stream
-	// under the tag 0, in a BUNDLE group of its own.
+	// a=group:BUNDLE line, no a=mid line and no a=extmap line. The zero value
+	// offers the stream under the tag 0, in a BUNDLE group of its own, with
+	// the MID header extension mapped (RFC 8843 section 9.1).
 	//
 	// The SDPs of ours that follow that offer keep its form, a session made
 	// by Fork included, until an offer of the peer is committed: from then on
@@ -353,6 +354,11 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // any of its streams without an a=mid line, which groups none (RFC 5888
 // section 6). Before any offer of the peer the audio stream has the tag 0 in
 // a group of its own, or neither line when Config.OfferWithoutBundle is set.
+//
+// An offer of ours maps the header extension of the tag whenever its audio
+// stream is in a BUNDLE group (RFC 8843 section 9.1), whether or not an offer
+// of the peer mapped it: under the identifier that offer gave the extension,
+// or one it left free, which is 1 before any offer of the peer.
 //
 // The answer to an offer whose audio stream is in a BUNDLE group and carries
 // a=rtcp-mux-only repeats that line (RFC 8843 section 9.3.1.2). No other body
@@ -885,8 +891,9 @@ func (m *MediaSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
 // not keyed it sends nothing and returns an error that wraps ErrDTLSNotKeyed.
 //
 // On a session whose peer offered the audio stream in a BUNDLE group with the
-// MID header extension mapped, the packet sent carries the stream's tag in
-// that extension (RFC 8843 sections 9.2 and 15.2); pkt itself is not changed.
+// MID header extension mapped, or kept in its answer the mapping an offer of
+// ours made, the packet sent carries the stream's tag in that extension (RFC
+// 8843 sections 9.2 and 15.2); pkt itself is not changed.
 func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 	if m.leftRunning.unkeyed.Load() {
 		return ErrDTLSNotKeyed

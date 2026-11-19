@@ -138,9 +138,14 @@ func TestMediaSessionWebrtcICEAndSRTP(t *testing.T) {
 	case description := <-sourceDescriptions:
 		require.Len(t, description.Chunks, 1)
 		require.Equal(t, offerWriter.SSRC, description.Chunks[0].Source)
-		require.Len(t, description.Chunks[0].Items, 1)
+		// Both sessions bundle the audio stream and map the MID header
+		// extension, so the tag of the stream follows the CNAME (RFC 8843
+		// sections 9.2 and 15).
+		require.Len(t, description.Chunks[0].Items, 2)
 		require.Equal(t, rtcp.SDESCNAME, description.Chunks[0].Items[0].Type)
 		require.NotEmpty(t, description.Chunks[0].Items[0].Text)
+		require.Equal(t, sdesMID, description.Chunks[0].Items[1].Type)
+		require.Equal(t, ownAudioTag, description.Chunks[0].Items[1].Text)
 	}
 
 	// RFC 3550 keeps sender status for two reporting intervals after the last

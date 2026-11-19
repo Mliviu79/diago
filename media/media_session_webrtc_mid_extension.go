@@ -5,7 +5,6 @@ package media
 import (
 	"slices"
 	"strconv"
-	"strings"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -29,7 +28,8 @@ import (
 // identifier: "the same identifier MUST be used for the same offered extension
 // in the answer" (RFC 8285 section 7). So the extension is in use on a session
 // whose peer offered the audio stream in a BUNDLE group with the extension
-// mapped, and on no other.
+// mapped, on one whose peer kept the mapping of an offer of ours in its answer
+// (see ownOfferMID), and on no other.
 
 const (
 	// sdesMIDURI names the RTP header extension that carries an
@@ -52,8 +52,8 @@ const (
 )
 
 // midExtension is the RTP header extension carrying the identification-tag of
-// the audio stream, as the peer's offer mapped it. Its zero value is no
-// extension: packets are sent as they are.
+// the audio stream, as an offer mapped it: the peer's, or one of ours. Its
+// zero value is no extension: packets are sent as they are.
 type midExtension struct {
 	// id is the identifier the offer maps to sdesMIDURI.
 	id uint8
@@ -64,8 +64,7 @@ type midExtension struct {
 
 // webRTCMIDExtension returns the header extension an offer maps to the
 // identification-tag tag of its audio stream, whose attributes are media,
-// under the session-level attributes session. The media-level mappings are
-// read first, since an SDP has them at one level alone (RFC 8285 section 5).
+// under the session-level attributes session: see webRTCMIDMapping.
 //
 // It returns no extension when the offer maps none, maps it to an identifier a
 // packet cannot carry, qualifies it with a direction other than sendrecv, in
@@ -75,27 +74,11 @@ func webRTCMIDExtension(session, media []webrtcsdp.Attribute, tag string) midExt
 	if tag == "" || len(tag) > maxMIDLen {
 		return midExtension{}
 	}
-	for _, attr := range slices.Concat(media, session) {
-		if attr.Key != "extmap" {
-			continue
-		}
-		fields := strings.Fields(attr.Value)
-		if len(fields) < 2 || fields[1] != sdesMIDURI {
-			continue
-		}
-		value, direction, _ := strings.Cut(fields[0], "/")
-		if direction != "" && direction != "sendrecv" {
-			return midExtension{}
-		}
-		// An identifier above 255 only offers the extension for remapping
-		// (RFC 8285 section 7), and 0 is padding.
-		id, err := strconv.ParseUint(value, 10, 8)
-		if err != nil || id == 0 {
-			return midExtension{}
-		}
-		return midExtension{id: uint8(id), tag: []byte(tag)}
+	id, direction := webRTCMIDMapping(session, media)
+	if id == 0 || (direction != "" && direction != extmapSendrecv) {
+		return midExtension{}
 	}
-	return midExtension{}
+	return midExtension{id: id, tag: []byte(tag)}
 }
 
 // extmapLines returns the a=extmap line that enables the extension in the
@@ -104,7 +87,7 @@ func (x midExtension) extmapLines() []string {
 	if x.id == 0 {
 		return nil
 	}
-	return []string{"a=extmap:" + strconv.Itoa(int(x.id)) + " " + sdesMIDURI}
+	return []string{"a=" + extmapAttribute + ":" + strconv.Itoa(int(x.id)) + " " + sdesMIDURI}
 }
 
 // tagged returns pkt as it is sent to the peer: a copy whose header carries

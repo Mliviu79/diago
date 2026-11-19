@@ -23,7 +23,9 @@ type bundledAudio struct {
 	grouped bool
 
 	// mid is the RTP header extension the offer maps to the tag of a grouped
-	// audio stream: see midExtension. Its zero value is no extension.
+	// audio stream: see midExtension. Its zero value is no extension. In
+	// the list an offer of ours is written around it is the extension that
+	// offer maps: see offeredStreams.inOwnOffer.
 	mid midExtension
 
 	// muxOnly is set when the audio section of the offer, listed in a BUNDLE
@@ -114,17 +116,20 @@ const ownAudioTag = "0"
 // ownOfferStreams returns the stream list a session writes its SDPs around
 // before any offer of the peer: the audio stream alone, identified as our own
 // first offer identifies it. That is under the tag 0 and in a BUNDLE group of
-// its own, or, when withoutBundle is set, with neither the tag nor the group.
+// its own, with the header extension of the tag mapped, or, when withoutBundle
+// is set, with none of the three.
 //
-// Both are an offerer's to write. The group is in "the first offer, within an
-// SDP session" of an offerer that "wants to negotiate a given BUNDLE group"
-// (RFC 8843 section 7.2), and an offerer that asks for none writes an SDP
-// without the grouping framework, where a stream needs no tag.
+// The group and the tag are an offerer's to write. The group is in "the first
+// offer, within an SDP session" of an offerer that "wants to negotiate a given
+// BUNDLE group" (RFC 8843 section 7.2), and an offerer that asks for none
+// writes an SDP without the grouping framework, where a stream needs no tag.
+// The extension is not: RFC 8843 section 9.1 has it enabled "in each bundled
+// RTP-based "m=" section in every offer and answer". See ownOfferMID.
 func ownOfferStreams(withoutBundle bool) offeredStreams {
 	if withoutBundle {
 		return offeredStreams{}
 	}
-	return offeredStreams{tags: []string{ownAudioTag}, bundle: bundledAudio{grouped: true}}
+	return offeredStreams{tags: []string{ownAudioTag}, bundle: bundledAudio{grouped: true}}.inOwnOffer()
 }
 
 // bundleGroupLines returns the session-level a=group lines of an SDP of ours
@@ -159,8 +164,9 @@ func (o offeredStreams) bundleGroupLines() []string {
 
 // bundledAudioLines returns the lines that identify the audio section of an
 // SDP of ours written around the stream list: its a=mid line, and the
-// a=extmap line of the tag's header extension when the offer mapped one. The
-// a=rtcp-mux-only line of an answer to a bundled offer that had it follows
+// a=extmap line of the tag's header extension, which an answer has when its
+// offer mapped one and an offer of ours whenever its audio stream is bundled.
+// The a=rtcp-mux-only line of an answer to a bundled offer that had it follows
 // them: see rtcpMuxOnlyLines.
 //
 // The a=mid line is the offer's (RFC 5888 section 9.1), and an audio stream
