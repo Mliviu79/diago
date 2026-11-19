@@ -3,6 +3,7 @@ package diago
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/emiago/diago/audio"
@@ -26,7 +27,7 @@ func TestIntegrationRecordingStereoWav(t *testing.T) {
 		RTPPacketWriter: media.NewRTPPacketWriter(nil, media.CodecAudioUlaw),
 	}
 
-	recordFile, err := os.OpenFile("/tmp/diago_test_record_stereo.wav", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
+	recordFile, err := os.OpenFile(filepath.Join(t.TempDir(), "record_stereo.wav"), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
 	require.NoError(t, err)
 	defer recordFile.Close()
 
