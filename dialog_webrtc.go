@@ -98,6 +98,7 @@ func (d *DialogWebrtc) Close() error {
 	rtpSess := d.rtpSession
 	sess := d.mediaSession
 	pendingSess := d.pendingMediaSession
+	jitter := d.jitterBuffer
 
 	d.closed = true
 	onClose := d.onClose
@@ -106,9 +107,12 @@ func (d *DialogWebrtc) Close() error {
 	d.pendingMediaSession = nil
 	d.mu.Unlock()
 
-	var hookErr, rtpErr, mediaErr, pendingErr error
+	var hookErr, jitterErr, rtpErr, mediaErr, pendingErr error
 	if onClose != nil {
 		hookErr = onClose()
+	}
+	if jitter != nil {
+		jitterErr = jitter.Close()
 	}
 	if rtpSess != nil {
 		rtpErr = rtpSess.MonitorClose()
@@ -119,7 +123,8 @@ func (d *DialogWebrtc) Close() error {
 	if pendingSess != nil && pendingSess != sess {
 		pendingErr = pendingSess.Close()
 	}
-	return errors.Join(hookErr, rtpErr, mediaErr, pendingErr)
+	// The sockets are closed, which fails the read the buffer's loop sits in.
+	return errors.Join(hookErr, jitterErr, rtpErr, mediaErr, pendingErr, awaitJitterBufferStopped(jitter))
 }
 
 func (d *DialogWebrtc) registerDialogCallbacks(c *dialogCallbacks) {
@@ -276,6 +281,7 @@ func (d *DialogWebrtc) commitCurrentMediaSession() {
 	if d.RTPPacketWriter != nil && d.rtpSession != nil && d.mediaSession != nil {
 		d.RTPPacketWriter.UpdateWriter(d.rtpSession, d.mediaSession.Codec())
 	}
+	d.followInPlaceUpdateUnsafe()
 	d.noteInstallUnsafe()
 	d.mu.Unlock()
 	d.mediaInstalled()
@@ -315,7 +321,7 @@ func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error
 		d.mu.Unlock()
 		return errors.Join(fmt.Errorf("carrying RTP deadlines to the new media session: %w", err), rtpSession.MonitorClose(), sess.Close())
 	}
-	reader.UpdateReader(rtpSession)
+	d.moveRTPReadsUnsafe(rtpSession)
 	writer.UpdateWriter(rtpSession, sess.Codec())
 	d.mediaSession = sess
 	d.rtpSession = rtpSession

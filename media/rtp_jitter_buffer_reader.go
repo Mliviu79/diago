@@ -72,6 +72,23 @@ func (j *RTPJitterBuffer) upstream() RTPReader {
 	return j.reader
 }
 
+// RTPAudioSession is an RTP session of this package that carries one
+// negotiated audio stream, the session a jitter buffer reads: an *RTPSession
+// and an *RTPSessionWebrtc.
+type RTPAudioSession interface {
+	RTPReader
+	// audioCodec returns the audio codec the session negotiated.
+	audioCodec() Codec
+}
+
+func (s *RTPSession) audioCodec() Codec {
+	return CodecAudioFromSession(s.Sess)
+}
+
+func (s *RTPSessionWebrtc) audioCodec() Codec {
+	return s.Sess.Codec()
+}
+
 // UpdateRTPSession moves the buffer onto rtpSess, the session a media update
 // installed in place of the one it reads. Playout paces by the packet duration
 // of its negotiated audio codec, and a buffer that learns packet durations
@@ -85,8 +102,8 @@ func (j *RTPJitterBuffer) upstream() RTPReader {
 // another payload type. The read continues under the read deadline StopRTP or
 // StartRTP last asked for. A previous reader that is no session of this
 // package finishes its read, or, if it fails, continues on rtpSess.
-func (j *RTPJitterBuffer) UpdateRTPSession(rtpSess *RTPSession) {
-	codec := CodecAudioFromSession(rtpSess.Sess)
+func (j *RTPJitterBuffer) UpdateRTPSession(rtpSess RTPAudioSession) {
+	codec := rtpSess.audioCodec()
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.moved = true

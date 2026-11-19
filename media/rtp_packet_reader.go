@@ -234,9 +234,9 @@ func resumeRead(reader RTPReader) {
 	case *RTPSession:
 		r.Sess.RestoreRTPReadDeadline()
 	case *MediaSessionWebrtc:
-		r.restoreRTPReadDeadline()
+		r.RestoreRTPReadDeadline()
 	case *RTPSessionWebrtc:
-		r.Sess.restoreRTPReadDeadline()
+		r.Sess.RestoreRTPReadDeadline()
 	}
 }
 

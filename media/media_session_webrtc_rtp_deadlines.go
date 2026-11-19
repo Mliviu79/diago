@@ -124,7 +124,7 @@ func (m *MediaSessionWebrtc) CarryRTPDeadlines(from *MediaSessionWebrtc) error {
 
 // interruptRTPRead ends a read waiting on the session's RTP stream with a
 // read deadline that has passed. The deadline is not recorded: it is not one
-// the application asked for, and restoreRTPReadDeadline puts the recorded one
+// the application asked for, and RestoreRTPReadDeadline puts the recorded one
 // back in its place before the stream is read again.
 func (m *MediaSessionWebrtc) interruptRTPRead() error {
 	mux, err := m.rtpDeadlineMux()
@@ -134,10 +134,17 @@ func (m *MediaSessionWebrtc) interruptRTPRead() error {
 	return mux.rtp.SetReadDeadline(time.Now())
 }
 
-// restoreRTPReadDeadline sets the RTP stream's read deadline to the one
+// RestoreRTPReadDeadline sets the RTP stream's read deadline to the one
 // StopRTP, StartRTP or SetRTPDeadline last asked for, which is none when none
 // of them did.
-func (m *MediaSessionWebrtc) restoreRTPReadDeadline() error {
+//
+// RTPPacketReader.UpdateReader ends a read waiting on the session with a read
+// deadline of its own, which stays on the stream until the read that takes
+// over replaces it. A caller that puts a reader of this same session in the
+// packet reader's place, as a jitter buffer over the session is, calls this
+// before that reader reads: its reads then go on, and a stop the application
+// set is still in force. Without a transport it returns an error.
+func (m *MediaSessionWebrtc) RestoreRTPReadDeadline() error {
 	mux, err := m.rtpDeadlineMux()
 	if err != nil {
 		return err

@@ -12,8 +12,8 @@ import (
 )
 
 // dialogWebrtcState is the state DialogWebrtc keeps beside its transport for
-// the media handle: the close latch, the media update callbacks and the count
-// of media installs. It is guarded by DialogWebrtc.mu.
+// the media handle: the close latch, the media update callbacks, the count
+// of media installs and the jitter buffer. It is guarded by DialogWebrtc.mu.
 type dialogWebrtcState struct {
 	// closeDone is made by the first Close and closed once that Close has
 	// released the media, so a Close made after it returns only then.
@@ -29,6 +29,11 @@ type dialogWebrtcState struct {
 	// that changes no ICE credentials is applied to the media session in
 	// place, so the session alone does not tell one install from the next.
 	installs uint64
+
+	// jitterBuffer is the buffer WithAudioReaderWebrtcJitterBuffer put in
+	// front of the packet reader, nil without one. Media updates move it
+	// and Close waits for its read loop.
+	jitterBuffer *media.RTPJitterBuffer
 }
 
 var _ MediaHandle = (*DialogWebrtc)(nil)
