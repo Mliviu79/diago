@@ -1099,13 +1099,21 @@ func (m *MediaSession) WriteRTCPDeadline(p rtcp.Packet, deadline time.Time) erro
 }
 
 // Use this to write Multi RTCP packets if they can fit in MTU=1500
+//
+// The packets go out as one compound packet, protected like WriteRTCP's.
 func (m *MediaSession) WriteRTCPs(pkts []rtcp.Packet) error {
 	if err := m.refuseUnkeyedWrite(); err != nil {
 		return err
 	}
+	for _, p := range pkts {
+		logRTCPWrite(m, p)
+	}
 	data, err := rtcpMarshal(pkts)
 	if err != nil {
 		return err
+	}
+	if m.localCtxSRTP != nil {
+		return m.writeSRTCP(data)
 	}
 
 	n, err := m.WriteRTCPRaw(data)
