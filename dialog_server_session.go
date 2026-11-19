@@ -430,8 +430,9 @@ func (d *DialogServerSession) Hangup(ctx context.Context) error {
 // ReInvite sends a re-INVITE based on the current media session, and has the
 // media take the answer. It waits, bounded by ctx, for a re-INVITE in progress
 // to end, and sends its own again when it is answered 491, after the wait RFC
-// 3261 section 14.1 gives. A 2xx without Contact, which is not acknowledged,
-// and a 2xx without SDP are errors, and leave the media as it was.
+// 3261 section 14.1 gives. A 2xx without Contact, which is acknowledged at the
+// remote target in place, and a 2xx without SDP are errors, and leave the
+// media as it was.
 func (d *DialogServerSession) ReInvite(ctx context.Context) error {
 	d.dialogCallbacks.mu.Lock()
 	mediaHanshaker := d.mediaHanshaker
