@@ -5,17 +5,19 @@ package diago
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/require"
 )
 
 // heldReInvites is a client that answers every request 200 without a
-// transport, the INVITE with peerSDP, and holds each INVITE after the first
-// until the test releases it.
+// transport, the INVITE with peerSDP, and holds the answer of each INVITE
+// after the first until the test releases it.
 type heldReInvites struct {
 	mu      sync.Mutex
 	log     []string
@@ -64,13 +66,41 @@ func (h *heldReInvites) onRequest(req *sip.Request) *sip.Response {
 	return res
 }
 
+// Request hands req over at once, as a transport does, and delivers the answer
+// of onRequest when it returns, so a held INVITE is in flight and unanswered.
+// Holding it inside the hand-off would hold the dialog's next request with
+// it: a dialog hands its requests over one at a time, in the order of their
+// CSeq numbers. An ACK has no transaction and is only shown to onRequest.
+func (h *heldReInvites) Request(_ context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	if req.IsAck() {
+		h.onRequest(req)
+		return nil, nil
+	}
+	key, err := sip.ClientTxKeyMake(req)
+	if err != nil {
+		return nil, err
+	}
+	tx := sip.NewClientTx(key, req, NewConnRecorder(), slog.Default())
+	if err := tx.Init(); err != nil {
+		return nil, err
+	}
+	go func() { tx.Receive(h.onRequest(req)) }()
+	return tx, nil
+}
+
 // newHeldReInviteDialog returns an outgoing call, invited, answered with
 // peerSDP and acknowledged, whose later INVITEs h holds, and the media its
 // Invite handed back.
 func newHeldReInviteDialog(t *testing.T) (*DialogClientSession, *DialogMedia, *heldReInvites) {
 	t.Helper()
 	h := newHeldReInvites()
-	dg := testDiagoClient(t, h.onRequest)
+	ua, err := sipgo.NewUA()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ua.Close() })
+	client, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	client.TxRequester = h
+	dg := NewDiago(ua, WithClient(client))
 	ctx := context.Background()
 	d, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, NewDialogOptions{})
 	require.NoError(t, err)

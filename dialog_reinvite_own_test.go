@@ -244,12 +244,19 @@ func (r *ackWithoutTransaction) Request(ctx context.Context, req *sip.Request) (
 // used on a clock the test controls.
 func newOfferingMediaClientCall(t *testing.T, onRequest func(*sip.Request) *sip.Response) (*DialogClientSession, *offeringMedia) {
 	t.Helper()
+	return newOfferingMediaClientCallOver(t, &ackWithoutTransaction{clientTxRequester{onRequest: onRequest}})
+}
+
+// newOfferingMediaClientCallOver is newOfferingMediaClientCall over a client
+// whose requests requester takes.
+func newOfferingMediaClientCallOver(t *testing.T, requester sipgo.ClientTransactionRequester) (*DialogClientSession, *offeringMedia) {
+	t.Helper()
 	ua, err := sipgo.NewUA()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ua.Close() })
 	client, err := sipgo.NewClient(ua)
 	require.NoError(t, err)
-	client.TxRequester = &ackWithoutTransaction{clientTxRequester{onRequest: onRequest}}
+	client.TxRequester = requester
 	dialogUA := &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "dg", Host: "127.0.0.1", Port: 5060}}}
 
 	sess, err := dialogUA.Invite(t.Context(), sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}, nil)
@@ -273,7 +280,7 @@ func newOfferingMediaClientCall(t *testing.T, onRequest func(*sip.Request) *sip.
 // drop the offer it staged.
 func TestDialogReInviteAnsweredAfterDialogEnded(t *testing.T) {
 	h := newHeldReInvites()
-	d, med := newOfferingMediaClientCall(t, h.onRequest)
+	d, med := newOfferingMediaClientCallOver(t, h)
 
 	reinvited := make(chan error, 1)
 	go func() { reinvited <- d.ReInvite(t.Context()) }()
