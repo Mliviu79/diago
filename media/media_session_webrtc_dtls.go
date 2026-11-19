@@ -11,6 +11,11 @@ type webrtcSessionState struct {
 	// can take the DTLS stream of the mux back from the DTLS stack once the
 	// keying material is exported.
 	dtlsTr *dtlsKeyExchangeConn
+
+	// remoteFingerprints is the fingerprint set of the remote description the
+	// DTLS association of this ICE generation was negotiated with, as
+	// fingerprintSet renders it.
+	remoteFingerprints []string
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is

@@ -74,6 +74,22 @@ func hasCheckableDTLSFingerprint(fingerprints []DTLSFingerprint) bool {
 	})
 }
 
+// fingerprintSet renders fingerprints as a sorted set that compares equal for
+// the same certificates however the SDP spelled them: hash function names and
+// hex digits are case insensitive (RFC 8122 section 5), and the order of the
+// attributes carries no meaning.
+func fingerprintSet(fingerprints []DTLSFingerprint) []string {
+	set := make([]string, 0, len(fingerprints))
+	for _, fp := range fingerprints {
+		if fp.Value == "" {
+			continue
+		}
+		set = append(set, strings.ToLower(fp.Algorithm)+" "+strings.ToUpper(fp.Value))
+	}
+	slices.Sort(set)
+	return slices.Compact(set)
+}
+
 // dtlsCertificateFingerprint returns the fingerprint of a DER certificate under
 // the given hash, formatted as a=fingerprint carries it: upper case hex octets
 // separated by colons.

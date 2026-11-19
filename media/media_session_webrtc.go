@@ -163,6 +163,9 @@ func (m *MediaSessionWebrtc) Init(
 	if len(conf.DTLS.Certificates) == 0 {
 		return fmt.Errorf("webrtc media session requires a DTLS certificate")
 	}
+	if err := conf.DTLS.checkCertificates(); err != nil {
+		return fmt.Errorf("webrtc media session: %w", err)
+	}
 	if len(m.Codecs) == 0 {
 		return fmt.Errorf("webrtc media session requires at least one codec")
 	}
@@ -336,7 +339,7 @@ func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte,
 }
 
 func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string) ([]byte, error) {
-	fingerprint, err := dtlsSHA256Fingerprint(m.Config.DTLS.Certificates[0])
+	fingerprints, err := m.localFingerprintLines()
 	if err != nil {
 		return nil, fmt.Errorf("DTLS certificate fingerprint: %w", err)
 	}
@@ -384,9 +387,9 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		"a="+mode,
 		"a=ice-ufrag:"+m.localUfrag,
 		"a=ice-pwd:"+m.localPwd,
-		"a=fingerprint:sha-256 "+fingerprint,
-		"a=setup:"+setup,
 	)
+	lines = append(lines, fingerprints...)
+	lines = append(lines, "a=setup:"+setup)
 	for _, codec := range codecs {
 		channels := ""
 		if codec.NumChannels > 1 {
@@ -441,13 +444,9 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	if !ok {
 		return fmt.Errorf("remote WebRTC SDP has no DTLS setup role")
 	}
-	fingerprintValue, ok := webRTCAttribute(desc.Attributes, md.Attributes, "fingerprint")
-	if !ok {
-		return fmt.Errorf("remote WebRTC SDP has no DTLS fingerprint")
-	}
-	fingerprintFields := strings.Fields(fingerprintValue)
-	if len(fingerprintFields) != 2 {
-		return fmt.Errorf("invalid remote DTLS fingerprint %q", fingerprintValue)
+	fingerprints, err := webRTCFingerprints(desc.Attributes, md.Attributes)
+	if err != nil {
+		return err
 	}
 
 	remoteCodecs, err := webRTCAudioCodecs(&desc, md)
@@ -524,8 +523,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		if ufragChanged {
 			return ErrWebRTCICERestart
 		}
-		if !strings.EqualFold(fingerprintFields[0], m.remoteFingerprintAlgorithm) ||
-			!strings.EqualFold(fingerprintFields[1], m.remoteFingerprint) {
+		if !m.continuesRemoteFingerprints(fingerprints) {
 			return fmt.Errorf("remote DTLS fingerprint changed without an ICE restart")
 		}
 		if !offered && remoteSetup == "actpass" {
@@ -553,8 +551,9 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	}
 	m.remoteUfrag = remoteUfrag
 	m.remotePwd = remotePwd
-	m.remoteFingerprintAlgorithm = fingerprintFields[0]
-	m.remoteFingerprint = fingerprintFields[1]
+	m.remoteFingerprintAlgorithm = fingerprints[0].Algorithm
+	m.remoteFingerprint = fingerprints[0].Value
+	m.remoteFingerprints = fingerprintSet(fingerprints)
 	m.rtcpReducedSize = remoteRTCPReducedSize
 	m.filterCodecs = common
 	m.Codecs = slices.Clone(common)
@@ -580,10 +579,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.mux = newWebRTCPacketMux(conn)
 
 	m.localSetup = localSetup
-	dtlsConf := m.Config.DTLS.ToLibConf([]DTLSFingerprint{{
-		Algorithm: fingerprintFields[0],
-		Value:     fingerprintFields[1],
-	}})
+	dtlsConf := m.Config.DTLS.ToLibConf(fingerprints)
 	dtlsTr := m.dtlsTransport()
 	if localDTLSClient {
 		m.dtlsConn, err = dtls.Client(dtlsTr, conn.RemoteAddr(), dtlsConf)
