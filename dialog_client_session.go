@@ -691,10 +691,13 @@ func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Reque
 	}
 
 	offered = true
-	if err := mediaHanshaker.onRemoteSDP(d.Context(), req.Body(), false); err != nil {
+	offer := reInviteOffer(req)
+	if err := mediaHanshaker.onRemoteSDP(d.Context(), offer, false); err != nil {
 		return d.refusePeerReInvite(ctx, req, tx, err)
 	}
-	localSDP, err := mediaHanshaker.onLocalSDP(d.Context(), true, "")
+	// A re-INVITE without an offer asks for ours: the 2xx carries it, and
+	// the ACK to that 2xx the answer (RFC 3261 section 14.2).
+	localSDP, err := mediaHanshaker.onLocalSDP(d.Context(), offer != nil, "")
 	if err != nil {
 		return d.refusePeerReInvite(ctx, req, tx, err)
 	}
@@ -717,11 +720,14 @@ func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Reque
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
 	// A copy of an ACK already read, sent for a retransmission of our 2xx,
 	// brings the media nothing more.
-	ackHandled, first := d.ackPeerReInvite(req)
+	ackHandled, first, answerDue := d.ackPeerReInvite(req)
 	if !first {
 		return nil
 	}
 	defer ackHandled()
+	if answerDue {
+		return d.readReInviteAnswerAck(req)
+	}
 
 	mediaHanshaker := d.mediaHanshakerLocked()
 	if mediaHanshaker == nil {

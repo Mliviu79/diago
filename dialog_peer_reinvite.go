@@ -25,6 +25,9 @@ type pendingReInvite struct {
 	// remoteTarget is where the dialog keeps its remote target, which the 2xx
 	// to the re-INVITE moves.
 	remoteTarget *dialogCallbacks
+	// answerInAck is set for a re-INVITE that carries no offer: our 2xx
+	// carries the offer, and the ACK to it the answer (RFC 3261 section 14.2).
+	answerInAck bool
 	// answered is set once the re-INVITE has its final response.
 	answered bool
 	// acked is made when a 2xx is sent, and closed once its ACK is read.
@@ -80,7 +83,7 @@ func (s *sessionState) beginPeerReInvite(ctx context.Context, dialog *sipgo.Dial
 		res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
 		return true, tx.Respond(ctx, res)
 	}
-	p := &pendingReInvite{req: req, tx: tx, dialog: dialog, remoteTarget: remoteTarget}
+	p := &pendingReInvite{req: req, tx: tx, dialog: dialog, remoteTarget: remoteTarget, answerInAck: reInviteOffer(req) == nil}
 	if cseq := req.CSeq(); cseq != nil {
 		p.cseq = cseq.SeqNo
 	}
@@ -142,24 +145,28 @@ func (s *sessionState) endPeerReInvite(tx sip.ServerTransaction) (acked bool, er
 // the first did not, and the caller hands the media nothing for it. An ACK
 // that belongs to no re-INVITE being handled is reported as a first one, with
 // a handled that does nothing.
-func (s *sessionState) ackPeerReInvite(ack *sip.Request) (handled func(), first bool) {
+//
+// answerDue is set for the first ACK to a 2xx that carried our offer, the
+// re-INVITE having carried none: this ACK, which carries the CSeq of that
+// re-INVITE, is the one that carries the answer.
+func (s *sessionState) ackPeerReInvite(ack *sip.Request) (handled func(), first, answerDue bool) {
 	cseq := ack.CSeq()
 	if cseq == nil {
-		return func() {}, true
+		return func() {}, true, false
 	}
 	s.answerMu.Lock()
 	defer s.answerMu.Unlock()
 	p := s.peerReInvite
 	if p == nil || p.acked == nil || p.cseq != cseq.SeqNo {
-		return func() {}, true
+		return func() {}, true, false
 	}
 	if p.ackHandled != nil {
-		return func() {}, false
+		return func() {}, false, false
 	}
 	close(p.acked)
 	ackHandled := make(chan struct{})
 	p.ackHandled = ackHandled
-	return func() { close(ackHandled) }, true
+	return func() { close(ackHandled) }, true, p.answerInAck
 }
 
 // retransmitReInvite2xx passes res, the 2xx sent to the re-INVITE p, to the

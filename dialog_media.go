@@ -76,6 +76,11 @@ type DialogMedia struct {
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
 
+	// offerRequested is set while the peer's request has brought no session
+	// description and so asks for our offer, until that offer is made. See
+	// noteOfferRequest.
+	offerRequested bool
+
 	// releaseRTPPort returns this dialog RTP port to the allocator that handed
 	// it out. Nil when no allocator is installed, as the OS takes the port back
 	// when the socket closes. Set next to mediaSession and consumed by Close.
@@ -343,11 +348,13 @@ func (d *DialogMedia) registerDialogCallbacks(c *dialogCallbacks) {
 	defer c.mu.Unlock()
 
 	c.mediaHanshaker = d
+	c.onMediaFailure = d.abortPendingMediaSession
 	c.onClose = append(c.onClose, d.Close)
 }
 
 func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
 	if remoteSDP == nil {
+		d.noteOfferRequest(offered)
 		return nil
 	}
 
@@ -357,6 +364,10 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 		// this exchange installed.
 		d.mu.Unlock()
 		return errMediaClosed
+	}
+	if d.mediaSession == nil {
+		d.mu.Unlock()
+		return errNoMediaSession
 	}
 	if !offered && d.awaitsFirstExchangeUnsafe() {
 		// The call's first offer: there is nothing running to update.
@@ -396,6 +407,7 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	requested := d.takeOfferRequestUnsafe()
 	if d.closed {
 		// Nothing is described, and for an offer of ours nothing forked, on
 		// media that is closed.
@@ -420,6 +432,10 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 		ms.Mode = mode
 	}
 	d.pendingMediaSession = ms
+	if requested {
+		// The peer asked for this offer: it renegotiates nothing.
+		return negotiatedOffer(ms, d.mediaSession), nil
+	}
 	return ms.LocalSDP(false), nil
 }
 
