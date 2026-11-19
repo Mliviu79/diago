@@ -168,6 +168,11 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 }
 
 func (d *DialogClientSession) invite(ctx context.Context, med *DialogMedia, opts InviteClientOptions) error {
+	return d.inviteWith(ctx, med, opts, d.DialogClientSession.WaitAnswer)
+}
+
+// inviteWith is invite, waiting for the INVITE's answer with wait.
+func (d *DialogClientSession) inviteWith(ctx context.Context, med *DialogMedia, opts InviteClientOptions, wait inviteAnswerWait) error {
 	sess := med.mediaSession
 	inviteReq := d.InviteRequest
 	originator := opts.Originator
@@ -263,10 +268,10 @@ func (d *DialogClientSession) invite(ctx context.Context, med *DialogMedia, opts
 	}
 
 	if opts.EarlyMediaDetect {
-		return d.waitAnswerEarly(ctx, med, ansOpts)
+		return d.waitAnswerEarly(ctx, med, ansOpts, wait)
 	}
 
-	return d.waitAnswer(ctx, med, ansOpts)
+	return d.waitAnswerWith(ctx, med, ansOpts, wait)
 }
 
 func (d *DialogClientSession) doInvite(ctx context.Context, sd []byte) error {
@@ -311,7 +316,7 @@ func (d *DialogClientSession) WaitAnswer(ctx context.Context, med *DialogMedia, 
 	return d.waitAnswer(ctx, med, opts)
 }
 
-func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
+func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
 	sess := med.mediaSession
 	onResps := opts.OnResponse
 
@@ -364,11 +369,16 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 
 		return ErrClientEarlyMedia
 	}
-	return d.waitAnswer(ctx, med, opts)
+	return d.waitAnswerWith(ctx, med, opts, wait)
 }
 
 func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions) error {
-	if err := d.DialogClientSession.WaitAnswer(ctx, opts); err != nil {
+	return d.waitAnswerWith(ctx, med, opts, d.DialogClientSession.WaitAnswer)
+}
+
+// waitAnswerWith is waitAnswer, waiting for the INVITE's answer with wait.
+func (d *DialogClientSession) waitAnswerWith(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
+	if err := wait(ctx, opts); err != nil {
 		return err
 	}
 
