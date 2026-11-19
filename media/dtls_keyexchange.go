@@ -61,7 +61,7 @@ func (c *dtlsKeyExchangeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(p)
 	// A DTLS record by its first byte (RFC 7983 section 7), as against media
 	// the peer sends on the same socket.
-	if n > 0 && p[0] >= 20 && p[0] <= 63 {
+	if isDTLS(p[:n]) {
 		c.mu.Lock()
 		c.heard = true
 		c.hello = nil
