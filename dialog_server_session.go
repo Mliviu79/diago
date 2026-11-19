@@ -115,7 +115,7 @@ func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMe
 			return errors.Join(err, med.Close())
 		}
 		med.registerDialogCallbacks(&d.dialogCallbacks)
-		return rtpSess.MonitorBackground()
+		return rtpSess.MonitorBackgroundContext(d.Context())
 	}()
 	return med, err
 }
@@ -143,7 +143,7 @@ func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt Prog
 		return errors.Join(err, med.Close())
 	}
 	med.registerDialogCallbacks(&d.dialogCallbacks)
-	return rtpSess.MonitorBackground()
+	return rtpSess.MonitorBackgroundContext(d.Context())
 }
 
 func (d *DialogServerSession) Ringing(ctx context.Context) error {
@@ -311,7 +311,7 @@ func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTP
 	}
 
 	// Must be called after media and reader writer is setup
-	return rtpSess.MonitorBackground()
+	return rtpSess.MonitorBackgroundContext(d.Context())
 }
 
 // AnswerLate answers an INVITE that carried no offer: its 2xx carries our
@@ -352,7 +352,7 @@ func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 		return nil, err
 	}
 	// Must be called after media and reader writer is setup
-	return m, rtpSess.MonitorBackground()
+	return m, rtpSess.MonitorBackgroundContext(d.Context())
 }
 
 // ReadAck reads an ACK to a 2xx of ours. The ACK to the 2xx that answered the
