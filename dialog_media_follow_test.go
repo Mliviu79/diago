@@ -360,6 +360,9 @@ func TestDialogMediaRingtoneKeepsReads(t *testing.T) {
 	p := newFollowPeer(t)
 	ringtone, err := p.d.PlaybackRingtoneCreate()
 	require.NoError(t, err)
+	// The ring goes out at once, so the ringtone is between rings as soon as
+	// the peer has it.
+	p.d.RTPPacketWriter.ClockDisable()
 
 	ar, err := p.d.AudioReader()
 	require.NoError(t, err)
@@ -372,9 +375,7 @@ func TestDialogMediaRingtoneKeepsReads(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded, "the ringtone cleared the read deadline")
 	require.NoError(t, p.d.StartRTP(1, 0))
 
-	// A ring is 2 s of PCMU in 20 ms frames, which go out at the packet
-	// writer's pace. The ringtone is between rings once the peer has the last
-	// of them.
+	// A ring is 2 s of PCMU in 20 ms frames.
 	for i := 0; i < 100; i++ {
 		p.recv(t)
 	}

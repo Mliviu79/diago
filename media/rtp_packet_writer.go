@@ -34,6 +34,10 @@ type RTPPacketWriter struct {
 	mu          sync.RWMutex
 	writer      RTPWriter
 	clockTicker *time.Ticker
+	// clockStopped is closed when ClockDisable stops clockTicker, so a Write
+	// waiting on that ticker returns. clockTicker paces Write at the codec
+	// sample duration and is nil while the clock is disabled.
+	clockStopped chan struct{}
 
 	// After each write packet header is saved for more reading
 	PacketHeader rtp.Header
@@ -77,7 +81,7 @@ func NewRTPPacketWriter(writer RTPWriter, codec Codec) *RTPPacketWriter {
 	}
 
 	w.nextTimestamp = w.initTimestamp
-	w.clockReset()
+	w.clockStart()
 	return &w
 }
 
@@ -93,16 +97,19 @@ func NewRTPPacketWriterSession(sess *RTPSession) *RTPPacketWriter {
 	return w
 }
 
+// clockReset takes the timestamp step and the sample duration of the codec,
+// restarting the clock at that duration unless it is disabled.
 func (w *RTPPacketWriter) clockReset() {
 	cod := w.codec
 	w.sampleRateTimestamp = cod.SampleTimestamp()
 	if w.clockTicker != nil {
 		w.clockTicker.Reset(cod.SampleDur)
-	} else {
-		w.clockTicker = time.NewTicker(cod.SampleDur)
 	}
 }
 
+// ClockDisable stops pacing: Write no longer waits for the sample duration, and
+// a Write waiting for it returns. The caller then paces the writes. The clock
+// stays disabled across UpdateRTPSession and UpdateWriter until ClockEnable.
 func (w *RTPPacketWriter) ClockDisable() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -110,17 +117,21 @@ func (w *RTPPacketWriter) ClockDisable() {
 		return
 	}
 	w.clockTicker.Stop()
+	close(w.clockStopped)
 	w.clockTicker = nil
+	w.clockStopped = nil
 }
 
+// ClockEnable paces Write at the codec sample duration again.
 func (w *RTPPacketWriter) ClockEnable() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.clockReset()
+	w.clockStart()
 }
 
 // ResetTimestamp can mark new stream comming. If stream is continuous it will add timestamp difference
-// MUST Not be called during stream Write
+// It is safe to call while another stream writes, as a playback starting on a
+// dialog another one plays on does.
 func (p *RTPPacketWriter) ResetTimestamp() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -153,21 +164,24 @@ func (p *RTPPacketWriter) DelayTimestamp(ofsset uint32) {
 // Write implements io.Writer and does payload RTP packetization
 // Media clock rate is determined
 // For more control or dynamic payload WriteSamples can be used
-// It is not thread safe and order of payload frames is required
+// Order of payload frames is required. Writes from several goroutines are
+// packetized one at a time, each packet with a sequence number of its own, and
+// interleave on the wire.
 func (p *RTPPacketWriter) Write(b []byte) (int, error) {
-	p.mu.RLock()
+	p.mu.Lock()
 	n, err := p.writeSamplesUnsafe(p.writer, b, p.sampleRateTimestamp, p.nextTimestamp == p.initTimestamp, p.codec.PayloadType)
-	p.mu.RUnlock()
-	p.lastSampleTime = <-p.clockTicker.C
+	ticker, stopped := p.clockTicker, p.clockStopped
+	p.mu.Unlock()
+	p.awaitSampleTime(ticker, stopped)
 	return n, err
 }
 
 // WriteSamples allows to skip default packet rate.
 // This is useful if you need to write different payload but keeping same SSRC
 func (p *RTPPacketWriter) WriteSamples(payload []byte, sampleRateTimestamp uint32, marker bool, payloadType uint8) (int, error) {
-	p.mu.RLock()
+	p.mu.Lock()
 	n, err := p.writeSamplesUnsafe(p.writer, payload, sampleRateTimestamp, marker, payloadType)
-	p.mu.RUnlock()
+	p.mu.Unlock()
 	return n, err
 }
 
