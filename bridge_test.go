@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -247,11 +248,27 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		},
 	))
 
-	bridge := NewBridgeMix()
-	dialogExit := make(chan string, 10)
+	// Subtests replace the bridge while the server keeps running. The handler
+	// runs on a server goroutine, so it loads the bridge through an atomic
+	// pointer that a subtest stores only once the bridge is fully configured.
+	var currentBridge atomic.Pointer[BridgeMix]
+	currentBridge.Store(NewBridgeMix())
+	// Each handler hands the test the error of its join or of its leave
+	dialogExit := make(chan error, 10)
+	waitDialogExit := func(t *testing.T) {
+		t.Helper()
+		select {
+		case err := <-dialogExit:
+			assert.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a call handler did not return")
+		}
+	}
 	log := asyncLog(t)
 	err := serveBackground(t, tu, ctx, func(ctx context.Context, in *DialogServerSession) {
-		defer func() { dialogExit <- in.ID }()
+		var exitErr error
+		defer func() { dialogExit <- exitErr }()
+		bridge := currentBridge.Load()
 
 		in.Trying(ctx)
 		in.Ringing(ctx)
@@ -265,12 +282,18 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		// Add us in bridge
 		log("Adding into bridge", in.ID)
 		if err := bridge.AddDialogMedia(med); err != nil {
-			log("Adding dialog in bridge failed", err)
+			// A subtest hangs its calls up as soon as they are answered, so a
+			// call can end before its handler joins it, which refuses the join
+			if in.LoadState() != sip.DialogStateEnded {
+				exitErr = fmt.Errorf("adding %s into bridge: %w", in.ID, err)
+			}
 			return
 		}
 		defer func() {
 			log("Removing from bridge", in.ID)
-			bridge.RemoveDialogMedia(med)
+			if err := bridge.RemoveDialogMedia(med); err != nil {
+				exitErr = fmt.Errorf("removing %s from bridge: %w", in.ID, err)
+			}
 		}()
 
 		<-in.Context().Done()
@@ -302,8 +325,9 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		}
 
 		for range len(dialogs) {
-			<-dialogExit
+			waitDialogExit(t)
 		}
+		bridge := currentBridge.Load()
 		assert.Equal(t, 0, len(bridge.medias))
 		assert.EqualValues(t, 0, bridge.stateRead())
 	})
@@ -321,7 +345,7 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		dialogsCreated := 0
 		defer func() {
 			for range dialogsCreated {
-				<-dialogExit
+				waitDialogExit(t)
 			}
 		}()
 
@@ -333,8 +357,9 @@ func TestIntegrationBridgingMix(t *testing.T) {
 
 		// Make number of calls that will have audio mixed in bridge
 		// wg := sync.WaitGroup{}
-		bridge = NewBridgeMix()
-		bridge.WaitDialogsNum = 2 // Do not start mixing until all 3 get joined, otherwise there will be no gurantee when something is mixed
+		bridge := NewBridgeMix()
+		bridge.WaitDialogsNum = 2 // Do not start mixing until both dialogs get joined, otherwise there will be no guarantee when something is mixed
+		currentBridge.Store(bridge)
 
 		dialog1, med1, err := dg.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 5090}, InviteOptions{})
 		require.NoError(t, err)

@@ -51,13 +51,32 @@ type BridgeMix struct {
 
 	mixWG    sync.WaitGroup
 	mixState int
+	// mixStopped is closed when the stop that set mixState to 2 has finished
+	mixStopped chan struct{}
+	// mixCodec is the audio of the last mix started, zero once the bridge is
+	// empty
+	mixCodec media.Codec
+	// streamCodecs is the codec the running mix decodes and encodes each
+	// media with, and nil while no mix runs
+	streamCodecs map[*DialogMedia]media.Codec
+	// unhooks removes the media update hook of each media in the bridge
+	unhooks map[*DialogMedia]func()
 
 	// WaitDialogsNum is just helper flag when to start proxy
 	WaitDialogsNum int
 	// RealtimeReader is almost always nesessary if you are delaying audio streaming(mixing) in bridge
 	RealtimeReader bool
-	Poll           bool
-	log            *slog.Logger
+	// RealtimeReaderPerMix has each mix read a media through a realtime reader
+	// of its own, which is never set on the media: the media leaves the bridge
+	// with the audio reader it joined with, and a mix judges a frame late only
+	// against frames it has read itself.
+	//
+	// By default the realtime reader is set on the media as its audio reader.
+	// It stays there once the media has left the bridge, and every later mix
+	// reads through it.
+	RealtimeReaderPerMix bool
+	Poll                 bool
+	log                  *slog.Logger
 }
 
 var (
@@ -101,12 +120,19 @@ func (b *BridgeMix) String() string {
 
 // DialogMediaList returns list of medias in bridge.
 // It is not safe to use media until it is removed from bridge.
+// A media that a re-INVITE moved to audio the bridge can not mix with the
+// others is taken out of the bridge at the next join, leave or codec change.
 func (b *BridgeMix) DialogMediaList() []*DialogMedia {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return slices.Clone(b.medias)
 }
 
+// AddDialogMedia adds m to the bridge and mixes its audio with that of the
+// medias already in it. A media that can not join is refused with an error and
+// the others keep being mixed: one without a media session, with
+// ErrNoMediaSetup, one that is in the bridge already, and one whose audio
+// differs from the mix in sample rate or frame duration.
 func (b *BridgeMix) AddDialogMedia(m *DialogMedia) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -114,19 +140,41 @@ func (b *BridgeMix) AddDialogMedia(m *DialogMedia) error {
 	if m == nil {
 		return fmt.Errorf("dialog media is nil")
 	}
+	// The mix reads the media's codec from its media session
+	if m.MediaSession() == nil {
+		return fmt.Errorf("dialog media has no media session: %w", ErrNoMediaSetup)
+	}
 
 	// Stop any current mixing
 	b.log.Debug("Stoping mix")
 	if err := b.mixStopWait(); err != nil {
+		// The join is refused, and the medias already here keep being mixed.
+		b.mixStart()
 		return fmt.Errorf("failed to stop current mixing: %w", err)
 	}
 
+	// A media is in the bridge once: twice, two streams would read it at
+	// once. This is checked after the stop, which lets another join run
+	// meanwhile.
+	if slices.Contains(b.medias, m) {
+		b.mixStart()
+		return fmt.Errorf("dialog media is already in the bridge")
+	}
+
 	b.medias = append(b.medias, m)
+	b.hookUnsafe(m)
 	b.log.Debug("Added media", "total", len(b.medias))
-	b.mixStart()
+	if err := b.mixStart()[m]; err != nil {
+		// The media can not be mixed with the others. The join is refused: the
+		// media is out of the bridge again, and the others are mixed.
+		return err
+	}
 	return nil
 }
 
+// RemoveDialogMedia takes m out of the bridge and mixes the medias left. The
+// mix has stopped reading m when it returns. m leaves even when stopping the
+// mix reports an error, which is then returned.
 func (b *BridgeMix) RemoveDialogMedia(m *DialogMedia) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -144,26 +192,25 @@ func (b *BridgeMix) RemoveDialogMedia(m *DialogMedia) error {
 
 	b.log.Debug("Stoping mix")
 
-	if err := b.mixStopWait(); err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
+	// The media leaves even when stopping the mix reports an error. Kept in
+	// the bridge, it would be in every later mix.
+	stopErr := b.mixStopWait()
+	if stopErr != nil {
+		stopErr = fmt.Errorf("failed to stop current mixing: %w", stopErr)
 	}
 
 	// NOTE: mixStopWait unlocks so we can not do any update before
 	for i, bm := range b.medias {
 		if bm == m {
 			b.medias = append(b.medias[:i], b.medias[i+1:]...)
+			b.unhookUnsafe(m)
 			break
 		}
 	}
 
 	b.log.Debug("Removed media", "total", len(b.medias))
-	return b.mixStart()
-}
-
-func (b *BridgeMix) stateWrite(s int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stateWriteUnsafe(s)
+	b.mixStart()
+	return stopErr
 }
 
 func (b *BridgeMix) stateWriteUnsafe(s int) {
@@ -178,70 +225,151 @@ func (b *BridgeMix) stateRead() int {
 
 func (b *BridgeMix) mixStopWait() error {
 	// DO NOT CALL THIS INSIDE LOOP of b.dialogs. This Unlocks
-	stopInProgress, err := b.mixStop()
-	if err != nil {
-		return fmt.Errorf("failed to stop current mixing: %w", err)
-	}
-
-	if stopInProgress {
+	// A stop another caller started is waited for. Until it has finished, the
+	// mix it stops may still be reading the medias.
+	for b.mixState == 2 {
+		stopped := b.mixStopped
 		b.mu.Unlock()
-		b.mixWG.Wait()
+		<-stopped
 		b.mu.Lock()
 	}
-	// Enable RTP again
-	var allErros error
+
+	// This caller sets the stopping state, so it clears it once the stopped
+	// mix has drained, even when stopping reported an error.
+	stopErr := b.mixStop()
+	b.mu.Unlock()
+	b.mixWG.Wait()
+	b.mu.Lock()
+	b.stateWriteUnsafe(0)
+	close(b.mixStopped)
+
+	// Enable RTP again, on every media even when stopping reported an error,
+	// so no media is left with its reads stopped.
+	var startErr error
 	for _, m := range b.medias {
 		err := m.StartRTP(1, 0) // Start reading
-		errors.Join(allErros, err)
+		startErr = errors.Join(startErr, bridgeRTPControlErr(err))
+	}
+	return errors.Join(stopErr, startErr)
+}
+
+// mixStop stops reads on every media, whether or not a mix loop is running:
+// a loop that ended on its own may have left its readers reading them.
+func (b *BridgeMix) mixStop() error {
+	b.mixState = 2 // Set it stoping in progress
+	b.mixStopped = make(chan struct{})
+	var allErros error
+	for _, m := range b.medias {
+		err := m.StopRTP(1, 0) // Stop reading
+		allErros = errors.Join(allErros, bridgeRTPControlErr(err))
 	}
 	return allErros
 }
 
-func (b *BridgeMix) mixStop() (bool, error) {
-	if state := b.mixState; state != 1 {
-		// Only if state is running this goroutine can stop it
-		return false, nil
-	}
-	b.mixState = 2 // Set it stoping in progress
-	var allErros error
-	for _, m := range b.medias {
-		err := m.StopRTP(1, 0) // Stop reading
-		errors.Join(allErros, err)
-	}
-	return true, allErros
-}
-
-func (b *BridgeMix) mixStart() error {
+// mixStart starts mixing the medias in the bridge. The mix neither resamples
+// nor reframes, so it runs at one sample rate and frame duration: those of the
+// last mix while a media still has them, since a re-INVITE can move a media
+// to other audio, and otherwise those of the first media. A media whose audio
+// differs, or can not be mixed at all, is taken out of the bridge and the
+// others are mixed. mixStart returns why each media it took out could not be
+// mixed.
+func (b *BridgeMix) mixStart() (notMixed map[*DialogMedia]error) {
 	if b.mixState == 2 {
 		// A stop is in progress (another goroutine is in mixStopWait).
 		// Don't start a new mix to avoid WaitGroup Add/Wait race.
 		return nil
 	}
+	b.streamCodecs = nil
 	if len(b.medias) < 1 {
+		b.mixCodec = media.Codec{}
 		return nil
 	}
 	if len(b.medias) < b.WaitDialogsNum {
 		return nil
 	}
 
+	codecs := make([]media.Codec, len(b.medias))
+	for i, m := range b.medias {
+		p := MediaProps{}
+		m.audioReaderProps(&p)
+		codecs[i] = p.Codec
+	}
+	mixCodec := b.mixCodec
+	if !slices.ContainsFunc(codecs, func(c media.Codec) bool { return bridgeSameAudio(c, mixCodec) }) {
+		mixCodec = codecs[0]
+	}
+
+	notMixed = map[*DialogMedia]error{}
+	streamCodecs := map[*DialogMedia]media.Codec{}
+	var rwStreams []*bridgePCMStream
+	for _, m := range b.medias {
+		stream := &bridgePCMStream{}
+		if err := b.addDialogStream(m, stream, mixCodec); err != nil {
+			notMixed[m] = err
+			continue
+		}
+		rwStreams = append(rwStreams, stream)
+		streamCodecs[m] = stream.codec
+	}
+	for m, err := range notMixed {
+		b.log.Warn("Dialog can not be mixed, taking it out of the bridge", "error", err)
+		b.unhookUnsafe(m)
+	}
+	b.medias = slices.DeleteFunc(b.medias, func(m *DialogMedia) bool {
+		_, out := notMixed[m]
+		return out
+	})
+	if len(b.medias) < 1 {
+		b.mixCodec = media.Codec{}
+		return notMixed
+	}
+	if len(b.medias) < b.WaitDialogsNum {
+		return notMixed
+	}
+	b.mixCodec = mixCodec
+	b.streamCodecs = streamCodecs
+
 	ctx, cancelPoll := context.WithCancel(context.Background())
 	// We could decide and optimize here, poll vs deadlines
 	poll := b.Poll
-	rwStreams, err := func() ([]*bridgePCMStream, error) {
-		rwStreams := make([]*bridgePCMStream, len(b.medias))
-		firstDialogCodec := media.Codec{}
 
-		for i, m := range b.medias {
-			rwStreams[i] = &bridgePCMStream{}
-			if err := b.addDialogStream(ctx, m, rwStreams[i], &firstDialogCodec, poll); err != nil {
-				return nil, err
-			}
+	// Readers start once every stream is set up, so a stream that can not be
+	// mixed leaves no reader behind.
+	if poll {
+		for _, stream := range rwStreams {
+			// We do buffering because initial packet can be read oner than actual mixing has started
+			b.mixWG.Add(1)
+			bridgeTrace("poll: starting stream", "stream.id", stream.id)
+			go func(s *bridgePCMStream) {
+				defer b.mixWG.Done()
+
+				bufPtr := bridgeReadPool.Get().(*[]byte)
+				defer bridgeReadPool.Put(bufPtr)
+
+				defer close(s.pipeWrite)
+
+				buf := *bufPtr
+				for {
+					n, err := s.r.Read(buf)
+					if err != nil {
+						bridgeTrace("poll: stopped with error", "error", err, "stream.id", s.id)
+						return
+					}
+
+					select {
+					case s.pipeWrite <- buf[:n]:
+						nw := <-s.pipeRead
+						if nw != n {
+							// there is no reason this to happen, so lets panic
+							panic("reading from pipe was not full")
+						}
+					case <-ctx.Done():
+						bridgeTrace("poll: stream context canceled", "stream.id", s.id)
+						return
+					}
+				}
+			}(stream)
 		}
-		return rwStreams, nil
-	}()
-	if err != nil {
-		cancelPoll()
-		return err
 	}
 
 	// Start new mix
@@ -250,16 +378,16 @@ func (b *BridgeMix) mixStart() error {
 	go func(rwStreams []*bridgePCMStream) {
 		defer cancelPoll()
 		defer b.mixWG.Done()
-		defer b.stateWrite(0)
+		defer b.mixEnded()
 		b.log.Debug("Starting mix loop", "streams.len", len(rwStreams))
-		if err := b.mixLoop(rwStreams, poll); err != nil {
+		if err := b.mixLoop(rwStreams, poll, mixCodec.SampleDur); err != nil {
 			b.log.Info("Mix stopped with error", "error", err)
 		}
 	}(rwStreams)
-	return nil
+	return notMixed
 }
 
-func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool) error {
+func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur time.Duration) error {
 	mixBuf := make([]byte, media.RTPBufSize)
 
 	if len(rwStreams) == 1 {
@@ -282,22 +410,27 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool) error {
 		return nil
 	}
 
-	// Currently we consider that sample clock is done by Audio Writers
-	// The slowest will cause jitter.
-	// TODO fix this with single ticker
-	for {
+	// A round starts every frame duration, on one ticker, so a reader holding a
+	// frame hands it over within a frame duration. That stays inside what the
+	// realtime reader allows before it drops a frame as late. A round that the
+	// writers pace past its tick is followed at once by the next.
+	ticker := time.NewTicker(frameDur)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
 		n, err := b.mixAllStreams(rwStreams, mixBuf, poll)
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			bridgeTrace("Nothing read, delaying read")
-			time.Sleep(50 * time.Millisecond)
+			bridgeTrace("Nothing read, waiting for the next round")
 			continue
 		}
 
-		// broadcast to all
+		// broadcast to all, except the streams dropped from the mix
 		for i, w := range rwStreams {
+			if w.markGone {
+				continue
+			}
 			streamBuf := mixBuf[:n]
 			if w.n > 0 {
 				readBuf := w.buf
@@ -320,17 +453,30 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool) error {
 					continue
 
 				}
-				return err
+				// A media that is closed, as a BYE closes it before its
+				// handler leaves the bridge, is dropped from the mix. Any other
+				// failure loses this frame for this media alone. Either way the
+				// others keep being mixed.
+				if errors.Is(err, net.ErrClosed) {
+					b.log.Debug("Dropping stream with closed media from mix", "stream.id", w.id, "error", err)
+					w.markGone = true
+					continue
+				}
+				b.log.Debug("Writing stream failed", "stream.id", w.id, "error", err)
 			}
 		}
 	}
 }
 
 type bridgePCMStream struct {
-	id           uint32
-	r            io.Reader
-	w            io.Writer
-	mediaSession *media.MediaSession
+	id uint32
+	r  io.Reader
+	w  io.Writer
+	// codec is the media's codec the stream decodes and encodes
+	codec media.Codec
+	// media is the dialog's media, whose current session a direct read sets its
+	// deadline on
+	media *DialogMedia
 	// read buf
 	buf []byte
 	n   int
@@ -340,18 +486,16 @@ type bridgePCMStream struct {
 	markGone  bool
 }
 
-func (b *BridgeMix) addDialogStream(ctx context.Context, m *DialogMedia, stream *bridgePCMStream, firstDialogCodec *media.Codec, poll bool) error {
+func (b *BridgeMix) addDialogStream(m *DialogMedia, stream *bridgePCMStream, mixCodec media.Codec) error {
+	// The reader, the writer and their codec are read together, so a re-INVITE
+	// can not give the stream's decoder and encoder different codecs.
 	p := MediaProps{}
-	r, err := m.AudioReader(WithAudioReaderMediaProps(&p))
+	r, w, err := m.audioReaderWriterProps(&p)
 	if err != nil {
 		return err
 	}
 
-	if firstDialogCodec.SampleRate == 0 {
-		firstDialogCodec = &p.Codec
-	}
-
-	if firstDialogCodec.SampleRate != p.Codec.SampleRate && firstDialogCodec.SampleDur != p.Codec.SampleDur {
+	if !bridgeSameAudio(p.Codec, mixCodec) {
 		return fmt.Errorf("Codec missmatch. Resampling or transcoding is not supported")
 	}
 
@@ -365,7 +509,9 @@ func (b *BridgeMix) addDialogStream(ctx context.Context, m *DialogMedia, stream 
 		}
 
 		rtr := media.NewRTPRealTimeReader(r, m.RTPPacketReader, p.Codec)
-		m.SetAudioReader(rtr)
+		if !b.RealtimeReaderPerMix {
+			m.SetAudioReader(rtr)
+		}
 		return rtr
 	}()
 
@@ -376,61 +522,20 @@ func (b *BridgeMix) addDialogStream(ctx context.Context, m *DialogMedia, stream 
 	}
 
 	// Now do write stream
-	p = MediaProps{}
-	w, err := m.AudioWriter(WithAudioWriterMediaProps(&p))
-	if err != nil {
-		return err
-	}
-
 	pcmWriter := audio.PCMEncoderWriter{}
 	if err := pcmWriter.Init(p.Codec, w); err != nil {
 		return err
 	}
 
 	*stream = bridgePCMStream{
-		r:            &pcmReader,
-		w:            &pcmWriter,
-		mediaSession: m.mediaSession,
-		id:           m.RTPPacketWriter.SSRC,
-		buf:          make([]byte, media.RTPBufSize),
-		pipeRead:     make(chan int),
-		pipeWrite:    make(chan []byte),
-	}
-
-	if poll {
-		// We do buffering because initial packet can be read oner than actual mixing has started
-		b.mixWG.Add(1)
-		bridgeTrace("poll: starting stream", "stream.id", stream.id)
-		go func(s *bridgePCMStream) {
-			defer b.mixWG.Done()
-
-			bufPtr := bridgeReadPool.Get().(*[]byte)
-			defer bridgeReadPool.Put(bufPtr)
-
-			defer close(s.pipeWrite)
-
-			buf := *bufPtr
-			for {
-				n, err := s.r.Read(buf)
-				if err != nil {
-					bridgeTrace("poll: stopped with error", "error", err, "stream.id", stream.id)
-					return
-				}
-
-				select {
-				case s.pipeWrite <- buf[:n]:
-					nw := <-s.pipeRead
-					if nw != n {
-						// there is no reason this to happen, so lets panic
-						panic("reading from pipe was not full")
-					}
-				case <-ctx.Done():
-					bridgeTrace("poll: stream context canceled", "stream.id", stream.id)
-					return
-				}
-			}
-		}(stream)
-		return nil
+		r:         &pcmReader,
+		w:         &pcmWriter,
+		codec:     p.Codec,
+		media:     m,
+		id:        m.RTPPacketWriter.SSRC,
+		buf:       make([]byte, media.RTPBufSize),
+		pipeRead:  make(chan int),
+		pipeWrite: make(chan []byte),
 	}
 	return nil
 }
@@ -446,13 +551,20 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 	if !poll {
 		// If are not polling data then we need todo direct read
 		err := func() error {
-			for i, r := range rwStreams {
-				r.mediaSession.StopRTP(1, 1*time.Millisecond)
+			handledStreams := len(rwStreams)
+			for _, r := range rwStreams {
+				r.n = 0
+				if r.markGone {
+					handledStreams--
+					continue
+				}
+				if !b.armDirectRead(r) {
+					return fmt.Errorf("reading is stopped")
+				}
 
 				// Mostly PCM sample size should be same or less our sampling
 				// but we should keep same sampling or deal this per writer?
-				n, err := r.r.Read(r.buf)
-				rwStreams[i].n = n
+				n, err := b.readDirect(r)
 				if err != nil {
 					if errors.Is(err, os.ErrDeadlineExceeded) {
 						state := b.stateRead()
@@ -462,9 +574,19 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 						}
 						continue
 					}
-					return err
+					// The stream's reader has ended, as it does once a BYE has
+					// closed the dialog's media. The media is dropped from the
+					// mix, and the others keep being mixed.
+					r.markGone = true
+					handledStreams--
+					continue
 				}
-				maxN = max(maxN, n)
+				r.n = n
+				mixN := audio.PCMMix(mixedBuf, mixedBuf, r.buf[:n])
+				maxN = max(maxN, mixN)
+			}
+			if handledStreams == 0 {
+				return fmt.Errorf("all streams are gones")
 			}
 			return nil
 		}()
@@ -519,14 +641,13 @@ func (b *BridgeMix) mixAllStreams(rwStreams []*bridgePCMStream, mixedBuf []byte,
 	return maxN, err
 }
 
+// unmixStream returns what a stream hears of a round's mix: mixedBuf without
+// buf, the frame the stream read that round. A frame shorter than the mix put
+// nothing into the rest of it, so there the stream hears the mix as it is. The
+// result is written over buf's backing array, whose capacity holds the mix.
 func unmixStream(buf []byte, mixedBuf []byte) []byte {
-	n := len(mixedBuf)
-	if len(buf) < len(mixedBuf) {
-		// panic("stream buf is shorter than mixed buf")
-	}
-
-	readBuf := buf[:n]
-	audio.PCMUnmix(readBuf, mixedBuf, readBuf)
-	// NOTE: This can be higher than actual read bytes
-	return readBuf
+	heard := buf[:len(mixedBuf)]
+	audio.PCMUnmix(heard, mixedBuf, buf)
+	copy(heard[len(buf):], mixedBuf[len(buf):])
+	return heard
 }
