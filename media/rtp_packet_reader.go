@@ -230,9 +230,9 @@ func (r *RTPPacketReader) readRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 func resumeRead(reader RTPReader) {
 	switch r := reader.(type) {
 	case *MediaSession:
-		r.restoreRTPReadDeadline()
+		r.RestoreRTPReadDeadline()
 	case *RTPSession:
-		r.Sess.restoreRTPReadDeadline()
+		r.Sess.RestoreRTPReadDeadline()
 	case *MediaSessionWebrtc:
 		r.restoreRTPReadDeadline()
 	case *RTPSessionWebrtc:

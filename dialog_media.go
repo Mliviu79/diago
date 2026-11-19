@@ -69,6 +69,11 @@ type DialogMedia struct {
 	// Use this only as read only
 	RTPPacketWriter *media.RTPPacketWriter
 
+	// jitterBuffer is the buffer WithAudioReaderJitterBuffer put between the
+	// RTP session and RTPPacketReader, nil without one. A media update moves it
+	// onto the new RTP session rather than taking it off the packet reader.
+	jitterBuffer *media.RTPJitterBuffer
+
 	// In case we are chaining audio readers
 	audioReader io.Reader
 	audioWriter io.Writer
@@ -123,6 +128,7 @@ func (d *DialogMedia) Close() error {
 	d.onClose = nil
 	m := d.mediaSession
 	rtpSess := d.rtpSession
+	jitter := d.jitterBuffer
 
 	d.mu.Unlock()
 
@@ -138,7 +144,12 @@ func (d *DialogMedia) Close() error {
 	if m != nil {
 		e3 = m.Close()
 	}
-	return errors.Join(e1, e2, e3)
+
+	// The jitter buffer was closed with the hooks above, but its read loop may
+	// still be in a read on the session. Closing the sockets fails that read,
+	// and the loop has stopped reading them once this returns.
+	e4 := awaitJitterBufferStopped(jitter)
+	return errors.Join(e1, e2, e3, e4)
 }
 
 func (d *DialogMedia) OnClose(f func() error) {
@@ -341,7 +352,7 @@ func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	}
 
 	// Make sure any current reader is not consuming old media session.
-	d.RTPPacketReader.UpdateRTPSession(rtpSess)
+	d.moveRTPReadsUnsafe(rtpSess)
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
 
 	d.mediaSession = msess
@@ -485,11 +496,22 @@ func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 }
 
 // WithAudioReaderJitterBuffer inserts an RTP jitter buffer before the payload reader.
-// Packet duration is derived from the negotiated audio codec.
+// Playout starts at the packet duration of the negotiated audio codec and then
+// follows the duration of the peer's packets, learned from their RTP timestamps
+// in the codec's clock rate, or in opts.ClockRate when it is set.
+// The buffer stays in place across media updates, reading each new RTP session.
+// A dialog has at most one; asking for a second is an error.
+// Before the media is set up the option returns ErrNoMediaSetup.
+//
+// A stop of the dialog's reads set with StopRTP stays in force when the buffer
+// is put in.
 func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderOption {
 	return func(d *DialogMedia) error {
 		if d.mediaSession == nil || d.RTPPacketReader == nil {
 			return ErrNoMediaSetup
+		}
+		if d.jitterBuffer != nil {
+			return errors.New("jitter buffer already set up")
 		}
 
 		codec := media.CodecAudioFromSession(d.mediaSession)
@@ -502,19 +524,25 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 			return fmt.Errorf("no RTP reader setup")
 		}
 
+		if opts.ClockRate == 0 {
+			opts.ClockRate = codec.SampleRate
+		}
 		jitter := media.NewRTPJitterBuffer(reader, codec.SampleDur, opts)
 		d.RTPPacketReader.UpdateReader(jitter)
 
 		// UpdateReader interrupts a potentially blocked RTPSession read. The new
 		// jitter reader uses that same session, so restore normal network reading.
+		// What is restored is the read deadline the application last asked for,
+		// which is none unless it stopped the reads: that stop is not cleared.
 		if session, ok := reader.(*media.RTPSession); ok {
-			if err := session.Sess.StartRTP(1); err != nil {
+			if err := session.Sess.RestoreRTPReadDeadline(); err != nil {
 				d.RTPPacketReader.UpdateReader(reader)
 				_ = jitter.Close()
 				return fmt.Errorf("failed to start jitter buffer RTP reader: %w", err)
 			}
 		}
 
+		d.jitterBuffer = jitter
 		d.onCloseUnsafe(jitter.Close)
 		return nil
 	}

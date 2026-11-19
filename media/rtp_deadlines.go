@@ -85,9 +85,16 @@ func (s *MediaSession) CarryRTPDeadlines(from *MediaSession) error {
 	return errors.Join(s.rtpConn.SetReadDeadline(read), s.rtpConn.SetWriteDeadline(write))
 }
 
-// restoreRTPReadDeadline sets the RTP socket's read deadline to the one
+// RestoreRTPReadDeadline sets the RTP socket's read deadline to the one
 // StopRTP or StartRTP last asked for, which is none when neither did.
-func (s *MediaSession) restoreRTPReadDeadline() error {
+//
+// RTPPacketReader.UpdateReader ends a read waiting on the session with a read
+// deadline of its own, which stays on the socket until the read that takes
+// over replaces it. A caller that puts a reader of this same session in the
+// packet reader's place, as a jitter buffer over the session is, calls this
+// before that reader reads: its reads then go on, and a stop the application
+// set with StopRTP is still in force, where StartRTP would clear it.
+func (s *MediaSession) RestoreRTPReadDeadline() error {
 	rec := s.rtpDeadlineRecord()
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
