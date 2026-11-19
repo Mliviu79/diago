@@ -208,9 +208,9 @@ func (d *DialogServerSession) refreshSession(ctx context.Context, t *sessionTime
 			log.Warn("Session refresh answered without SDP, keeping the media session", "call_id", d.callID())
 			return refreshGoesOn
 		}
-		if errors.Is(err, errMediaClosed) {
-			// The call is ending: the media is closed, or the dialog has
-			// ended.
+		if errors.Is(err, errMediaClosed) || errors.Is(err, errMediaUpdateAfterAnswer) {
+			// The call is ending: the media is closed, the dialog has ended,
+			// or the answer could not be keyed and the call was hung up.
 			log.Warn("Session refresh failed, the call is ending", "call_id", d.callID(), "error", err)
 			return refreshEnded
 		}

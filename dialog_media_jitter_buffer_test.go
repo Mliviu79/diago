@@ -241,8 +241,7 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 		}
 
 		// A re-INVITE whose answer moves our media to a new socket.
-		replaced := jd.d.MediaSession()
-		ms := replaced.Fork()
+		ms := jd.d.MediaSession().Fork()
 		ms.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
 		require.NoError(t, ms.Init())
 		t.Cleanup(func() { _ = ms.Close() })
@@ -256,12 +255,8 @@ func TestDialogMediaJitterBufferFollowsReinvite(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, jd.d.RTPPacketReader.Reader() == media.RTPReader(jd.jitter), "the re-INVITE took the jitter buffer off the audio reader")
 
-		// The update leaves the sockets it replaced open. They carry nothing
-		// any more, and are closed here as whoever moved the media away
-		// closes them. The read loop's read on the replaced session is ended
-		// by the update or by this close, and must continue on the new
-		// socket rather than end the stream.
-		require.NoError(t, replaced.Close())
+		// The replaced session is closed under the read loop's read, which
+		// must continue on the new socket rather than end the stream.
 		for seq := uint16(10); seq < 50; seq++ {
 			jd.sendAndRead(t, ms.Laddr, seq)
 		}

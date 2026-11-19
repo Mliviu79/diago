@@ -423,12 +423,21 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 
 // Ack acknowledgeds media
 // Before Ack normally you want to setup more stuff like bridging
+//
+// Once the ACK is sent, Ack has the media of the call keyed where it needs
+// keys, a DTLS handshake that waits for the peer. That wait ends with ctx or
+// with the dialog, whichever ends first, and Ack then returns an error.
 func (d *DialogClientSession) Ack(ctx context.Context) error {
 	inviteRequest := d.InviteRequest
 	recipient := inviteRequest.Recipient
 	if contact := d.InviteResponse.Contact(); contact != nil {
 		recipient = contact.Address
 	}
+
+	// Once the ACK is out the peer may re-INVITE, while the media it started
+	// is still being keyed below. Such a re-INVITE waits for Ack to return,
+	// see awaitAck.
+	defer d.markAcking()()
 
 	if err := d.ack(ctx, recipient, nil); err != nil {
 		return err
@@ -438,7 +447,11 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 	if mediaHanshaker == nil {
 		return nil
 	}
-	return mediaHanshaker.onFinalize(ctx)
+	// The media is keyed within ctx, and within the call: a peer that has
+	// hung up never completes the handshake.
+	fctx, stop := endsWithDialog(ctx, &d.Dialog)
+	defer stop()
+	return mediaHanshaker.onFinalize(fctx)
 }
 
 // AckLate sends ACK with media. Use this in combination with late(delay) offer
@@ -612,6 +625,10 @@ func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *s
 }
 
 func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) (err error) {
+	if !d.awaitAck(ctx, tx) {
+		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+	}
+
 	d.requestMu.Lock()
 	defer d.requestMu.Unlock()
 
@@ -688,7 +705,9 @@ func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Reque
 // re-INVITE waits for.
 //
 // An ACK cannot be refused, so media that the ACK leaves unusable ends the
-// call with a BYE.
+// call with a BYE, and the error returned wraps errMediaUpdateAfterAnswer. A
+// dialog that ended while the media committed the update has no call left to
+// end, and that is no error.
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
 	// A copy of an ACK already read, sent for a retransmission of our 2xx,
 	// brings the media nothing more.
@@ -716,6 +735,9 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 		// Nothing was installed: the media drops what the exchange left
 		// staged.
 		d.abortMedia()
+		if err = updateFailedAfterAnswer(&d.Dialog, err); err == nil {
+			return nil
+		}
 		return errors.Join(err, d.hangupNoMedia())
 	}
 	return nil

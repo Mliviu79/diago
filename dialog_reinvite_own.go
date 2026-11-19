@@ -41,6 +41,8 @@ type ownReInvite struct {
 	// target and acknowledges its 2xx. A final response other than 2xx is
 	// returned together with sipgo.ErrDialogResponse.
 	send func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error)
+	// hangup ends a call whose media the answer left unusable.
+	hangup func() error
 }
 
 // run sends the re-INVITE and has the media take the answer in its 2xx. Each
@@ -60,7 +62,9 @@ type ownReInvite struct {
 // errReInviteAnswerWithoutSDP for a 2xx without SDP, sipgo.ErrDialogResponse
 // for any other final response than 2xx or 491, and the cause of ctx when ctx
 // ends first. Whenever the answer is not taken, the media drops the offer it
-// staged and goes on as it was.
+// staged and goes on as it was. An error wrapping errMediaUpdateAfterAnswer
+// means the answer was taken and the media it asked for could not be keyed:
+// the call has been ended with a BYE.
 func (r ownReInvite) run(ctx context.Context) error {
 	for {
 		refused, err := r.attempt(ctx)
@@ -139,7 +143,18 @@ func (r ownReInvite) applyAnswer(ctx context.Context, res *sip.Response) error {
 	if len(answer) == 0 {
 		return errReInviteAnswerWithoutSDP
 	}
-	return r.handshaker.onRemoteSDP(ctx, answer, true)
+	// An answer that completes a new DTLS association has the media run its
+	// handshake before it returns: within ctx, and within the call, since a
+	// peer that has hung up never completes it.
+	ctx, stop := endsWithDialog(ctx, r.dialog)
+	defer stop()
+	err := r.handshaker.onRemoteSDP(ctx, answer, true)
+	if errors.Is(err, errMediaKeyingFailed) {
+		// The answer stands, so the peer has moved to a session that has no
+		// keys here.
+		return errors.Join(fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err), r.hangup())
+	}
+	return err
 }
 
 // reInviteRetryWait waits, bounded by ctx, before a re-INVITE of ours answered
@@ -242,6 +257,7 @@ func (d *DialogServerSession) ownReInvite(
 		mode:       mode,
 		// The caller generated the Call-ID.
 		callIDOwner: false,
+		hangup:      d.hangupNoMedia,
 		send: func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error) {
 			// NOTE: we do not change original invite request
 			req := sip.NewRequest(sip.INVITE, d.RemoteContact().Address)
@@ -273,6 +289,7 @@ func (d *DialogClientSession) ownReInvite(handshaker mediaHanshaker, mode string
 		mode:       mode,
 		// We generated the Call-ID.
 		callIDOwner: true,
+		hangup:      d.hangupNoMedia,
 		send: func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error) {
 			// NOTE: we do not change original invite request
 			req := sip.NewRequest(sip.INVITE, d.RemoteContact().Address)

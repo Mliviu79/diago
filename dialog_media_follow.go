@@ -19,12 +19,19 @@ import (
 // replaced session, and that read is taken up again on msess with the read
 // deadline msess holds by then.
 //
+// The sockets of the session replaced are closed last, when msess runs on
+// its own, see closeReplacedSockets.
+//
 // Must be called with d.mu held.
 func (d *DialogMedia) replaceMediaSessionUnsafe(msess *media.MediaSession) error {
-	if old := d.mediaSession; old != nil && old != msess {
+	old := d.mediaSession
+	if old != nil && old != msess {
 		if err := msess.CarryRTPDeadlines(old); err != nil {
 			return fmt.Errorf("carrying RTP deadlines to the new media session: %w", err)
 		}
 	}
-	return d.replaceRTPSessionUnsafe(msess)
+	if err := d.replaceRTPSessionUnsafe(msess); err != nil {
+		return err
+	}
+	return closeReplacedSockets(old, msess)
 }

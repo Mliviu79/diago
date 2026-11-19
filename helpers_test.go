@@ -19,6 +19,7 @@ import (
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/require"
@@ -529,6 +530,30 @@ func withSetup(body []byte, setup string) []byte {
 		}
 	}
 	return []byte(strings.Join(lines, "\r\n"))
+}
+
+// newProgressMediaDTLSDialog builds an inbound dialog over a fake transaction
+// whose INVITE carries the DTLS-SRTP offer of peer, and whose media config is
+// DTLS with a certificate of its own. The transaction hands every response it
+// is given to the returned channel.
+func newProgressMediaDTLSDialog(t *testing.T) (d *DialogServerSession, peer *media.MediaSession, inviteTx *respondedServerTx) {
+	t.Helper()
+
+	peer = newDTLSMediaSession(t, testdata.ClientCertificate())
+
+	inviteTx = &respondedServerTx{byeServerTx: newByeServerTx(), responded: make(chan *sip.Response, 4)}
+	d = newTestDialogOver(t, inviteTx)
+	d.InviteRequest.SetBody(peer.LocalSDP(false))
+	d.mediaConf = MediaConfig{
+		Codecs:     []media.Codec{media.CodecAudioUlaw},
+		DTLSConfig: &media.DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}},
+		secureRTP:  media.SecureRTPModeDTLS,
+		bindIP:     net.IPv4(127, 0, 0, 1),
+	}
+	// The media a test's answer makes is closed with the session it
+	// registered with.
+	t.Cleanup(func() { _ = d.Close() })
+	return d, peer, inviteTx
 }
 
 // newICEDialogMedia installs sess in a DialogMedia the way an answered call

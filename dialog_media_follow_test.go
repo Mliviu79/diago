@@ -76,16 +76,12 @@ func (p *followPeer) reinvite(t *testing.T, te int, version int) {
 }
 
 // rebind moves the dialog's media to sockets of its own, as a re-INVITE whose
-// answer moves our media does. The sockets it replaces stay open until the
-// test ends.
+// answer moves our media does, and closes the ones it replaced.
 func (p *followPeer) rebind(t *testing.T) {
 	t.Helper()
 	fork := p.d.MediaSession().Fork()
 	fork.Laddr = net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
 	require.NoError(t, fork.Init())
-	// The dialog closes the session it runs on, not one a later rebind
-	// replaced.
-	t.Cleanup(func() { _ = fork.Close() })
 	require.NoError(t, fork.RemoteSDP(teOffer(p.conn.LocalAddr().(*net.UDPAddr).Port, 101, 3), false))
 	p.d.mu.Lock()
 	err := p.d.mediaUpdateUnsafe(fork)
@@ -438,18 +434,13 @@ func TestDialogMediaAudioHelpersReadMediaUnderLock(t *testing.T) {
 // TestDialogMediaRingtoneFollowsRebind pins that a ringtone made before a
 // re-INVITE moved the dialog's media to new sockets plays and stops on the
 // dialog's current media. It kept the media session it was made on, whose
-// sockets are gone once the media has moved, so starting and stopping it
-// failed there.
+// sockets the re-INVITE closed, so starting and stopping it failed there.
 func TestDialogMediaRingtoneFollowsRebind(t *testing.T) {
 	p := newFollowPeer(t)
 	ringtone, err := p.d.PlaybackRingtoneCreate()
 	require.NoError(t, err)
 
-	replaced := p.d.MediaSession()
 	p.rebind(t)
-	// The rebind leaves the sockets it replaced open. They carry nothing any
-	// more, and are closed here as whoever moved the media away closes them.
-	require.NoError(t, replaced.Close())
 
 	stop, err := ringtone.PlayBackground()
 	require.NoError(t, err)

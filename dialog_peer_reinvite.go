@@ -282,11 +282,18 @@ func (s *sessionState) terminatePeerReInviteLocked(ctx context.Context) error {
 // Media that is closed was closed by a BYE handled while the request was
 // pending, or by the application. The request is still answered, with the 487
 // RFC 3261 section 15.1.2 recommends, and that is no failure to report: only
-// what sending the 487 returned is. Any other refusal is answered 400 and
-// returned together with what sending it returned.
+// what sending the 487 returned is. Media that still waits for the keys of an
+// earlier update cannot take this one now: RFC 3261 section 14.2 lets such a
+// request be retried after a 491, which is no failure to report either. Any
+// other refusal is answered 400 and returned together with what sending it
+// returned.
 func (s *sessionState) refusePeerReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, mediaErr error) error {
 	if errors.Is(mediaErr, errMediaClosed) {
 		_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
+		return err
+	}
+	if errors.Is(mediaErr, errMediaUpdateInProgress) {
+		_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
 	}
 	_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))

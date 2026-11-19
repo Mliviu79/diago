@@ -362,7 +362,10 @@ func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 // re-INVITE waits for.
 //
 // An ACK cannot be refused, so media that the ACK leaves unusable ends the
-// call with a BYE, sent once the ACK is read.
+// call with a BYE, sent once the ACK is read. For the ACK to the 2xx to a
+// re-INVITE the error returned then wraps errMediaUpdateAfterAnswer, and a
+// dialog that ended while the media committed the update has no call left to
+// end, which is no error.
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	d.dialogCallbacks.mu.Lock()
 	mediaHanshaker := d.mediaHanshaker
@@ -396,6 +399,11 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		// Nothing was installed: the media drops what the exchange left
 		// staged.
 		d.abortMedia()
+		if err = updateFailedAfterAnswer(&d.Dialog, err); err == nil {
+			// The dialog has ended, which leaves this ACK nothing to
+			// confirm.
+			return nil
+		}
 		// The ACK is read before the call is ended: the BYE that ends an
 		// answered call waits for the ACK to its 2xx (RFC 3261 section 15),
 		// which is the one this handler holds.

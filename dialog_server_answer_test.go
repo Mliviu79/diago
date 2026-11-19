@@ -28,6 +28,9 @@ type recordingMedia struct {
 	// offerErr, when set, is what onRemoteSDP returns for an offer, as media
 	// that refuses it.
 	offerErr error
+	// answerErr, when set, is what onRemoteSDP returns for an answer, as
+	// media that cannot complete the session the answer asks for.
+	answerErr error
 	// onOffer and onCommit, when set, are called while the media is handed an
 	// offer and while it is asked to commit, with mu released.
 	onOffer  func()
@@ -38,8 +41,9 @@ func (m *recordingMedia) onRemoteSDP(_ context.Context, remoteSDP []byte, offere
 	m.mu.Lock()
 	if offered {
 		m.answers = append(m.answers, string(remoteSDP))
+		answerErr := m.answerErr
 		m.mu.Unlock()
-		return nil
+		return answerErr
 	}
 	onOffer, offerErr := m.onOffer, m.offerErr
 	m.mu.Unlock()

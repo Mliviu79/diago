@@ -86,6 +86,19 @@ type DialogMedia struct {
 	// noteOfferRequest.
 	offerRequested bool
 
+	// stagedMediaSession is the fork that answers an offer of the peer's
+	// which asks for a new DTLS association, from that offer until onFinalize
+	// has keyed and installed it or the exchange is aborted. The media
+	// session in place carries the media meanwhile.
+	stagedMediaSession *media.MediaSession
+	// mediaUpdating is set while an exchange waits, with mu released, for
+	// the handshake of a new DTLS association. No other exchange is taken
+	// meanwhile, see errMediaUpdateInProgress.
+	mediaUpdating bool
+	// discardErr is what closing a fork an abort discarded reported. The
+	// abort has nowhere to return it, so Close does.
+	discardErr error
+
 	// offerNegotiatedCodecs is MediaConfig.ReInviteNegotiatedCodecs of the
 	// config the media was built from. Set before the media is handed out
 	// and not changed after.
@@ -123,6 +136,9 @@ func (d *DialogMedia) Close() error {
 	// before, and a later Close returns after that.
 	releasePort := d.takeRTPPortReleaseUnsafe()
 	defer releasePort()
+	// A fork that was never installed and runs on sockets of its own is
+	// closed with the rest.
+	closeForks := d.takeUninstalledForksUnsafe()
 
 	onClose := d.onClose
 	d.onClose = nil
@@ -149,7 +165,7 @@ func (d *DialogMedia) Close() error {
 	// still be in a read on the session. Closing the sockets fails that read,
 	// and the loop has stopped reading them once this returns.
 	e4 := awaitJitterBufferStopped(jitter)
-	return errors.Join(e1, e2, e3, e4)
+	return errors.Join(e1, e2, e3, e4, closeForks())
 }
 
 func (d *DialogMedia) OnClose(f func() error) {
@@ -382,6 +398,11 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 		d.mu.Unlock()
 		return errMediaClosed
 	}
+	if d.mediaUpdating {
+		// An earlier exchange still waits for its keys.
+		d.mu.Unlock()
+		return errMediaUpdateInProgress
+	}
 	if d.mediaSession == nil {
 		d.mu.Unlock()
 		return errNoMediaSession
@@ -400,21 +421,27 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 		return err
 	}
 	var err error
+	// An offer that asks for a new DTLS association is only staged here, and
+	// installed by onFinalize once it is keyed.
+	installed := true
 	if offered && d.pendingMediaSession != nil {
-		err = d.pendingMediaSession.RemoteSDP(remoteSDP, true)
+		pending := d.pendingMediaSession
+		err = pending.RemoteSDP(remoteSDP, true)
 		if err == nil {
-			err = d.mediaUpdateUnsafe(d.pendingMediaSession)
+			// Taken first: installing it may wait for a handshake with the
+			// lock released.
 			d.pendingMediaSession = nil
+			err = d.installKeyedUnsafe(ctx, pending)
 		}
 	} else {
-		err = d.sdpUpdateUnsafe(remoteSDP, offered)
+		installed, err = d.updateFromForkUnsafe(ctx, remoteSDP, offered)
 	}
 	onMediaUpdate := d.onMediaUpdate
 	d.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if onMediaUpdate != nil {
+	if installed && onMediaUpdate != nil {
 		onMediaUpdate(d)
 	}
 	return nil
@@ -430,12 +457,16 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 		// media that is closed.
 		return nil, errMediaClosed
 	}
+	if d.mediaUpdating {
+		// An earlier exchange still waits for its keys.
+		return nil, errMediaUpdateInProgress
+	}
 	if d.mediaSession == nil {
 		return nil, fmt.Errorf("dialog media is not initialized")
 	}
 
 	if answered {
-		return d.mediaSession.LocalSDP(true), nil
+		return d.answeringSessionUnsafe().LocalSDP(true), nil
 	}
 
 	if d.awaitsFirstExchangeUnsafe() {
@@ -463,6 +494,12 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 }
 
 func (d *DialogMedia) onFinalize(ctx context.Context) error {
+	// A fork staged for a new DTLS association is keyed and installed now
+	// that its answer is out.
+	if staged, err := d.commitStagedMediaSession(ctx); staged {
+		return err
+	}
+
 	d.mu.Lock()
 	ms := d.mediaSession
 	d.mu.Unlock()

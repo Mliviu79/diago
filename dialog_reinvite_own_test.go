@@ -5,6 +5,7 @@ package diago
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
@@ -295,6 +297,142 @@ func TestDialogReInviteAnsweredAfterDialogEnded(t *testing.T) {
 	// One of ours on a dialog that has ended is not sent at all.
 	require.ErrorIs(t, d.ReInvite(t.Context()), errMediaClosed)
 	assert.EqualValues(t, 1, med.offers.Load(), "an offer was made on an ended dialog")
+}
+
+// TestDialogReInviteAnswerNotKeyedEndsTheCall is a re-INVITE of ours whose
+// answer the media took and then could not key, as when the handshake of a
+// new DTLS association fails. The 2xx was acknowledged by then, so the peer
+// has moved to a session that has no keys here: the call is ended with a BYE
+// (RFC 5763 section 5), and the caller is told the update failed after its
+// answer. An answer the media refuses outright leaves the call up.
+func TestDialogReInviteAnswerNotKeyedEndsTheCall(t *testing.T) {
+	answering := func(byes *atomic.Int32) func(*sip.Request) *sip.Response {
+		return func(req *sip.Request) *sip.Response {
+			res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+			if req.Method == sip.BYE {
+				byes.Add(1)
+			}
+			if req.IsInvite() {
+				res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+				res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+				res.SetBody(peerSDP())
+			}
+			return res
+		}
+	}
+
+	t.Run("not_keyed", func(t *testing.T) {
+		var byes atomic.Int32
+		d, med := newOfferingMediaClientCall(t, answering(&byes))
+		errHandshake := errors.New("handshake failed")
+		med.answerErr = fmt.Errorf("%w: %w", errMediaKeyingFailed, errHandshake)
+
+		err := d.ReInvite(t.Context())
+		require.ErrorIs(t, err, errMediaUpdateAfterAnswer)
+		require.ErrorIs(t, err, errHandshake)
+		assert.EqualValues(t, 1, byes.Load(), "the call was not ended with one BYE")
+		assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		var byes atomic.Int32
+		d, med := newOfferingMediaClientCall(t, answering(&byes))
+		errRefused := errors.New("answer refused")
+		med.answerErr = errRefused
+
+		err := d.ReInvite(t.Context())
+		require.ErrorIs(t, err, errRefused)
+		require.NotErrorIs(t, err, errMediaUpdateAfterAnswer)
+		assert.Zero(t, byes.Load(), "a refused answer ended the call")
+		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+		_, _, aborted := med.seen()
+		assert.Equal(t, 1, aborted, "the media was not told to drop the offer")
+	})
+}
+
+// answerKeyingMedia is media that keys the session an answer to an offer of
+// ours asks for, as the handshake of a new DTLS association the peer never
+// completes does, until the context it was given ends.
+type answerKeyingMedia struct {
+	*offeringMedia
+	keying chan struct{}
+}
+
+func (m *answerKeyingMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
+	if !offered {
+		return m.offeringMedia.onRemoteSDP(ctx, remoteSDP, offered)
+	}
+	close(m.keying)
+	<-ctx.Done()
+	return fmt.Errorf("%w: %w", errMediaKeyingFailed, context.Cause(ctx))
+}
+
+// TestDialogReInviteKeyingEndsWithDialog pins that the keying a re-INVITE of
+// ours waits for, once its answer is in, ends with the dialog as well as with
+// the caller's context: a peer that has hung up never completes a handshake.
+func TestDialogReInviteKeyingEndsWithDialog(t *testing.T) {
+	d, med := newOfferingMediaClientCall(t, func(req *sip.Request) *sip.Response {
+		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+		if req.IsInvite() {
+			res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.SetBody(peerSDP())
+		}
+		return res
+	})
+	keying := &answerKeyingMedia{offeringMedia: med, keying: make(chan struct{})}
+	d.dialogCallbacks.mu.Lock()
+	d.mediaHanshaker = keying
+	d.dialogCallbacks.mu.Unlock()
+
+	reinvited := make(chan error, 1)
+	go func() { reinvited <- d.ReInvite(t.Context()) }()
+	select {
+	case <-keying.keying:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the media was not handed the answer")
+	}
+
+	require.NoError(t, d.Hangup(t.Context()))
+	select {
+	case err := <-reinvited:
+		require.ErrorIs(t, err, errMediaUpdateAfterAnswer)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the end of the dialog did not end the keying")
+	}
+}
+
+// TestDialogReInviteOffersActpass pins the offer of ReInvite on a DTLS-SRTP
+// call, on either side: a subsequent offer carries a=setup:actpass (RFC 8842
+// section 5.5), whatever role the endpoint plays. The media session in place
+// has its role set, passive for the offerer the peer answered active, active
+// for the answerer of an actpass offer, and offering from it signalled that
+// role.
+func TestDialogReInviteOffersActpass(t *testing.T) {
+	for _, side := range reInviteSides {
+		t.Run(side.name, func(t *testing.T) {
+			sess := newDTLSMediaSession(t, testdata.ClientCertificate())
+			peer := newDTLSMediaSession(t, testdata.ServerCertificate())
+			if side.name == "inbound" {
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP(false), false))
+			} else {
+				require.NoError(t, peer.RemoteSDP(sess.LocalSDP(false), false))
+				require.NoError(t, sess.RemoteSDP(peer.LocalSDP(true), true))
+			}
+
+			offers := make(chan []byte, 1)
+			call := side.setup(t, MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}}, sess, func(req *sip.Request) *sip.Response {
+				offers <- req.Body()
+				return sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := call.reInvite(ctx)
+			var resErr sipgo.ErrDialogResponse
+			require.ErrorAs(t, err, &resErr)
+			require.Equal(t, "a=setup:actpass", sdpLineWithPrefix(t, <-offers, "a=setup:"))
+		})
+	}
 }
 
 // TestDialogReInviteRetriesAfter491 is a re-INVITE of ours answered 491 and

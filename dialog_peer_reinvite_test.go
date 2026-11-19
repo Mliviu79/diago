@@ -419,6 +419,75 @@ func TestDialogPeerReInviteCommitsOrAbortsTheMedia(t *testing.T) {
 		assert.Equal(t, 1, aborted)
 	})
 
+	t.Run("media_update_in_progress", func(t *testing.T) {
+		d, med, _ := newRecordedMediaCall(t)
+		med.refuseOffers(fmt.Errorf("offer: %w", errMediaUpdateInProgress))
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(t.Context(), offer(t, d), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusRequestPending, tx.responses[0].StatusCode)
+		_, _, aborted := med.seen()
+		assert.Equal(t, 1, aborted)
+	})
+
+	t.Run("commit_failed", func(t *testing.T) {
+		d, med, sent := newRecordedMediaCall(t)
+		errNotKeyed := errors.New("media not keyed")
+		med.finalizeErr = errNotKeyed
+		req := offer(t, d)
+
+		tx := newTransmissionsTx()
+		handled := make(chan error, 1)
+		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
+		require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
+
+		// The answer is out, so the peer has moved to a session the media
+		// could not complete: the reading of the ACK says so and ends the
+		// call.
+		err := d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+		require.ErrorIs(t, err, errMediaUpdateAfterAnswer)
+		require.ErrorIs(t, err, errNotKeyed)
+		select {
+		case err := <-handled:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE did not end once its ACK was handled")
+		}
+		_, _, aborted := med.seen()
+		assert.Equal(t, 1, aborted)
+		assert.Contains(t, sent.sent(), sip.BYE, "the call was not ended with a BYE")
+	})
+
+	t.Run("dialog_ended_during_commit", func(t *testing.T) {
+		d, med, sent := newRecordedMediaCall(t)
+		req := offer(t, d)
+		// The peer's BYE is read while the media commits the update, which
+		// the end of the dialog then cuts short.
+		var byeErr error
+		med.hook(nil, func() {
+			byeErr = d.ReadBye(t.Context(), newBye(t, d, req.CSeq().SeqNo+1), newByeServerTx())
+		})
+		med.finalizeErr = errors.New("commit cut short")
+
+		tx := newTransmissionsTx()
+		handled := make(chan error, 1)
+		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
+		require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
+
+		require.NoError(t, d.ReadAck(newReInviteAck(req, nil), newByeServerTx()), "the end of the dialog is no failure of the update")
+		require.NoError(t, byeErr)
+		select {
+		case err := <-handled:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the re-INVITE did not end once its ACK was handled")
+		}
+		_, _, aborted := med.seen()
+		assert.Equal(t, 1, aborted)
+		assert.NotContains(t, sent.sent(), sip.BYE, "a call the peer had ended was ended again")
+	})
+
 	t.Run("bye_before_the_answer", func(t *testing.T) {
 		d, med, _ := newRecordedMediaCall(t)
 		req := offer(t, d)

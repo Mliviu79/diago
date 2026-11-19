@@ -5,14 +5,18 @@ package diago
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/testdata"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -293,5 +297,62 @@ func TestDialogServerLateOfferAckWithoutAnswerEndsTheCall(t *testing.T) {
 		assert.ErrorIs(t, err, errAckCarriesNoAnswer)
 	case <-time.After(5 * time.Second):
 		t.Error("ReadAck did not return")
+	}
+}
+
+// TestDialogServerLateOfferHandshakeFailure is a late offer over DTLS-SRTP
+// whose answer, in the ACK, carries a fingerprint that the certificate the
+// peer then presents does not match, as it would be from an attacker on the
+// media path. The handshake fails, which leaves the call with no SRTP keys.
+// Before, ReadAck swallowed that failure and the call went on, with its media
+// unencrypted. Now ReadAck and AnswerLate return the error, and the call is
+// ended with a BYE: an ACK cannot be refused, and RFC 5763 section 5 has the
+// media session torn down on a fingerprint mismatch.
+func TestDialogServerLateOfferHandshakeFailure(t *testing.T) {
+	d, inviteTx, sent := newLateOfferDialog(t, MediaConfig{
+		Codecs:     []media.Codec{media.CodecAudioUlaw},
+		DTLSConfig: &media.DTLSConfig{Certificates: []tls.Certificate{testdata.ServerCertificate()}},
+		secureRTP:  media.SecureRTPModeDTLS,
+		bindIP:     net.IPv4(127, 0, 0, 1),
+	})
+	offer, answered := answerLate(t, d, inviteTx)
+
+	peer := newDTLSMediaSession(t, testdata.ClientCertificate())
+	require.NoError(t, peer.RemoteSDP(offer, false))
+	answer := string(peer.LocalSDP(true))
+
+	other, err := selfsign.GenerateSelfSigned()
+	require.NoError(t, err)
+	otherFP := sdpLineWithPrefix(t, newDTLSMediaSession(t, other).LocalSDP(false), "a=fingerprint:")
+	answer = strings.Replace(answer, sdpLineWithPrefix(t, []byte(answer), "a=fingerprint:"), otherFP, 1)
+
+	// The peer answered actpass with active, so it starts the handshake.
+	peerDone := make(chan error, 1)
+	go func() { peerDone <- peer.Finalize() }()
+
+	acked := make(chan error, 1)
+	go func() { acked <- d.ReadAck(newLateAck(d, []byte(answer)), newByeServerTx()) }()
+	select {
+	case err := <-acked:
+		assert.Error(t, err, "a failed handshake must not be swallowed")
+	case <-time.After(20 * time.Second):
+		t.Fatal("ReadAck did not return")
+	}
+	select {
+	case late := <-answered:
+		assert.Error(t, late.err, "an answer whose media could not be keyed is not a success")
+	case <-time.After(20 * time.Second):
+		t.Fatal("AnswerLate did not return")
+	}
+	select {
+	case req := <-sent:
+		assert.Equal(t, sip.BYE, req.Method, "the call must be ended")
+	case <-time.After(20 * time.Second):
+		t.Fatal("no BYE was sent")
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the peer's handshake did not return")
 	}
 }

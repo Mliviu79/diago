@@ -39,16 +39,29 @@ func (d *DialogMedia) takeOfferRequestUnsafe() bool {
 	return requested
 }
 
-// abortPendingMediaSession drops the fork that made an offer of ours when the
-// exchange ends without its answer: the request carrying the offer failed, or
-// the ACK to the 2xx carrying it brought no answer. The fork runs on the
-// sockets of the media session in place, which carries the media as before,
-// so there is nothing of the fork's own to close. An answer that comes later
-// then finds no offer of ours to be the answer to.
+// abortPendingMediaSession drops what an offer/answer exchange left without
+// installing it, when the exchange ends without committing: the fork that
+// made an offer of ours, when the request carrying the offer failed or the
+// ACK to the 2xx carrying it brought no answer, and the fork staged for an
+// offer of the peer's that asked for a new DTLS association, when its answer
+// was not sent or its ACK did not come. The media session in place carries
+// the media as before. An answer that comes later then finds no offer of ours
+// to be the answer to.
+//
+// A fork made here runs on the sockets of the media session in place, so
+// there is nothing of its own to close. One moved to sockets of its own, as a
+// new DTLS association is, has them closed; what that close reports is
+// returned by Close.
 func (d *DialogMedia) abortPendingMediaSession() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for _, fork := range []*media.MediaSession{d.pendingMediaSession, d.stagedMediaSession} {
+		if fork != nil {
+			d.discardErr = errors.Join(d.discardErr, d.discardForkUnsafe(fork))
+		}
+	}
 	d.pendingMediaSession = nil
+	d.stagedMediaSession = nil
 	d.offerRequested = false
 }
 

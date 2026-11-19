@@ -389,6 +389,20 @@ func cseqOf(req *sip.Request) uint32 {
 	return req.CSeq().SeqNo
 }
 
+// unkeyableAnswerMedia is the media of a call that cannot key the session an
+// answer to an offer of ours asks for, as when the handshake of a new DTLS
+// association fails.
+type unkeyableAnswerMedia struct {
+	*DialogMedia
+}
+
+func (m unkeyableAnswerMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
+	if offered {
+		return fmt.Errorf("%w: handshake failed", errMediaKeyingFailed)
+	}
+	return m.DialogMedia.onRemoteSDP(ctx, remoteSDP, offered)
+}
+
 // weRefreshCall is the INVITE of a peer that names us the refresher.
 var weRefreshCall = []string{"Supported: timer", "Session-Expires: " + strconv.Itoa(refreshInterval) + ";refresher=uas"}
 
@@ -441,6 +455,31 @@ func TestSessionRefreshFollowsRFC4028(t *testing.T) {
 			require.FailNow(t, "the dialog did not end with our BYE")
 		}
 		assert.True(t, p.warned("Session refresh failed, ending the call", map[string]string{"status": "481"}))
+	})
+
+	t.Run("a refresh whose answer cannot be keyed ends the call with our BYE", func(t *testing.T) {
+		p := newRefreshPeer(t, nil)
+		d := p.call(t, weRefreshCall...)
+		d.dialogCallbacks.mu.Lock()
+		d.mediaHanshaker = unkeyableAnswerMedia{DialogMedia: p.media}
+		d.dialogCallbacks.mu.Unlock()
+
+		req, from := p.await(t, sip.INVITE, refreshDue)
+		p.answerOK(t, req, from, "Session-Expires: 90;refresher=uac")
+		bye, from := p.await(t, sip.BYE, 5*time.Second)
+		p.answer(t, bye, from, sip.StatusOK, "OK", nil)
+		select {
+		case <-d.Context().Done():
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the dialog did not end with our BYE")
+		}
+		// Refreshing ends with the call, which the refresh itself ended.
+		select {
+		case <-d.timer.Load().done:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the session timer did not end with the call")
+		}
+		assert.False(t, p.warned("Session refresh failed, refreshing stopped", nil), "a call the refresh ended was left to the peer's timer")
 	})
 
 	t.Run("a refresh with no final answer ends the call with our BYE", func(t *testing.T) {
@@ -512,6 +551,39 @@ func TestSessionRefreshFollowsRFC4028(t *testing.T) {
 		ack, _ := p.await(t, sip.ACK, 2*time.Second)
 		assert.Equal(t, cseqOf(retry), cseqOf(ack), "our ACK names the retried re-INVITE")
 	})
+}
+
+// TestSessionRefreshAnswerNotKeyedIsTheCallEnding pins what a session refresh
+// makes of a re-INVITE whose answer the media could not key. The re-INVITE
+// has hung the call up by then, so the refresh reports the call ending, and
+// does not stop refreshing as it does for a failure that leaves the call to
+// the peer's timer. The refresh runs here on a ctx that outlives the dialog,
+// so that its own reading of the failure is what decides.
+func TestSessionRefreshAnswerNotKeyedIsTheCallEnding(t *testing.T) {
+	ua, err := sipgo.NewUA()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ua.Close() })
+	client, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	client.TxRequester = &clientTxRequester{onRequest: func(req *sip.Request) *sip.Response {
+		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+		if req.IsInvite() {
+			res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5070}})
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.SetBody(peerSDP())
+		}
+		return res
+	}}
+	d := newTestDialogOverUA(t, newByeServerTx(), &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}}})
+	res := sip.NewResponseFromRequest(d.InviteRequest, sip.StatusOK, "OK", nil)
+	res.AppendHeader(&sip.ContactHeader{Address: d.InviteRequest.Recipient})
+	d.InviteResponse = res
+	confirm(t, d)
+	med := &recordingMedia{answerErr: fmt.Errorf("%w: handshake failed", errMediaKeyingFailed)}
+	med.register(d)
+
+	require.Equal(t, refreshEnded, d.refreshSession(t.Context(), nil))
+	require.Equal(t, sip.DialogStateEnded, d.LoadState(), "the call was not hung up")
 }
 
 // peerRefreshesCall is the INVITE of a peer that names itself the refresher.

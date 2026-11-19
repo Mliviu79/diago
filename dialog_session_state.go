@@ -59,8 +59,8 @@ type sessionState struct {
 
 	// answeringMu guards answering, ackAnswerErr, ackCarriesAnswer and
 	// timerAnswer, which the answer to an inbound call and the reading of its
-	// ACK share. It is a lock of the session's own and is never held across a
-	// call.
+	// ACK share, and acking. It is a lock of the session's own and is never
+	// held across a call.
 	answeringMu sync.Mutex
 	// answering is set by an answer before it sends its 2xx, and closed when
 	// that answer returns: after the ACK is read and, for an answer that sets
@@ -76,6 +76,10 @@ type sessionState struct {
 	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
 	// section 13.2.1).
 	ackCarriesAnswer bool
+	// acking is set by the Ack of an outbound call before it sends the ACK,
+	// and closed when that Ack returns: once the media it finalizes is keyed,
+	// or has failed. awaitAck waits on it.
+	acking chan struct{}
 	// timerAnswer is the RFC 4028 session timer the answer negotiated, which
 	// its 2xx carries and starts; nil until an answer negotiates one. Guarded
 	// by answeringMu.
