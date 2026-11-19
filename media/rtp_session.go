@@ -663,6 +663,15 @@ func (s *RTPSession) readReceptionReport(rr rtcp.ReceptionReport, now time.Time)
 func (s *RTPSession) writeRTCP(now time.Time) error {
 	sess := s.Sess
 
+	// A DTLS-SRTP session its handshake has not keyed yet has nothing to
+	// protect a report with and would refuse to send it. No report is built
+	// for it, so the monitor goes on to its next tick and reports once the
+	// session is keyed, where the refusal would end it for the rest of the
+	// call.
+	if sess.awaitsDTLSKeys() {
+		return nil
+	}
+
 	var pkt rtcp.Packet
 
 	// If there is no writer in session (a=recvonly) then generate only receiver report
