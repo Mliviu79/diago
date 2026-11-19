@@ -354,7 +354,17 @@ func (s *RTPSessionWebrtc) readRTCP() error {
 	s.Sess.mu.Lock()
 	rtcpEndpoint := s.Sess.mux.rtcp
 	s.Sess.mu.Unlock()
-	if err := rtcpEndpoint.SetReadDeadline(time.Time{}); err != nil {
+	// Serialize clearing the read deadline with the stop, as RTPSession does.
+	// The stop marks the session closed under this lock and only then expires
+	// the deadline, so a reader that starts late would otherwise clear the
+	// deadline after the stop and read on with nothing left to end it.
+	s.rtcpMU.Lock()
+	var err error
+	if !s.closed {
+		err = rtcpEndpoint.SetReadDeadline(time.Time{})
+	}
+	s.rtcpMU.Unlock()
+	if err != nil {
 		return err
 	}
 	buf := make([]byte, RTPBufSize)
