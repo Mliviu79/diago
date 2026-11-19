@@ -9,6 +9,30 @@ type mediaUpdateHook struct {
 	f func()
 }
 
+// mediaUpdateHooks are the media update hooks of a dialog's media, guarded by
+// the media's lock.
+type mediaUpdateHooks []*mediaUpdateHook
+
+// add registers f and returns the hook that remove takes.
+func (hs *mediaUpdateHooks) add(f func()) *mediaUpdateHook {
+	h := &mediaUpdateHook{f: f}
+	*hs = append(*hs, h)
+	return h
+}
+
+// remove takes h out again.
+func (hs *mediaUpdateHooks) remove(h *mediaUpdateHook) {
+	*hs = slices.DeleteFunc(*hs, func(x *mediaUpdateHook) bool { return x == h })
+}
+
+// run calls each of the hooks a copy holds; the copy is taken under the
+// media's lock and run with it released.
+func (hs mediaUpdateHooks) run() {
+	for _, h := range hs {
+		h.f()
+	}
+}
+
 // addMediaUpdateHook has f called after every update that replaces the media
 // session, once the session is in place and with the media's lock released,
 // and before the application's OnMediaUpdate. It returns the function that
@@ -19,13 +43,12 @@ type mediaUpdateHook struct {
 // media's audio has to know when its codec changes, and OnMediaUpdate belongs
 // to the application.
 func (d *DialogMedia) addMediaUpdateHook(f func()) (remove func()) {
-	h := &mediaUpdateHook{f: f}
 	d.mu.Lock()
-	d.mediaUpdateHooks = append(d.mediaUpdateHooks, h)
+	h := d.mediaUpdateHooks.add(f)
 	d.mu.Unlock()
 	return func() {
 		d.mu.Lock()
-		d.mediaUpdateHooks = slices.DeleteFunc(d.mediaUpdateHooks, func(x *mediaUpdateHook) bool { return x == h })
+		d.mediaUpdateHooks.remove(h)
 		d.mu.Unlock()
 	}
 }
@@ -43,7 +66,5 @@ func (d *DialogMedia) runMediaUpdateHooksUnsafe() {
 	}
 	d.mu.Unlock()
 	defer d.mu.Lock()
-	for _, h := range hooks {
-		h.f()
-	}
+	hooks.run()
 }

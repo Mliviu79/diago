@@ -9,17 +9,32 @@ import (
 	"github.com/emiago/diago/media"
 )
 
-// dtmfCodecWithoutNegotiated8000 returns the codec DTMF is read on, when
-// receive is set, or written on, for a media session that negotiated no
-// telephone-event/8000.
+// negotiatedDTMFCodec returns the codec DTMF is read on, when receive is set,
+// or written on, for a media session that negotiated common and has own as
+// its own codec list.
 //
-// It is the telephone-event the session does have: one negotiated at another
-// clock rate, or the one of its own list while nothing is negotiated yet. A
-// session with none at all gets the package default, payload type 101, so a
-// call whose peer offered no telephone-event still has a DTMF reader and
-// writer. The reader then takes for DTMF only what arrives on that number.
-func dtmfCodecWithoutNegotiated8000(s *media.MediaSession, receive bool) media.Codec {
-	codec, ok := media.CodecTelephoneEventFromSession(s)
+// It is telephone-event/8000 as negotiated, at the payload type the call runs
+// it on. Without it, it is the telephone-event the session does have: one
+// negotiated at another clock rate, or the one of its own list while nothing
+// is negotiated yet. A session with none at all gets the package default,
+// payload type 101, so a call whose peer offered no telephone-event still has
+// a DTMF reader and writer. The reader then takes for DTMF only what arrives
+// on that number.
+func negotiatedDTMFCodec(common, own []media.Codec, receive bool) media.Codec {
+	for _, codec := range common {
+		if !codec.Matches(media.CodecTelephoneEvent8000) {
+			continue
+		}
+		if receive {
+			codec.PayloadType = codec.PayloadTypeRecv()
+		}
+		return codec
+	}
+	listed := common
+	if len(listed) == 0 {
+		listed = own
+	}
+	codec, ok := media.CodecTelephoneEventFromList(listed)
 	if !ok {
 		return media.CodecTelephoneEvent8000
 	}
@@ -45,7 +60,7 @@ func (d *DialogMedia) initDTMFReaderUnsafe(r *DTMFReader) error {
 	}
 	r.dtmfReader = media.NewRTPDTMFReader(codec, d.RTPPacketReader, ar)
 	r.rtpDeadline = dialogRTPDeadline{dialog: d}
-	r.follow = &dtmfMediaFollow{dialog: d, receive: true, target: r.dtmfReader, mediaSession: d.mediaSession}
+	r.follow = &dtmfMediaFollow[*media.MediaSession]{dialog: d, receive: true, target: r.dtmfReader, installed: d.mediaSession}
 	return nil
 }
 
@@ -63,50 +78,76 @@ func (d *DialogMedia) initDTMFWriterUnsafe(w *DTMFWriter) error {
 		return err
 	}
 	w.dtmfWriter = media.NewRTPDTMFWriter(codec, d.RTPPacketWriter, aw)
-	w.follow = &dtmfMediaFollow{dialog: d, target: w.dtmfWriter, mediaSession: d.mediaSession}
+	w.follow = &dtmfMediaFollow[*media.MediaSession]{dialog: d, target: w.dtmfWriter, installed: d.mediaSession}
 	return nil
 }
 
+// dtmfCodecSince returns the media session the dialog runs on and the
+// telephone-event codec on it, when that session is not since. ok is false
+// when it is since, or when the dialog has no media session.
+func (d *DialogMedia) dtmfCodecSince(since *media.MediaSession, receive bool) (sess *media.MediaSession, codec media.Codec, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	sess = d.mediaSession
+	if sess == since {
+		return nil, media.Codec{}, false
+	}
+	codec, err := d.dtmfCodec(receive)
+	if err != nil {
+		// The dialog has no media session to follow.
+		return nil, media.Codec{}, false
+	}
+	return sess, codec, true
+}
+
+// dtmfMedia is the media of a dialog as a DTMF reader or writer follows it.
+// S tells apart the media installs a codec is taken from: the media session
+// itself where every update installs a new one, a count of installs where an
+// update may change the session in place.
+type dtmfMedia[S comparable] interface {
+	// dtmfCodecSince returns the install in place and the telephone-event
+	// codec on it, receive selecting the number the peer sends on, when that
+	// install is not since. ok is false when it is since, or when there is no
+	// media.
+	dtmfCodecSince(since S, receive bool) (installed S, codec media.Codec, ok bool)
+}
+
+// dtmfFollower moves a DTMF reader or writer to the telephone-event codec of
+// the media its dialog runs on.
+type dtmfFollower interface {
+	update()
+}
+
 // dtmfMediaFollow keeps a DTMF reader or writer on the telephone-event codec
-// of the media session its dialog runs on. telephone-event is a dynamic
-// format, and the offer behind a media update may carry it at another number
-// and drop the old one, which the answerer then must not send (RFC 3264
-// section 8.3.2).
-type dtmfMediaFollow struct {
-	dialog *DialogMedia
+// of the media its dialog runs on. telephone-event is a dynamic format, and
+// the offer behind a media update may carry it at another number and drop the
+// old one, which the answerer then must not send (RFC 3264 section 8.3.2).
+type dtmfMediaFollow[S comparable] struct {
+	dialog dtmfMedia[S]
 	// receive is set for a reader, which takes the number the peer sends on.
 	receive bool
 	// target is the RTP DTMF reader or writer kept on that codec.
 	target interface{ UpdateCodec(codec media.Codec) }
 
-	// mu guards mediaSession and keeps the codec changes made for it in the
-	// order of the sessions they were made for.
+	// mu guards installed and keeps the codec changes made for it in the
+	// order of the installs they were made for.
 	mu sync.Mutex
-	// mediaSession is the media session the codec in use was taken from.
-	mediaSession *media.MediaSession
+	// installed is the media install the codec in use was taken from.
+	installed S
 }
 
 // update gives the target the telephone-event codec of the dialog's current
-// media session when a media update has replaced the one the codec in use was
+// media when a media update has replaced the install the codec in use was
 // taken from.
-func (f *dtmfMediaFollow) update() {
+func (f *dtmfMediaFollow[S]) update() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	d := f.dialog
-	d.mu.Lock()
-	sess := d.mediaSession
-	if sess == f.mediaSession {
-		d.mu.Unlock()
+	installed, codec, ok := f.dialog.dtmfCodecSince(f.installed, f.receive)
+	if !ok {
 		return
 	}
-	codec, err := d.dtmfCodec(f.receive)
-	d.mu.Unlock()
-	if err != nil {
-		// The dialog has no media session to follow.
-		return
-	}
-	f.mediaSession = sess
+	f.installed = installed
 	f.target.UpdateCodec(codec)
 }
 
@@ -134,7 +175,7 @@ func (w *DTMFWriter) followMedia() {
 // kept the session it was made on set the deadline on one a media update had
 // replaced since.
 type dialogRTPDeadline struct {
-	dialog *DialogMedia
+	dialog dialogRTPControl
 }
 
 func (a dialogRTPDeadline) StopRTP(rw int8, dur time.Duration) error {

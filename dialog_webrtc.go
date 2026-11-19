@@ -38,6 +38,8 @@ type DialogWebrtc struct {
 	audioWriter io.Writer
 	onClose     func() error
 	closed      bool
+
+	dialogWebrtcState
 }
 
 func (d *DialogWebrtc) Init(sess *media.MediaSessionWebrtc, rtpSess *media.RTPSessionWebrtc) {
@@ -83,9 +85,16 @@ func (d *DialogWebrtc) OnClose(f func() error) {
 func (d *DialogWebrtc) Close() error {
 	d.mu.Lock()
 	if d.closed {
+		done := d.closeDone
 		d.mu.Unlock()
+		// The first Close is still releasing the media: this one reports it
+		// closed only once the release has run.
+		<-done
 		return nil
 	}
+	done := make(chan struct{})
+	d.closeDone = done
+	defer close(done)
 	rtpSess := d.rtpSession
 	sess := d.mediaSession
 	pendingSess := d.pendingMediaSession
@@ -125,7 +134,13 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 	d.mu.Lock()
 	current := d.mediaSession
 	pending := d.pendingMediaSession
+	closed := d.closed
 	d.mu.Unlock()
+	if closed {
+		// Nothing is described, and for an offer of ours nothing forked, on
+		// media that is closed.
+		return nil, errMediaClosed
+	}
 	if current == nil {
 		return nil, fmt.Errorf("dialog WebRTC media is not initialized")
 	}
@@ -160,7 +175,13 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 	d.mu.Lock()
 	current := d.mediaSession
 	pending := d.pendingMediaSession
+	closed := d.closed
 	d.mu.Unlock()
+	if closed {
+		// Close has taken what it closes already, and would not close what
+		// this exchange set up.
+		return errMediaClosed
+	}
 	if current == nil {
 		return fmt.Errorf("dialog WebRTC media is not initialized")
 	}
@@ -255,7 +276,9 @@ func (d *DialogWebrtc) commitCurrentMediaSession() {
 	if d.RTPPacketWriter != nil && d.rtpSession != nil && d.mediaSession != nil {
 		d.RTPPacketWriter.UpdateWriter(d.rtpSession, d.mediaSession.Codec())
 	}
+	d.noteInstallUnsafe()
 	d.mu.Unlock()
+	d.mediaInstalled()
 }
 
 func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error {
@@ -284,17 +307,25 @@ func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error
 		_ = sess.Close()
 		return fmt.Errorf("dialog WebRTC media replacement was canceled")
 	}
+	// The deadlines StopRTP and StartRTP last set go first: moving the packet
+	// reader ends a read waiting on the replaced transport, and that read is
+	// taken up again on the new one with the deadline it holds by then.
+	if err := sess.CarryRTPDeadlines(oldMediaSession); err != nil {
+		d.pendingMediaSession = nil
+		d.mu.Unlock()
+		return errors.Join(fmt.Errorf("carrying RTP deadlines to the new media session: %w", err), rtpSession.MonitorClose(), sess.Close())
+	}
 	reader.UpdateReader(rtpSession)
 	writer.UpdateWriter(rtpSession, sess.Codec())
 	d.mediaSession = sess
 	d.rtpSession = rtpSession
 	d.pendingMediaSession = nil
-	if dtmfReader, ok := d.audioReader.(*DTMFReader); ok {
-		dtmfReader.rtpDeadline = sess
-	}
+	d.noteInstallUnsafe()
 	d.mu.Unlock()
 
-	return errors.Join(oldRTPSession.MonitorClose(), oldMediaSession.Close())
+	err := errors.Join(oldRTPSession.MonitorClose(), oldMediaSession.Close())
+	d.mediaInstalled()
+	return err
 }
 
 type AudioReaderWebrtcOption func(*DialogWebrtc) error
@@ -306,7 +337,7 @@ func WithAudioReaderWebrtcProps(props *MediaProps) AudioReaderWebrtcOption {
 			return fmt.Errorf("media props are nil")
 		}
 		if d.mediaSession == nil {
-			return fmt.Errorf("no media setup")
+			return ErrNoMediaSetup
 		}
 		props.Codec = d.mediaSession.Codec()
 		props.Laddr = d.mediaSession.Laddr
@@ -321,14 +352,19 @@ func WithAudioReaderWebrtcDTMF(reader *DTMFReader) AudioReaderWebrtcOption {
 			return fmt.Errorf("DTMF reader is nil")
 		}
 		if d.mediaSession == nil || d.RTPPacketReader == nil {
-			return fmt.Errorf("no media setup")
+			return ErrNoMediaSetup
+		}
+		codec, err := d.dtmfCodecUnsafe(true)
+		if err != nil {
+			return err
 		}
 		reader.dtmfReader = media.NewRTPDTMFReader(
-			media.CodecTelephoneEvent8000,
+			codec,
 			d.RTPPacketReader,
 			d.audioReaderUnsafe(),
 		)
-		reader.rtpDeadline = d.mediaSession
+		reader.rtpDeadline = dialogRTPDeadline{dialog: d}
+		reader.follow = &dtmfMediaFollow[uint64]{dialog: d, receive: true, target: reader.dtmfReader, installed: d.installs}
 		d.audioReader = reader
 		return nil
 	}
@@ -339,7 +375,7 @@ func (d *DialogWebrtc) AudioReader(opts ...AudioReaderWebrtcOption) (io.Reader, 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.mediaSession == nil || d.RTPPacketReader == nil {
-		return nil, fmt.Errorf("no media setup")
+		return nil, ErrNoMediaSetup
 	}
 	for _, opt := range opts {
 		if err := opt(d); err != nil {
@@ -371,7 +407,7 @@ func WithAudioWriterWebrtcProps(props *MediaProps) AudioWriterWebrtcOption {
 			return fmt.Errorf("media props are nil")
 		}
 		if d.mediaSession == nil {
-			return fmt.Errorf("no media setup")
+			return ErrNoMediaSetup
 		}
 		props.Codec = d.mediaSession.Codec()
 		props.Laddr = d.mediaSession.Laddr
@@ -386,13 +422,18 @@ func WithAudioWriterWebrtcDTMF(writer *DTMFWriter) AudioWriterWebrtcOption {
 			return fmt.Errorf("DTMF writer is nil")
 		}
 		if d.RTPPacketWriter == nil {
-			return fmt.Errorf("no media setup")
+			return ErrNoMediaSetup
+		}
+		codec, err := d.dtmfCodecUnsafe(false)
+		if err != nil {
+			return err
 		}
 		writer.dtmfWriter = media.NewRTPDTMFWriter(
-			media.CodecTelephoneEvent8000,
+			codec,
 			d.RTPPacketWriter,
 			d.audioWriterUnsafe(),
 		)
+		writer.follow = &dtmfMediaFollow[uint64]{dialog: d, target: writer.dtmfWriter, installed: d.installs}
 		d.audioWriter = writer
 		return nil
 	}
@@ -403,7 +444,7 @@ func (d *DialogWebrtc) AudioWriter(opts ...AudioWriterWebrtcOption) (io.Writer, 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.mediaSession == nil || d.RTPPacketWriter == nil {
-		return nil, fmt.Errorf("no media setup")
+		return nil, ErrNoMediaSetup
 	}
 	for _, opt := range opts {
 		if err := opt(d); err != nil {

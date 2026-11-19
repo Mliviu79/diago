@@ -3,8 +3,8 @@
 package diago
 
 import (
+	"context"
 	"io"
-	"net"
 	"os"
 	"testing"
 	"time"
@@ -16,7 +16,8 @@ import (
 // mediaHandlePeer is the far end of a call whose media a MediaHandle drives:
 // it sends the call RTP and reads what the call sends.
 type mediaHandlePeer struct {
-	addr      *net.UDPAddr
+	// raddr is the peer's address as the call's negotiated props name it.
+	raddr     string
 	sendAudio func(t *testing.T)
 	sendDTMF  func(t *testing.T, pt uint8, marker bool, payload []byte)
 	recv      func(t *testing.T) uint8
@@ -40,7 +41,7 @@ func mediaHandleCases() []mediaHandleCase {
 			setUp: func(t *testing.T) (MediaHandle, *mediaHandlePeer) {
 				p := newFollowPeer(t)
 				return p.d, &mediaHandlePeer{
-					addr:      p.conn.LocalAddr().(*net.UDPAddr),
+					raddr:     p.conn.LocalAddr().String(),
 					sendAudio: p.sendAudio,
 					sendDTMF: func(t *testing.T, pt uint8, marker bool, payload []byte) {
 						p.send(t, pt, marker, 8000, payload)
@@ -49,6 +50,23 @@ func mediaHandleCases() []mediaHandleCase {
 				}
 			},
 			unset: func() MediaHandle { return &DialogMedia{} },
+		},
+		{
+			// telephone-event at a number other than the package default.
+			name:   "DialogWebrtc",
+			dtmfPT: 110,
+			setUp: func(t *testing.T) (MediaHandle, *mediaHandlePeer) {
+				d, p := newWebrtcHandleCall(t, []media.Codec{media.CodecAudioUlaw, telephoneEventAt(110)})
+				return d, &mediaHandlePeer{
+					raddr:     p.laddr,
+					sendAudio: p.sendAudio,
+					sendDTMF: func(t *testing.T, pt uint8, marker bool, payload []byte) {
+						p.send(t, pt, marker, 8000, payload)
+					},
+					recv: func(t *testing.T) uint8 { return p.recv(t).PayloadType },
+				}
+			},
+			unset: func() MediaHandle { return &DialogWebrtc{} },
 		},
 	}
 }
@@ -65,7 +83,7 @@ func TestMediaHandleSequence(t *testing.T) {
 			props, err := h.NegotiatedProps()
 			require.NoError(t, err)
 			require.True(t, props.Codec.Matches(media.CodecAudioUlaw), "NegotiatedProps() codec = %v, want PCMU", props.Codec)
-			require.Equal(t, peer.addr.String(), props.Raddr)
+			require.Equal(t, peer.raddr, props.Raddr)
 			require.NotEmpty(t, props.Laddr)
 
 			r, err := h.Reader()
@@ -152,6 +170,102 @@ func TestMediaHandleBeforeSetup(t *testing.T) {
 			require.ErrorIs(t, err, ErrNoMediaSetup)
 			require.ErrorIs(t, h.StopRTP(1, 0), ErrNoMediaSetup)
 			require.ErrorIs(t, h.StartRTP(1, 0), ErrNoMediaSetup)
+		})
+	}
+}
+
+// mediaHandleAudioHelpers are the audio helpers both media types have beside
+// MediaHandle.
+type mediaHandleAudioHelpers interface {
+	MediaHandle
+	ListenContext(ctx context.Context) error
+	ListenUntil(dur time.Duration) error
+	PlaybackRingtoneCreate() (AudioRingtone, error)
+}
+
+// audioHelpersOf returns the audio helpers of h, failing the test when its
+// type lacks them.
+func audioHelpersOf(t *testing.T, h MediaHandle) mediaHandleAudioHelpers {
+	t.Helper()
+	a, ok := h.(mediaHandleAudioHelpers)
+	require.True(t, ok, "%T lacks the audio helpers", h)
+	return a
+}
+
+// requireHandleReadable requires a plain read of the call to get the next
+// packet the peer sends, so no read deadline was left set.
+func requireHandleReadable(t *testing.T, h MediaHandle, peer *mediaHandlePeer) {
+	t.Helper()
+	r, err := h.Reader()
+	require.NoError(t, err)
+	peer.sendAudio(t)
+	_, err = readWithin(t, r, 5*time.Second)
+	require.NoError(t, err, "a read deadline was left set")
+}
+
+// TestMediaHandleListenHelpers pins, on each media type, that the helpers
+// that end a read with a read deadline end it on a silent peer and leave the
+// call's reads as they found them: a deadline left set fails every later read
+// at once.
+func TestMediaHandleListenHelpers(t *testing.T) {
+	for _, tc := range mediaHandleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("DTMFListen", func(t *testing.T) {
+				h, peer := tc.setUp(t)
+				r, err := h.AudioReaderDTMF()
+				require.NoError(t, err)
+				require.NoError(t, r.Listen(func(rune) error { return nil }, 50*time.Millisecond))
+				requireHandleReadable(t, h, peer)
+			})
+			t.Run("ListenContext", func(t *testing.T) {
+				h, peer := tc.setUp(t)
+				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				defer cancel()
+				require.NoError(t, audioHelpersOf(t, h).ListenContext(ctx))
+				requireHandleReadable(t, h, peer)
+			})
+			t.Run("ListenUntil", func(t *testing.T) {
+				h, peer := tc.setUp(t)
+				require.ErrorIs(t, audioHelpersOf(t, h).ListenUntil(50*time.Millisecond), os.ErrDeadlineExceeded)
+				requireHandleReadable(t, h, peer)
+			})
+		})
+	}
+}
+
+// TestMediaHandleRingtone pins, on each media type, that a ringtone playing
+// in the background goes out to the peer, keeps a read deadline another
+// helper set, and stops cleanly between two rings, leaving the writes going
+// out.
+func TestMediaHandleRingtone(t *testing.T) {
+	for _, tc := range mediaHandleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h, peer := tc.setUp(t)
+			ringtone, err := audioHelpersOf(t, h).PlaybackRingtoneCreate()
+			require.NoError(t, err)
+
+			r, err := h.Reader()
+			require.NoError(t, err)
+			require.NoError(t, h.StopRTP(1, 300*time.Millisecond))
+
+			stop, err := ringtone.PlayBackground()
+			require.NoError(t, err)
+
+			_, err = readWithin(t, r, 5*time.Second)
+			require.ErrorIs(t, err, os.ErrDeadlineExceeded, "the ringtone cleared the read deadline")
+			require.NoError(t, h.StartRTP(1, 0))
+
+			// A ring is 2 s of PCMU in 20 ms frames.
+			for range 100 {
+				peer.recv(t)
+			}
+			require.NoError(t, stop(), "a stop between rings is a clean stop")
+
+			w, err := h.Writer()
+			require.NoError(t, err)
+			_, err = w.Write(make([]byte, 160))
+			require.NoError(t, err, "a write deadline was left set")
+			peer.recv(t)
 		})
 	}
 }

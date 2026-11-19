@@ -6,6 +6,7 @@ package diago
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -19,9 +20,30 @@ type AudioRingtone struct {
 	writer     *audio.PCMEncoderWriter
 	ringtone   []byte
 	sampleSize int
-	// dialog is the dialog the ringtone plays on. Its write deadline, which
-	// stops the ringtone, is set on its current media session.
-	dialog *DialogMedia
+	// dialog is the media of the dialog the ringtone plays on. Its write
+	// deadline, which stops the ringtone, is set on its current media session.
+	dialog dialogRTPControl
+}
+
+// newAudioRingtone loads the ringtone in codec and encodes it to w, the audio
+// writer of the dialog whose RTP deadlines dialog sets.
+func newAudioRingtone(w io.Writer, codec media.Codec, dialog dialogRTPControl) (AudioRingtone, error) {
+	ringtone, err := audio.RingtoneLoadPCM(codec)
+	if err != nil {
+		return AudioRingtone{}, err
+	}
+
+	encoder := audio.PCMEncoderWriter{}
+	if err := encoder.Init(codec, w); err != nil {
+		return AudioRingtone{}, err
+	}
+
+	return AudioRingtone{
+		writer:     &encoder,
+		ringtone:   ringtone,
+		sampleSize: codec.Samples16(),
+		dialog:     dialog,
+	}, nil
 }
 
 // PlayBackground plays the ringtone until the returned stop is called. The

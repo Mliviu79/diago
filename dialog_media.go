@@ -83,7 +83,7 @@ type DialogMedia struct {
 
 	// mediaUpdateHooks are told of every media update, as onMediaUpdate is,
 	// see addMediaUpdateHook.
-	mediaUpdateHooks []*mediaUpdateHook
+	mediaUpdateHooks mediaUpdateHooks
 
 	// offerRequested is set while the peer's request has brought no session
 	// description and so asks for our offer, until that offer is made. See
@@ -607,7 +607,7 @@ func WithAudioReaderRTPStats(hook media.OnRTPReadStats) AudioReaderOption {
 		}
 		d.audioReader = &rtpStatsReader{
 			reader: d.getAudioReader(),
-			dialog: d,
+			stats:  d.rtpReadStats,
 			hook:   hook,
 		}
 		return nil
@@ -749,7 +749,7 @@ func WithAudioWriterRTPStats(hook media.OnRTPWriteStats) AudioWriterOption {
 		}
 		d.audioWriter = &rtpStatsWriter{
 			writer: d.getAudioWriter(),
-			dialog: d,
+			stats:  d.rtpWriteStats,
 			hook:   hook,
 		}
 		return nil
@@ -936,23 +936,7 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 		return AudioRingtone{}, ErrNoMediaSetup
 	}
 
-	ringtone, err := audio.RingtoneLoadPCM(mprops.Codec)
-	if err != nil {
-		return AudioRingtone{}, err
-	}
-
-	encoder := audio.PCMEncoderWriter{}
-	if err := encoder.Init(mprops.Codec, w); err != nil {
-		return AudioRingtone{}, err
-	}
-
-	ar := AudioRingtone{
-		writer:     &encoder,
-		ringtone:   ringtone,
-		sampleSize: mprops.Codec.Samples16(),
-		dialog:     d,
-	}
-	return ar, nil
+	return newAudioRingtone(w, mprops.Codec, d)
 }
 
 // AudioStereoRecordingCreate creates Stereo Recording audio Pipeline and stores as Wav file format
@@ -981,55 +965,20 @@ func (d *DialogMedia) AudioStereoRecordingCreate(wavFile *os.File) (AudioStereoR
 // Listen keeps reading stream until it gets closed or deadlined
 // Use ListenBackground or ListenContext for better control
 func (d *DialogMedia) Listen() (err error) {
-	buf := make([]byte, media.RTPBufSize)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-
-	for {
-		_, err := audioReader.Read(buf)
-		if err != nil {
-			return err
-		}
-	}
+	return listenReader(audioReader)
 }
 
 // ListenBackground listens on stream in background and allows correct stoping of stream on network layer
 func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
-	buf := make([]byte, media.RTPBufSize)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return nil, err
 	}
-
-	wg := sync.WaitGroup{}
-	var readErr error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			_, err := audioReader.Read(buf)
-			if err != nil {
-				if err, ok := err.(net.Error); ok && err.Timeout() {
-					return
-				}
-				readErr = err
-				return
-			}
-		}
-	}()
-
-	return func() error {
-		if err := d.StopRTP(1, 0); err != nil {
-			return err
-		}
-		wg.Wait() // This makes sure we have exited reading
-		if err := d.StartRTP(1, 0); err != nil {
-			return err
-		}
-		return readErr
-	}, nil
+	return listenBackground(audioReader, d), nil
 }
 
 // ListenContext listens until context is canceled.
@@ -1037,51 +986,21 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 // The context's end stops the read with a read deadline, which is cleared
 // again before ListenContext returns, and ListenContext then returns nil.
 func (d *DialogMedia) ListenContext(pctx context.Context) (err error) {
-	buf := make([]byte, media.RTPBufSize)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-	restoreReads := d.stopReadsAtEnd(pctx)
-	defer func() {
-		if restoreErr := restoreReads(); err == nil {
-			err = restoreErr
-		}
-	}()
-	for {
-		_, err := audioReader.Read(buf)
-		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Timeout() {
-				return nil
-			}
-			return err
-		}
-	}
+	return listenContext(pctx, audioReader, d)
 }
 
 // ListenUntil listens for dur, and returns the read deadline's error when dur
 // has passed. The read deadline is cleared again before it returns.
 func (d *DialogMedia) ListenUntil(dur time.Duration) (err error) {
-	buf := make([]byte, media.RTPBufSize)
-
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
-	if err := d.StopRTP(1, dur); err != nil {
-		return err
-	}
-	defer func() {
-		if startErr := d.StartRTP(1, 0); startErr != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-			err = errors.Join(err, startErr)
-		}
-	}()
-	for {
-		_, err := audioReader.Read(buf)
-		if err != nil {
-			return err
-		}
-	}
+	return listenUntil(audioReader, d, dur)
 }
 
 // StopRTP sets a read or write deadline, as MediaSession.StopRTP does, on the
@@ -1118,25 +1037,16 @@ type DTMFReader struct {
 	rtpDeadline rtpDTMFDeadline
 	dtmfReader  *media.RTPDtmfReader
 	onDTMF      func(dtmf rune) error
-	// follow is set on a reader of a DialogMedia, which then reads DTMF on
-	// the telephone-event payload type of the dialog's current media session.
-	follow *dtmfMediaFollow
+	// follow is set on a reader of a dialog, which then reads DTMF on the
+	// telephone-event payload type of the dialog's current media session.
+	follow dtmfFollower
 }
 
 func (d *DialogMedia) dtmfCodec(receive bool) (media.Codec, error) {
 	if d.mediaSession == nil {
 		return media.Codec{}, ErrNoMediaSetup
 	}
-	for _, codec := range d.mediaSession.CommonCodecs() {
-		if !codec.Matches(media.CodecTelephoneEvent8000) {
-			continue
-		}
-		if receive {
-			codec.PayloadType = codec.PayloadTypeRecv()
-		}
-		return codec, nil
-	}
-	return dtmfCodecWithoutNegotiated8000(d.mediaSession, receive), nil
+	return negotiatedDTMFCodec(d.mediaSession.CommonCodecs(), d.mediaSession.Codecs, receive), nil
 }
 
 // AudioReaderDTMF is DTMF over RTP. It reads audio and provides hook for dtmf while listening for audio
@@ -1209,9 +1119,9 @@ func (d *DTMFReader) Read(buf []byte) (n int, err error) {
 
 type DTMFWriter struct {
 	dtmfWriter *media.RTPDtmfWriter
-	// follow is set on a writer of a DialogMedia, which then writes DTMF on
-	// the telephone-event payload type of the dialog's current media session.
-	follow *dtmfMediaFollow
+	// follow is set on a writer of a dialog, which then writes DTMF on the
+	// telephone-event payload type of the dialog's current media session.
+	follow dtmfFollower
 }
 
 func (m *DialogMedia) AudioWriterDTMF() (*DTMFWriter, error) {
