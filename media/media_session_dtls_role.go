@@ -39,9 +39,9 @@ const (
 
 // mediaSessionState is the state a MediaSession keeps beside the fields it
 // negotiates with. Like them it is not safe for concurrent use, srtpReadState
-// apart. A fork starts an exchange of its own, so Fork carries none of it but
-// the DTLS association the fork continues, see carryDTLSAssociation, and the
-// stream list our SDPs are written around.
+// and leftRunning apart. A fork starts an exchange of its own, so Fork carries
+// none of it but the DTLS association the fork continues, see
+// carryDTLSAssociation, and the stream list our SDPs are written around.
 type mediaSessionState struct {
 	srtpReadState
 	dtlsAssociationState
@@ -66,9 +66,16 @@ type mediaSessionState struct {
 	dtlsRemoteSetup string
 
 	// onFinalize runs the negotiation RemoteSDP armed, the DTLS handshake,
-	// under the ctx FinalizeContext was given. It is nil when there is none
-	// to run.
-	onFinalize func(ctx context.Context) error
+	// under the ctx it is given. capped also ends the handshake after
+	// DTLSHandshakeTimeout; without it only ctx does. It is nil when there
+	// is none to run: before RemoteSDP armed one, and once FinalizeContext
+	// has run it or FinalizeWithin has taken it to run.
+	onFinalize func(ctx context.Context, capped bool) error
+
+	// leftRunning is the negotiation FinalizeWithin left running. It guards
+	// itself, since Close may run on another goroutine than the one that
+	// waits for the negotiation.
+	leftRunning negotiationLeftRunning
 }
 
 // answeringOffer reports whether the last body RemoteSDP applied was an offer,

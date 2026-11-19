@@ -17,8 +17,8 @@ import (
 // MediaSessionWebrtc. The DTLS stack retransmits its flights for as long as
 // its context lives, so without a cap a peer that never completes the
 // handshake would hold it, the caller of Finalize and the socket forever. A
-// handshake MediaSessionWebrtc.FinalizeWithin left running is capped from the
-// moment Finalize waits for it.
+// handshake FinalizeWithin left running, on either session type, is capped
+// from the moment Finalize waits for it.
 var DTLSHandshakeTimeout = 30 * time.Second
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose
@@ -144,15 +144,19 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []DTLSFingerp
 	}
 	s.dtlsTr = tr
 
-	s.onFinalize = func(ctx context.Context) error {
+	s.onFinalize = func(ctx context.Context, capped bool) error {
 		DefaultLogger().Debug("Starting dtls handshake",
 			"setup", setup,
 			"role", role,
 			"laddr", s.dtlsConn.LocalAddr().String(),
 			"raddr", s.dtlsConn.RemoteAddr().String(),
 		)
-		hctx, cancel := context.WithTimeout(ctx, DTLSHandshakeTimeout)
-		defer cancel()
+		hctx := ctx
+		if capped {
+			var cancel context.CancelFunc
+			hctx, cancel = context.WithTimeout(ctx, DTLSHandshakeTimeout)
+			defer cancel()
+		}
 		if err := s.dtlsConn.HandshakeContext(hctx); err != nil {
 			return fmt.Errorf("dtls conn handshake: %w", err)
 		}
@@ -230,20 +234,38 @@ func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []DTLSFingerp
 // for the peer, and ends with an error when ctx is done first, or at the
 // latest after DTLSHandshakeTimeout. A handshake is run once: after it, failed
 // or not, FinalizeContext has nothing left to run and returns nil.
+//
+// When FinalizeWithin left the handshake running, FinalizeContext waits for
+// that one instead, under the same bounds counted from this call: ctx and
+// DTLSHandshakeTimeout. When either ends first the handshake is ended with
+// it. The peer is expected to take part from this call on, so a ClientHello
+// it has not answered is sent again at once, rather than when the DTLS
+// stack's retransmission timer, which may have backed off to a minute, next
+// fires. A handshake left running that failed stays failed: FinalizeContext
+// returns its error from then on.
 func (s *MediaSession) FinalizeContext(ctx context.Context) error {
+	run, kept := s.leftRunning.current()
+	if run != nil {
+		return s.leftRunning.await(ctx, run, DTLSHandshakeTimeout, s.resendClientHello)
+	}
+	if kept != nil {
+		return kept
+	}
 	if s.onFinalize != nil {
-		err := s.onFinalize(ctx)
+		err := s.onFinalize(ctx, true)
 		s.onFinalize = nil
 		return err
 	}
 	return nil
 }
 
-// FinalizePending reports whether FinalizeContext has negotiation left to run:
-// the DTLS handshake RemoteSDP armed. A session that needs none, and one whose
-// handshake has been run, has nothing pending.
+// FinalizePending reports whether FinalizeContext has negotiation left to run
+// or to wait for: the DTLS handshake RemoteSDP armed, or one FinalizeWithin
+// left running that has not been waited for. A session that needs none, and
+// one whose handshake has been run, has nothing pending.
 func (s *MediaSession) FinalizePending() bool {
-	return s.onFinalize != nil
+	run, _ := s.leftRunning.current()
+	return s.onFinalize != nil || run != nil
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is

@@ -355,6 +355,10 @@ func (s *MediaSession) Fork() *MediaSession {
 }
 
 func (s *MediaSession) Close() error {
+	// A negotiation FinalizeWithin left running reads and writes the sockets
+	// closed below, so it ends first.
+	s.leftRunning.stop()
+
 	// panic("calling close")
 	var e1, e2 error
 	if s.rtcpConn != nil {
