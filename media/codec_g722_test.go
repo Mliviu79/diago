@@ -32,7 +32,9 @@ func TestCodecG722FromPayloadType(t *testing.T) {
 }
 
 func TestCodecG722SDPRtpmap(t *testing.T) {
-	codecs := []Codec{CodecAudioG722, CodecTelephoneEvent8000}
+	// The rtpmap carries the codec's own name, so the registered spelling is
+	// that of the codecs the application configures.
+	codecs := CodecsWithRegisteredNames(CodecAudioG722, CodecTelephoneEvent8000)
 	ip := net.IPv4(127, 0, 0, 1)
 	out := string(generateSDPForAudio(1, 1, "RTP/AVP", ip, ip, 10000, sdp.ModeSendrecv, codecs, sdesInline{}, nil))
 

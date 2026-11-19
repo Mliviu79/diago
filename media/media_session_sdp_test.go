@@ -94,9 +94,11 @@ func TestGenerateSDPTelephoneEventCanonicalRtpmap(t *testing.T) {
 
 // Static payload types are frozen by the RTP/AVP registry (RFC 3551 section 6).
 // This is the control: the everyday PSTN answer must be byte for byte what it
-// was before dynamic formats stopped being keyed by number.
+// was before dynamic formats stopped being keyed by number. The names are the
+// codecs' own, so the registered spelling is asked for with
+// CodecsWithRegisteredNames.
 func TestGenerateSDPStaticCodecsUnchanged(t *testing.T) {
-	out := sdpForCodecs(CodecAudioUlaw, CodecAudioAlaw, CodecAudioG722, CodecTelephoneEvent8000)
+	out := sdpForCodecs(CodecsWithRegisteredNames(CodecAudioUlaw, CodecAudioAlaw, CodecAudioG722, CodecTelephoneEvent8000)...)
 
 	require.Contains(t, out, "m=audio 5004 RTP/AVP 0 8 9 101")
 	assert.Contains(t, out, "a=rtpmap:0 PCMU/8000")
@@ -112,7 +114,7 @@ func TestGenerateSDPStaticCodecsUnchanged(t *testing.T) {
 	assert.NotContains(t, out, "G722/16000")
 }
 
-// Encoding names are case insensitive (RFC 4566 section 6). InitWithSDP writes
+// Encoding names are case insensitive (RFC 4855 section 3). InitWithSDP writes
 // peer spelled names straight into the codec list, bypassing negotiation.
 func TestGenerateSDPDynamicCodecNameCaseInsensitive(t *testing.T) {
 	opus := opusAt(111)
@@ -120,8 +122,17 @@ func TestGenerateSDPDynamicCodecNameCaseInsensitive(t *testing.T) {
 	te := telephoneEventAt(96)
 	te.Name = "TELEPHONE-EVENT"
 
+	// The format is recognised in any spelling, so its parameters are written.
 	out := sdpForCodecs(opus, te)
 
+	assert.Contains(t, out, "a=fmtp:111 useinbandfec=0")
+	assert.Contains(t, out, "a=fmtp:96 0-16")
+
+	// The name on the wire is the codec's own, so the registered spelling is
+	// asked for.
+	out = sdpForCodecs(CodecsWithRegisteredNames(opus, te)...)
+
+	assert.Contains(t, out, "a=rtpmap:111 opus/48000/2")
 	assert.Contains(t, out, "a=fmtp:111 useinbandfec=0")
 	assert.Contains(t, out, "a=rtpmap:96 telephone-event/8000")
 	assert.Contains(t, out, "a=fmtp:96 0-16")
