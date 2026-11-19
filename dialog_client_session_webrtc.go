@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
@@ -28,6 +29,12 @@ type InviteWebrtcOptions struct {
 	// response. InviteWebrtc returns the usable media together with
 	// ErrClientEarlyMedia; call WaitAnswerWebrtc to finish the call.
 	EarlyMediaDetect bool
+	// EarlyMediaKeyTimeout bounds how long, with EarlyMediaDetect, the call
+	// waits for the callee to key the early media of a 183, by completing ICE
+	// and the DTLS handshake, before it takes the call as having none. Zero
+	// means five seconds. It bounds the wait only: the negotiation goes on,
+	// and the ACK completes it.
+	EarlyMediaKeyTimeout time.Duration
 
 	WebrtcConfig media.MediaSessionWebrtcConfig
 	// OnICEStateChange observes ICE transport state. It must not block.
@@ -41,6 +48,13 @@ type InviteWebrtcOptions struct {
 // establishes the WebRTC transport and returns it with ErrClientEarlyMedia.
 // The caller can use the returned media immediately, then call
 // WaitAnswerWebrtc to wait for the final response and ACK it.
+//
+// The callee is given EarlyMediaKeyTimeout to key the early media. Early
+// media it has not keyed by then is not reported: InviteWebrtc goes on to the
+// 2xx, the answer of the 183 stands and no later session description is
+// applied (RFC 3261 section 13.2.1), and once the ACK is sent it completes the
+// negotiation of the 183, bounded by ctx, media.ICEConnectTimeout and
+// media.DTLSHandshakeTimeout.
 func (d *DialogClientSession) InviteWebrtc(ctx context.Context, opts InviteWebrtcOptions) (*DialogWebrtc, error) {
 	return d.inviteWebrtcWith(ctx, opts, d.DialogClientSession.WaitAnswer)
 }
@@ -92,23 +106,30 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 						return err
 					}
 				}
-				if res.StatusCode != sip.StatusSessionInProgress {
+				if earlySessionDescription(res) == nil {
 					return nil
 				}
-				contentType := res.ContentType()
-				if contentType == nil || contentType.Value() != "application/sdp" || res.Body() == nil {
-					return nil
-				}
-				if err := setupWebrtcMedia(ctx, sess, med, res.Body()); err != nil {
+				// The answer of the 183 is applied and keyed through the
+				// media, which takes the transport of the offer for it.
+				if err := med.takeFirstExchange(sess); err != nil {
 					return err
 				}
-				return ErrClientEarlyMedia
+				return d.takeEarlyWebrtcAnswer(ctx, med, res, opts.EarlyMediaKeyTimeout)
 			}
 		}
 		if err = wait(ctx, answerOpts); err != nil {
 			return err
 		}
 		answered = true
+		if d.earlyKeyingLeft() {
+			// The answer of the 183 stands (RFC 3261 section 13.2.1), and the
+			// negotiation it started is completed once the ACK is out.
+			if err = d.Ack(ctx); err != nil {
+				return err
+			}
+			acked = true
+			return med.onFinalize(ctx)
+		}
 		remoteSDP := d.InviteResponse.Body()
 		if remoteSDP == nil {
 			return fmt.Errorf("no SDP in response")
@@ -143,13 +164,6 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 	return med, nil
 }
 
-func setupWebrtcMedia(ctx context.Context, sess *media.MediaSessionWebrtc, med *DialogWebrtc, remoteSDP []byte) error {
-	if err := sess.RemoteSDP(ctx, remoteSDP, true); err != nil {
-		return err
-	}
-	return finalizeWebrtcMedia(ctx, sess, med)
-}
-
 func finalizeWebrtcMedia(ctx context.Context, sess *media.MediaSessionWebrtc, med *DialogWebrtc) error {
 	if err := sess.Finalize(ctx); err != nil {
 		return err
@@ -173,12 +187,21 @@ func (d *DialogClientSession) registerWebrtcDialogCallbacks(med *DialogWebrtc, o
 // WaitAnswerWebrtc continues an InviteWebrtc call that returned
 // ErrClientEarlyMedia. The early WebRTC transport remains active while this
 // method waits for the final response; on success it sends the ACK.
+//
+// The session description of the 2xx is applied to med in place, as the 2xx
+// after early media of DialogMedia is: a 2xx whose description cannot be
+// applied is acknowledged and the call ended with a BYE, and the error
+// returned. A 2xx without one leaves the media as the 183 set it up.
 func (d *DialogClientSession) WaitAnswerWebrtc(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if med == nil || med.MediaSession() == nil {
 		return fmt.Errorf("dialog WebRTC media is not initialized")
 	}
 	if err := d.DialogClientSession.WaitAnswer(ctx, opts); err != nil {
 		return err
+	}
+	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {
+		// The 2xx is acknowledged and the call it set up ended.
+		return errors.Join(err, d.ackAndBye())
 	}
 	return d.Ack(ctx)
 }

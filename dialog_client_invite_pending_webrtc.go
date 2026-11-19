@@ -35,13 +35,18 @@ func (d *DialogClientSession) InviteWebrtcLeavePending(ctx context.Context, opts
 // and the error wraps sipgo.ErrInvitePending and context.Cause(ctx). It goes
 // on with the INVITE that InviteWebrtcLeavePending returned
 // ErrClientEarlyMedia for, and med is the media returned with it, which stays
-// as it is when the wait returns an error. On success it sends the ACK.
+// as it is when the wait returns an error. On success it applies the session
+// description of the 2xx to med and sends the ACK, as WaitAnswerWebrtc does.
 func (d *DialogClientSession) WaitAnswerWebrtcLeavePending(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if med == nil || med.MediaSession() == nil {
 		return errors.New("dialog WebRTC media is not initialized")
 	}
 	if err := d.DialogClientSession.WaitAnswerLeavePending(ctx, opts); err != nil {
 		return err
+	}
+	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {
+		// The 2xx is acknowledged and the call it set up ended.
+		return errors.Join(err, d.ackAndBye())
 	}
 	return d.Ack(ctx)
 }

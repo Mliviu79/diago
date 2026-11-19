@@ -38,10 +38,20 @@ var errNoOfferInInvite = errors.New("no sdp present in INVITE")
 // A call ProgressMedia gave early media is answered with that media, which is
 // returned: the 2xx repeats the answer of the 183, and the DTLS handshake
 // ProgressMedia left running is completed or the call declined 488, as
-// AnswerEarlyMedia describes. A refusal waits for its ACK within ctx too.
+// AnswerEarlyMedia describes. A refusal waits for its ACK within ctx too. A
+// call ProgressMediaWebrtc gave early media is answered with
+// AnswerWebrtcContext, and AnswerContext returns an error for it, sending
+// nothing.
 func (d *DialogServerSession) AnswerContext(ctx context.Context) (*DialogMedia, error) {
-	if med, early, ok := d.earlyMedia(); ok {
-		return d.answerEarlyMediaWithin(ctx, med, early)
+	if keyer, early, ok := d.earlyMedia(); ok {
+		med, ok := keyer.(*DialogMedia)
+		if !ok {
+			return nil, errEarlyMediaOtherType
+		}
+		if err := d.answerEarlyMediaWithin(ctx, med, early); err != nil {
+			return nil, err
+		}
+		return med, nil
 	}
 	return d.answerOfferWithin(ctx, d.mediaConf, nil)
 }
@@ -53,9 +63,16 @@ func (d *DialogServerSession) AnswerOptions(ctx context.Context, opt AnswerOptio
 	d.onReferDialog = opt.OnRefer
 	d.dialogCallbacks.mu.Unlock()
 
-	if med, early, ok := d.earlyMedia(); ok {
+	if keyer, early, ok := d.earlyMedia(); ok {
+		med, ok := keyer.(*DialogMedia)
+		if !ok {
+			return nil, errEarlyMediaOtherType
+		}
 		med.setOnMediaUpdate(opt.OnMediaUpdate)
-		return d.answerEarlyMediaWithin(ctx, med, early)
+		if err := d.answerEarlyMediaWithin(ctx, med, early); err != nil {
+			return nil, err
+		}
+		return med, nil
 	}
 
 	conf := d.mediaConf

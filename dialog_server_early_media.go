@@ -12,7 +12,8 @@ import (
 )
 
 // ErrEarlyMediaNotKeyed is returned by ProgressMedia when the caller did not key
-// DTLS-SRTP early media within ProgressMediaOptions.KeyTimeout, most likely
+// DTLS-SRTP early media within ProgressMediaOptions.KeyTimeout, and by
+// ProgressMediaWebrtc within ProgressMediaWebrtcOptions.KeyTimeout, most likely
 // because it ignores early media (RFC 3960) and takes part in the DTLS
 // handshake only once the call is answered.
 //
@@ -22,8 +23,16 @@ import (
 // AnswerEarlyMedia with that media, or AnswerContext, sends the 200 and then
 // completes the handshake ProgressMedia started, bounded by the call and by
 // media.DTLSHandshakeTimeout, before the media is set up. When that handshake
-// has failed by then, the answer declines the call 488 instead.
+// has failed by then, the answer declines the call 488 instead. The media
+// ProgressMediaWebrtc returned with it has no transport set up until
+// AnswerWebrtcContext, or AnswerWebrtc, has answered the call the same way.
 var ErrEarlyMediaNotKeyed = errors.New("early media not keyed: the caller has not completed the DTLS handshake")
+
+// errEarlyMediaOtherType refuses an answer with media of one type to a call
+// that ProgressMedia or ProgressMediaWebrtc gave early media of the other: the
+// 2xx repeats the answer of the 183 (RFC 3261 section 13.2.1), and only the
+// media that made that answer carries the session it describes.
+var errEarlyMediaOtherType = errors.New("answer: the early media of the call is of another media type")
 
 // keyEarlyMedia has keyer, the media whose answer the 183 just sent carried
 // as answer, keyed by the caller, and records that answer for the 2xx to
@@ -59,21 +68,22 @@ func (d *DialogServerSession) keyEarlyMedia(keyer mediaEarlyKeyer, answer []byte
 	return nil
 }
 
-// earlyAnswerOf returns the answer the 183 of ProgressMedia carried when med
-// is the media that ProgressMedia made, and false for any other media, which
-// describes itself in the 2xx.
-func (d *DialogServerSession) earlyAnswerOf(med *DialogMedia) (earlyAnswer, bool) {
-	registered, ok := d.mediaHanshakerLocked().(*DialogMedia)
+// earlyAnswerOf returns the answer the 183 of ProgressMedia or
+// ProgressMediaWebrtc carried when med is the media that it made, and false
+// for any other media, which describes itself in the 2xx.
+func (d *DialogServerSession) earlyAnswerOf(med mediaEarlyKeyer) (earlyAnswer, bool) {
+	registered, ok := d.mediaHanshakerLocked().(mediaEarlyKeyer)
 	if !ok || registered != med {
 		return earlyAnswer{}, false
 	}
 	return d.earlyAnswer()
 }
 
-// earlyMedia returns the media ProgressMedia gave the call, with the answer
-// its 183 carried, and false for a call without early media.
-func (d *DialogServerSession) earlyMedia() (*DialogMedia, earlyAnswer, bool) {
-	med, ok := d.mediaHanshakerLocked().(*DialogMedia)
+// earlyMedia returns the media ProgressMedia or ProgressMediaWebrtc gave the
+// call, with the answer its 183 carried, and false for a call without early
+// media.
+func (d *DialogServerSession) earlyMedia() (mediaEarlyKeyer, earlyAnswer, bool) {
+	med, ok := d.mediaHanshakerLocked().(mediaEarlyKeyer)
 	if !ok {
 		return nil, earlyAnswer{}, false
 	}
@@ -82,20 +92,17 @@ func (d *DialogServerSession) earlyMedia() (*DialogMedia, earlyAnswer, bool) {
 }
 
 // answerEarlyMediaWithin answers, within ctx, a call that has the early media
-// med, as AnswerContext describes, and returns med.
-func (d *DialogServerSession) answerEarlyMediaWithin(ctx context.Context, med *DialogMedia, early earlyAnswer) (*DialogMedia, error) {
+// med, as AnswerContext describes.
+func (d *DialogServerSession) answerEarlyMediaWithin(ctx context.Context, med mediaEarlyKeyer, early earlyAnswer) error {
 	if ctx.Err() != nil {
-		return nil, fmt.Errorf("answer: %w", context.Cause(ctx))
+		return fmt.Errorf("answer: %w", context.Cause(ctx))
 	}
 	// RFC 4028: negotiate session timers before the 200 OK, as an answer
 	// without early media does.
 	if err := d.prepareSessionTimers(ctx); err != nil {
-		return nil, err
+		return err
 	}
-	if err := d.answerEarlyWithin(ctx, med, early); err != nil {
-		return nil, err
-	}
-	return med, nil
+	return d.answerEarlyWithin(ctx, med, early)
 }
 
 // answerEarlyWithin answers 200 a call whose 183 carried early as its answer,

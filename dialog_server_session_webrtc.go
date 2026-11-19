@@ -28,7 +28,13 @@ type AnswerWebrtcOptions struct {
 
 // AnswerWebrtc consumes the WebRTC SDP offer, sends a SIP 200 answer and
 // completes ICE/DTLS-SRTP negotiation before returning.
+//
+// A call ProgressMediaWebrtc gave early media is answered with that media, as
+// AnswerWebrtcContext answers it, on the dialog's context.
 func (d *DialogServerSession) AnswerWebrtc(opts AnswerWebrtcOptions) (*DialogWebrtc, error) {
+	if med, early, ok := d.earlyMedia(); ok {
+		return d.answerEarlyWebrtcWithin(d.Context(), med, early, opts)
+	}
 	// RFC 4028: as Answer, negotiate session timers before the 2xx.
 	if err := d.prepareSessionTimers(d.Context()); err != nil {
 		return nil, err

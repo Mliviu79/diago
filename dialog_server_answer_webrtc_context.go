@@ -29,9 +29,21 @@ import (
 // ctx bounds the wait and nothing else: the media runs until it is closed,
 // which the session's Close and the peer's BYE do. The media of an answer
 // that returned an error is closed by the session too.
+//
+// A call ProgressMediaWebrtc gave early media is answered with that media,
+// which is returned: the 200 repeats the answer of the 183, and the
+// negotiation ProgressMediaWebrtc left running is completed by the reading of
+// the ACK, or the call declined 488 when it has failed by then. The codecs and
+// WebRTC configuration of opts then go unused: the media was made with those
+// ProgressMediaWebrtc had. A call ProgressMedia gave early media is answered
+// with AnswerContext, and AnswerWebrtcContext returns an error for it, sending
+// nothing.
 func (d *DialogServerSession) AnswerWebrtcContext(ctx context.Context, opts AnswerWebrtcOptions) (*DialogWebrtc, error) {
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("answer: %w", context.Cause(ctx))
+	}
+	if med, early, ok := d.earlyMedia(); ok {
+		return d.answerEarlyWebrtcWithin(ctx, med, early, opts)
 	}
 	// RFC 4028: negotiate session timers before the 200 OK, as AnswerContext
 	// does.

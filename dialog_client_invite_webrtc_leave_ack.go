@@ -34,11 +34,13 @@ var errNoAnswerIn2xx = errors.New("no SDP in response")
 // comes with no media, the media made for the INVITE being closed, the
 // pending INVITE's included.
 //
-// With EarlyMediaDetect, WebRTC media set up from a 183 is returned with
-// ErrClientEarlyMedia as InviteWebrtc returns it, and
-// WaitAnswerWebrtcLeaveAck goes on waiting for the answer. The answer of the
-// 183 stands for the call (RFC 3261 section 13.2.1), so the session
-// description of the 2xx that follows is not applied.
+// With EarlyMediaDetect, WebRTC early media the callee keyed within
+// EarlyMediaKeyTimeout is returned with ErrClientEarlyMedia as InviteWebrtc
+// returns it, and WaitAnswerWebrtcLeaveAck goes on waiting for the answer and
+// applies the session description of the 2xx as WaitAnswerWebrtc does. Early
+// media the callee has not keyed by then is not reported: the answer of the
+// 183 stands (RFC 3261 section 13.2.1), the 2xx is returned with the media
+// not set up, and Ack completes the negotiation of the 183.
 //
 // A 2xx whose answer is missing or cannot be applied is acknowledged and the
 // call ended with a BYE (RFC 3261 section 13.2.2.4), and the error returned.
@@ -97,58 +99,34 @@ func (d *DialogClientSession) inviteWebrtcLeaveAck(ctx context.Context, med *Dia
 		Password:   opts.Password,
 	}
 	if opts.EarlyMediaDetect {
-		answerOpts.OnResponse = earlyWebrtcMedia(ctx, med, opts.OnResponse)
+		onResponse := opts.OnResponse
+		answerOpts.OnResponse = func(res *sip.Response) error {
+			if onResponse != nil {
+				if err := onResponse(res); err != nil {
+					return err
+				}
+			}
+			return d.takeEarlyWebrtcAnswer(ctx, med, res, opts.EarlyMediaKeyTimeout)
+		}
 	}
 	return d.waitAnswerWebrtcLeaveAck(ctx, med, answerOpts)
 }
 
-// earlyWebrtcMedia returns the response callback of an INVITE whose WebRTC
-// early media is asked for: after onResponse, a 183 with a session
-// description has that description applied to med as the answer and med
-// completed within ctx, and the wait then ends with ErrClientEarlyMedia. A
-// 183 that follows media set up so brings nothing more: the first answer
-// stands (RFC 3261 section 13.2.1).
-func earlyWebrtcMedia(ctx context.Context, med *DialogWebrtc, onResponse func(*sip.Response) error) func(*sip.Response) error {
-	return func(res *sip.Response) error {
-		if onResponse != nil {
-			if err := onResponse(res); err != nil {
-				return err
-			}
-		}
-		if res.StatusCode != sip.StatusSessionInProgress {
-			return nil
-		}
-		contentType := res.ContentType()
-		if contentType == nil || contentType.Value() != "application/sdp" || res.Body() == nil {
-			return nil
-		}
-		if med.MediaSession() != nil {
-			return nil
-		}
-		if err := med.onRemoteSDP(ctx, res.Body(), true); err != nil {
-			return err
-		}
-		if err := med.onFinalize(ctx); err != nil {
-			return err
-		}
-		return ErrClientEarlyMedia
-	}
-}
-
 // waitAnswerWebrtcLeaveAck waits for the INVITE's final response, leaving it
-// pending when ctx ends first, and applies the answer of a 2xx to med unless
-// early media set med up already.
+// pending when ctx ends first, and applies the answer of a 2xx to med. After
+// early media that answer is applied as WaitAnswerWebrtc applies it, and none
+// is applied after a 183 whose negotiation was left running.
 func (d *DialogClientSession) waitAnswerWebrtcLeaveAck(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if err := d.DialogClientSession.WaitAnswerLeavePending(ctx, opts); err != nil {
 		return err
 	}
-	if med.MediaSession() != nil {
-		// The answer of the 183 stands, and its media runs.
-		return nil
-	}
-	answer := d.InviteResponse.Body()
+	// Without early media the 2xx carries the answer to the offer.
 	err := errNoAnswerIn2xx
-	if answer != nil {
+	answer := d.InviteResponse.Body()
+	switch {
+	case med.MediaSession() != nil || d.earlyKeyingLeft():
+		err = d.applyEarlyWebrtcFinalAnswer(ctx, med)
+	case answer != nil:
 		err = med.onRemoteSDP(ctx, answer, true)
 	}
 	if err == nil {

@@ -209,7 +209,12 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 
 	if offered {
 		if pending == nil {
-			return fmt.Errorf("dialog WebRTC re-INVITE has no pending local offer")
+			// The answer to the offer the running transport made, as the
+			// 2xx after early media carries it: applied in place.
+			if err := d.setPendingMediaSession(current); err != nil {
+				return err
+			}
+			pending = current
 		}
 		if err := pending.RemoteSDP(ctx, remoteSDP, true); err != nil {
 			d.abortPendingMediaSession()

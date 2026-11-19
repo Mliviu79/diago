@@ -90,6 +90,13 @@ func (d *DialogWebrtc) finalizeFirstExchange(ctx context.Context, sess *media.Me
 		d.abortPendingMediaSession()
 		return err
 	}
+	return d.installFirstExchange(sess)
+}
+
+// installFirstExchange sets sess, the completed transport of the media's
+// first exchange, up as the media of the call, with its RTP session, reader
+// and writer, and starts its RTCP monitor.
+func (d *DialogWebrtc) installFirstExchange(sess *media.MediaSessionWebrtc) error {
 	rtpSess := media.NewRTPSessionWebrtc(sess)
 	d.mu.Lock()
 	if d.closed || d.pendingMediaSession != sess {
