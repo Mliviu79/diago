@@ -322,13 +322,9 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	if !ok {
 		return fmt.Errorf("remote WebRTC SDP has no DTLS setup role")
 	}
-	fingerprintValue, ok := webRTCAttribute(desc.Attributes, md.Attributes, "fingerprint")
-	if !ok {
-		return fmt.Errorf("remote WebRTC SDP has no DTLS fingerprint")
-	}
-	fingerprintFields := strings.Fields(fingerprintValue)
-	if len(fingerprintFields) != 2 {
-		return fmt.Errorf("invalid remote DTLS fingerprint %q", fingerprintValue)
+	fingerprints, err := remoteDTLSFingerprints(desc.Attributes, md.Attributes)
+	if err != nil {
+		return err
 	}
 
 	remoteCodecs, err := webRTCAudioCodecs(&desc, md)
@@ -422,10 +418,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		localDTLSClient = true
 		m.localSetup = "active"
 	}
-	dtlsConf := m.Config.DTLS.ToLibConf([]media.DTLSFingerprint{{
-		Algorithm: fingerprintFields[0],
-		Value:     fingerprintFields[1],
-	}})
+	dtlsConf := m.Config.DTLS.ToLibConf(fingerprints)
 	if localDTLSClient {
 		m.dtlsConn, err = dtls.Client(m.mux.dtls, conn.RemoteAddr(), dtlsConf)
 	} else {
