@@ -58,10 +58,12 @@ func TestConnectionInformationSessionLevel(t *testing.T) {
 }
 
 // TestConnectionInformationMultipleMediaLines documents why taking the last c=
-// is sound. Line order alone cannot bind a c= to its section, so with several m=
-// lines the last c= may belong to some other stream. MediaDescription already
-// rejects that body, and ConnectionInformation rejects it for the same reason
-// rather than quietly answering with the video section's address.
+// is sound only for a single m= line. Line order alone cannot bind a c= to its
+// section, so with several m= lines the last c= may belong to some other stream.
+// ConnectionInformation keeps answering such a body with its first c=, the
+// session level one here, and never with the video section's address.
+// MediaDescription rejects the body, which is what stops a media session from
+// being set up on it.
 func TestConnectionInformationMultipleMediaLines(t *testing.T) {
 	sd := SessionDescription{}
 	require.NoError(t, Unmarshal(offer(
@@ -73,10 +75,29 @@ func TestConnectionInformationMultipleMediaLines(t *testing.T) {
 		"c=IN IP4 192.0.2.44", // video's address, must never govern audio
 	), &sd))
 
-	_, err := sd.ConnectionInformation()
-	require.Error(t, err)
+	ci, err := sd.ConnectionInformation()
+	require.NoError(t, err)
+	require.Equal(t, "203.0.113.9", ci.IP.String())
 
 	_, err = sd.MediaDescription("audio")
+	require.Error(t, err)
+}
+
+// TestConnectionInformationMultipleMediaLinesMalformed covers the truncated c=
+// on the path a body with several m= lines takes: the first c= is the one read
+// there, and it is indexed behind the same field count guard.
+func TestConnectionInformationMultipleMediaLinesMalformed(t *testing.T) {
+	sd := SessionDescription{}
+	require.NoError(t, Unmarshal(offer(
+		"v=0",
+		"c=IN IP4", // truncated before the address
+		"t=0 0",
+		"m=audio 5004 RTP/AVP 8",
+		"m=video 5006 RTP/AVP 96",
+		"c=IN IP4 192.0.2.44",
+	), &sd))
+
+	_, err := sd.ConnectionInformation()
 	require.Error(t, err)
 }
 
