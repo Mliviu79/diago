@@ -79,8 +79,9 @@ func mediaLines(body []byte) []string {
 }
 
 // withoutRejectedStreams returns the lines of an SDP body without each m= line
-// whose port is 0, and requires that no line follows one before the next m=
-// line: a rejected stream is answered with its m= line alone.
+// whose port is 0 and the a=mid line that identifies that stream, and requires
+// that no other line follows one before the next m= line: a rejected stream is
+// answered with its m= line and its tag alone.
 func withoutRejectedStreams(t *testing.T, body []byte) []string {
 	t.Helper()
 	var kept []string
@@ -93,11 +94,31 @@ func withoutRejectedStreams(t *testing.T, body []byte) []string {
 				continue
 			}
 		} else if rejected {
-			require.Failf(t, "a rejected stream carries a line", "line %q follows a rejected m= line in\n%s", l, body)
+			if !strings.HasPrefix(l, "a=mid:") {
+				require.Failf(t, "a rejected stream carries a line", "line %q follows a rejected m= line in\n%s", l, body)
+			}
+			continue
 		}
 		kept = append(kept, l)
 	}
 	return kept
+}
+
+// streamTagsOf returns, for each m= line of an SDP body in order, the
+// identification-tag its section carries as a=mid, or "" for a section
+// without one.
+func streamTagsOf(body []byte) []string {
+	var tags []string
+	for _, l := range streamsSDPLines(body) {
+		if strings.HasPrefix(l, "m=") {
+			tags = append(tags, "")
+			continue
+		}
+		if tag, ok := strings.CutPrefix(l, "a=mid:"); ok && len(tags) > 0 {
+			tags[len(tags)-1] = tag
+		}
+	}
+	return tags
 }
 
 // answerTo applies offer to a new session and returns the session and its
@@ -268,6 +289,91 @@ func TestMediaSessionAnswersEveryOfferedStream(t *testing.T) {
 		answer := fork.LocalSDP(true)
 		assert.Equal(t, []string{streamsAnsweredAudio, "m=video 0 RTP/AVP 96 97", "m=text 0 RTP/AVP 98"}, mediaLines(answer), "the answer\n%s", answer)
 	})
+}
+
+// TestMediaSessionAnswerKeepsTheOfferedTags pins RFC 5888 section 9.1 on a
+// MediaSession: "the "mid" value in the offer MUST be the same as the "mid"
+// value in the answer", for the stream that carries the call and for the ones
+// we reject, whose a=mid line section 9.2 keeps beside the m= line on port 0,
+// and "subsequent offers (e.g., in a re-INVITE) SHOULD use the same "mid"
+// value". A group the offer made of its streams is not answered: a
+// MediaSession carries one stream on its transport, and section 9.2 has an
+// answerer that does not implement a group's semantics "return an answer
+// without the "group" line", in which "the "mid" lines MUST still be present".
+func TestMediaSessionAnswerKeepsTheOfferedTags(t *testing.T) {
+	tagged := func(section, tag string) string { return section + "\r\na=mid:" + tag }
+	grouped := func(group string, sections ...string) []byte {
+		lines := append([]string{}, streamsOfferSession...)
+		lines = append(lines, group)
+		lines = append(lines, sections...)
+		return []byte(strings.Join(lines, "\r\n") + "\r\n")
+	}
+	_, alone := answerTo(t, streamsOffer(streamsAudio))
+
+	for _, tc := range []struct {
+		name  string
+		offer []byte
+		// wantBefore and wantAfter are the lines the answer has ahead of
+		// its audio section and behind it, beside those of the answer to
+		// the audio stream offered alone.
+		wantBefore, wantAfter []string
+		// wantTags is the tag of each stream of our SDPs, in order.
+		wantTags []string
+	}{
+		{
+			name:      "one_audio_stream",
+			offer:     streamsOffer(tagged(streamsAudio, "audio")),
+			wantAfter: []string{"a=mid:audio"},
+			wantTags:  []string{"audio"},
+		},
+		{
+			name:      "audio_then_video_in_a_BUNDLE_group",
+			offer:     grouped("a=group:BUNDLE 0 1", tagged(streamsAudio, "0"), tagged(streamsVideo, "1")),
+			wantAfter: []string{"a=mid:0", "m=video 0 RTP/AVP 96 97", "a=mid:1"},
+			wantTags:  []string{"0", "1"},
+		},
+		{
+			name:       "video_then_audio_in_a_lip_synchronization_group",
+			offer:      grouped("a=group:LS v a", tagged(streamsVideo, "v"), tagged(streamsAudio, "a")),
+			wantBefore: []string{"m=video 0 RTP/AVP 96 97", "a=mid:v"},
+			wantAfter:  []string{"a=mid:a"},
+			wantTags:   []string{"v", "a"},
+		},
+		{
+			name:      "a_tagged_stream_beside_an_audio_stream_without_a_tag",
+			offer:     streamsOffer(streamsAudio, tagged(streamsVideo, "v")),
+			wantAfter: []string{"m=video 0 RTP/AVP 96 97", "a=mid:v"},
+			wantTags:  []string{"", "v"},
+		},
+		{
+			name:      "no_tag",
+			offer:     streamsOffer(streamsAudio, streamsVideo),
+			wantAfter: []string{"m=video 0 RTP/AVP 96 97"},
+			wantTags:  []string{"", ""},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, answer := answerTo(t, tc.offer)
+
+			// The answer to the audio stream alone, with the rejected
+			// streams around its audio section and the tags.
+			session, audio, found := strings.Cut(string(alone), "m=audio ")
+			require.True(t, found, "the answer to the audio stream alone\n%s", alone)
+			want := streamsSDPLines([]byte(session))
+			want = append(want, tc.wantBefore...)
+			want = append(want, streamsSDPLines([]byte("m=audio "+audio))...)
+			want = append(want, tc.wantAfter...)
+			assert.Equal(t, want, streamsSDPLines(answer), "the answer\n%s", answer)
+			assert.Equal(t, tc.wantTags, streamTagsOf(answer), "the answer's tags\n%s", answer)
+			assert.Empty(t, sdpLines(answer, "a=group:"), "the answer\n%s", answer)
+
+			// As the dialog makes an offer of its own afterwards.
+			fork := m.Fork()
+			offer := fork.LocalSDP(false)
+			assert.Equal(t, tc.wantTags, streamTagsOf(offer), "the tags of our offer\n%s", offer)
+			assert.Empty(t, sdpLines(offer, "a=group:"), "our offer\n%s", offer)
+		})
+	}
 }
 
 // TestMediaSessionInitWithSDPReadsTheAudioStream pins that a session given its

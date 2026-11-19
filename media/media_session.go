@@ -496,7 +496,7 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 		mode = s.Mode
 	}
 
-	return s.offeredStreams.around(generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet))
+	return s.offeredStreams.around(s.offeredStreams.withAudioTag(generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet)))
 }
 
 // RemoteSDP applies an answer when offered is true, or an offer when false.

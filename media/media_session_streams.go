@@ -16,24 +16,39 @@ import (
 type offeredStreams struct {
 	media []sdp.MediaDescription
 	audio int
+
+	// tags holds the identification-tag the offer gave each stream of media
+	// in its a=mid line, empty for a stream it gave none. It is nil when the
+	// offer identifies no stream: see streamTags.
+	tags []string
+
+	// bundle is what the offer says of the BUNDLE group of its audio stream.
+	// Only the WebRTC media type reads an offer for it: a MediaSession does
+	// not carry several streams on one transport, and answers a group it
+	// does not implement without the a=group line (RFC 5888 section 9.2).
+	bundle bundledAudio
 }
 
-// rejected returns the m= lines rejecting every stream but the audio one: those
+// rejected returns the lines rejecting every stream but the audio one: those
 // before it and those after it. RFC 3264 section 6: "To reject an offered
 // stream, the port number in the corresponding stream in the answer MUST be
 // set to zero. Any media formats listed are ignored. At least one MUST be
-// present". The line keeps the offered transport and formats and carries no
+// present". The m= line keeps the offered transport and formats. A stream the
+// offer identified keeps its a=mid line, see midLine, and carries no other
 // attribute.
 func (o offeredStreams) rejected() (before, after []string) {
 	for i, md := range o.media {
 		if i == o.audio {
 			continue
 		}
-		line := (&sdp.MediaDescription{MediaType: md.MediaType, Proto: md.Proto, Formats: md.Formats}).String()
+		lines := []string{(&sdp.MediaDescription{MediaType: md.MediaType, Proto: md.Proto, Formats: md.Formats}).String()}
+		if tag := o.tag(i); tag != "" {
+			lines = append(lines, midLine(tag))
+		}
 		if i < o.audio {
-			before = append(before, line)
+			before = append(before, lines...)
 		} else {
-			after = append(after, line)
+			after = append(after, lines...)
 		}
 	}
 	return before, after
@@ -151,9 +166,12 @@ func readAudioStream(body []byte) (sd sdp.SessionDescription, md sdp.MediaDescri
 	}
 
 	streams = offeredStreams{media: make([]sdp.MediaDescription, len(sections.Media)), audio: audio}
+	tags := make([]string, len(sections.Media))
 	for i, sec := range sections.Media {
 		streams.media[i] = sec.Media
+		tags[i] = identificationTag(attributeValues(sec.Lines))
 	}
+	streams.tags = streamTags(tags)
 	attrs = streamAttributes{
 		session: attributeValues(sections.Session),
 		media:   attributeValues(sections.Media[audio].Lines),

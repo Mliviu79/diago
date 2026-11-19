@@ -38,12 +38,12 @@ const (
 
 	webrtcStreamsData = "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
 		"c=IN IP4 0.0.0.0\r\n" +
-		"a=mid:1\r\n" +
+		"a=mid:2\r\n" +
 		"a=sctp-port:5000"
 	webrtcStreamsRejectedData = "m=application 0 UDP/DTLS/SCTP webrtc-datachannel"
 
 	webrtcStreamsText = "m=text 9 UDP/TLS/RTP/SAVPF 98\r\n" +
-		"a=mid:2\r\n" +
+		"a=mid:3\r\n" +
 		"a=rtpmap:98 t140/1000"
 	webrtcStreamsRejectedText = "m=text 0 UDP/TLS/RTP/SAVPF 98"
 )
@@ -92,13 +92,14 @@ func webrtcReOfferMediaLines(t *testing.T, m *MediaSessionWebrtc) []string {
 // the port number in the corresponding stream in the answer MUST be set to
 // zero". The first audio stream we can carry carries the call, read with the
 // session level and its own section alone, and every other stream is rejected
-// with its m= line alone. Section 8 keeps those lines in every later SDP of
-// ours: "Deleted media streams from a previous SDP MUST NOT be removed in a
-// new SDP".
+// with its m= line and the tag the offer gave it alone. Section 8 keeps those
+// lines in every later SDP of ours: "Deleted media streams from a previous SDP
+// MUST NOT be removed in a new SDP".
 //
 // A stream rejected out of a BUNDLE group is written the same way, which is
 // what RFC 8843 section 7.3.3 asks: a zero port and no a=bundle-only. The
-// a=group:BUNDLE list of our SDP names the tag of its audio stream alone.
+// a=group:BUNDLE list of our SDP names the tag of its audio stream alone, and
+// each stream keeps the tag of the offer (RFC 5888 section 9.1).
 func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 	type row struct {
 		name string
@@ -215,10 +216,11 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 				"the audio stream is answered as it is when offered alone")
 
 			// RFC 8843 section 7.3.3: a rejected stream has no
-			// a=bundle-only, and the group names the audio stream alone.
+			// a=bundle-only, and the group names the audio stream alone. RFC
+			// 5888 section 9.1: each stream answers under the offer's tag.
 			assert.Empty(t, sdpLines(answer, "a=bundle-only"), "the answer\n%s", answer)
 			assert.Equal(t, []string{"a=group:BUNDLE 0"}, sdpLines(answer, "a=group:"), "the answer's group\n%s", answer)
-			assert.Equal(t, []string{"a=mid:0"}, sdpLines(answer, "a=mid:"), "the answer's tags\n%s", answer)
+			assert.Equal(t, streamTagsOf(offer), streamTagsOf(answer), "the answer's tags\n%s", answer)
 		})
 	}
 

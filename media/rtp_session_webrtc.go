@@ -483,7 +483,7 @@ func (s *RTPSessionWebrtc) writeReport(now time.Time) error {
 	if callback != nil {
 		callback(pkt, callbackStats)
 	}
-	compound := rtcp.CompoundPacket{pkt, s.sourceDescription}
+	compound := rtcp.CompoundPacket{pkt, s.Sess.identifiedSource(s.sourceDescription)}
 	return s.Sess.WriteRTCP(&compound)
 }
 

@@ -324,6 +324,13 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // last offer of the peer the session committed to when the body is an offer
 // of ours, in that offer's order: the audio stream, and every other stream
 // rejected with port 0 (RFC 3264 sections 6 and 8).
+//
+// The streams are identified as that offer identified them: each under its
+// a=mid tag (RFC 5888 section 9.1), the audio stream alone in the BUNDLE group
+// the offer listed it in (RFC 8843 sections 7.3 and 7.3.3), with the header
+// extension the offer mapped to its tag (RFC 8843 section 9.1). Before any
+// offer of the peer, and after one that identified no stream, the audio stream
+// has the tag 0 in a group of its own.
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -384,9 +391,9 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		fmt.Sprintf("o=diago %d %d IN %s %s", originID, originVersion, addressType, connectionIP),
 		"s=diago",
 		"t=0 0",
-		"a=group:BUNDLE 0",
-		"a=msid-semantic: WMS diago",
 	}
+	lines = append(lines, streams.bundleGroupLines()...)
+	lines = append(lines, "a=msid-semantic: WMS diago")
 	lines = append(lines, m.iceLiteLines()...)
 	for _, codec := range codecs {
 		formats = append(formats, strconv.Itoa(int(codec.PayloadType)))
@@ -394,9 +401,9 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 	lines = append(lines,
 		fmt.Sprintf("m=audio %d %s %s", candidate.Port(), profile, strings.Join(formats, " ")),
 		m.connectionLine(addressType, connectionIP),
-		"a=mid:0",
-		"a=rtcp-mux",
 	)
+	lines = append(lines, streams.bundledAudioLines()...)
+	lines = append(lines, "a=rtcp-mux")
 	if includeRTCPReducedSize {
 		lines = append(lines, "a=rtcp-rsize")
 	}
@@ -447,7 +454,8 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // formats is one of ours. An a=candidate line the ICE stack cannot read is
 // left out and the candidates of the other lines are used; a description left
 // with no candidate is refused with an *ICEError that matches
-// ErrICEConnection.
+// ErrICEConnection. The candidates are those of the audio section, or, when
+// it lists none, of the sections bundled with it under its ICE credentials.
 func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered bool) error {
 	var desc webrtcsdp.SessionDescription
 	if err := desc.Unmarshal(body); err != nil {
@@ -498,7 +506,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	}
 
 	remoteCandidates := make([]ice.Candidate, 0, 4)
-	for _, attr := range md.Attributes {
+	for _, attr := range webRTCCandidateAttributes(&desc, md) {
 		if attr.Key != "candidate" {
 			continue
 		}
@@ -842,6 +850,10 @@ func (m *MediaSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
 
 // WriteRTP encrypts pkt and sends it to the peer. On a session Finalize has
 // not keyed it sends nothing and returns an error that wraps ErrDTLSNotKeyed.
+//
+// On a session whose peer offered the audio stream in a BUNDLE group with the
+// MID header extension mapped, the packet sent carries the stream's tag in
+// that extension (RFC 8843 sections 9.2 and 15.2); pkt itself is not changed.
 func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 	if m.leftRunning.unkeyed.Load() {
 		return ErrDTLSNotKeyed
@@ -858,6 +870,7 @@ func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 		m.writeRTPBuf = make([]byte, RTPBufSize)
 	}
 	buf := m.writeRTPBuf
+	pkt = path.mid.tagged(pkt)
 	n, err := pkt.MarshalTo(buf)
 	if err == nil {
 		var data []byte
