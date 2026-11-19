@@ -15,6 +15,7 @@ import (
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -799,6 +800,183 @@ func TestDialogServerEarlyMediaFailureReleasesThePort(t *testing.T) {
 					}
 					require.Equal(t, []int{0}, alloc.released, "the failed setup did not hand its port back")
 				})
+			}
+		})
+	}
+}
+
+// TestDialogServerProgressMediaDTLS pins that early media over DTLS-SRTP is
+// keyed before ProgressMedia returns. RFC 5763 section 6.2 has an answerer that
+// wishes to provide early media take setup:active and establish the DTLS
+// association at once, and RFC 3261 section 13.2.1 has the caller treat the
+// answer in the 183 as the answer. Without the handshake the session has no
+// SRTP keys, so the early media goes out unencrypted, and the caller, waiting
+// as the DTLS server, never completes its own handshake.
+func TestDialogServerProgressMediaDTLS(t *testing.T) {
+	type progress struct {
+		med *DialogMedia
+		err error
+	}
+
+	t.Run("keys_the_early_media", func(t *testing.T) {
+		d, peer, inviteTx := newProgressMediaDTLSDialog(t)
+
+		progressed := make(chan progress, 1)
+		go func() {
+			med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{})
+			progressed <- progress{med: med, err: err}
+		}()
+
+		var res *sip.Response
+		select {
+		case res = <-inviteTx.responded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no 183 was sent")
+		}
+		require.Equal(t, sip.StatusSessionInProgress, res.StatusCode)
+
+		// The caller applies the answer in the 183 and runs its side of the
+		// handshake, as the DTLS server the actpass offer left it.
+		require.NoError(t, peer.RemoteSDP(res.Body(), true))
+		peerDone := make(chan error, 1)
+		go func() { peerDone <- peer.Finalize() }()
+
+		var med *DialogMedia
+		select {
+		case p := <-progressed:
+			require.NoError(t, p.err)
+			med = p.med
+		case <-time.After(5 * time.Second):
+			t.Fatal("the early media DTLS handshake did not complete")
+		}
+		select {
+		case err := <-peerDone:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the early media DTLS handshake did not complete")
+		}
+
+		payload := []byte{0xd5, 0xd5, 0xd5, 0xd5}
+		require.NoError(t, med.MediaSession().WriteRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    media.CodecAudioUlaw.PayloadType,
+				SequenceNumber: 1,
+				Timestamp:      160,
+				SSRC:           0xdeadbeef,
+			},
+			Payload: payload,
+		}))
+		require.NoError(t, peer.StopRTP(1, 5*time.Second))
+		got := rtp.Packet{}
+		_, err := peer.ReadRTP(make([]byte, media.RTPBufSize), &got)
+		require.NoError(t, err, "early media must arrive and decrypt")
+		assert.Equal(t, payload, got.Payload)
+	})
+
+	// A caller that gives up before it keys the early media ends the wait
+	// with the dialog, ahead of KeyTimeout.
+	t.Run("gives_up_with_the_dialog", func(t *testing.T) {
+		d, _, inviteTx := newProgressMediaDTLSDialog(t)
+
+		progressed := make(chan progress, 1)
+		go func() {
+			med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{})
+			progressed <- progress{med: med, err: err}
+		}()
+
+		select {
+		case <-inviteTx.responded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no 183 was sent")
+		}
+
+		// The INVITE transaction ends before any final response, as a CANCEL
+		// ends it, which ends the dialog.
+		inviteTx.onTerminate("", nil)
+		select {
+		case <-d.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("the dialog did not end with its transaction")
+		}
+
+		select {
+		case p := <-progressed:
+			require.Error(t, p.err, "early media that was never keyed is not a success")
+			assert.NotErrorIs(t, p.err, ErrEarlyMediaNotKeyed, "the call is over, not answerable")
+		case <-time.After(4 * time.Second):
+			t.Fatal("ProgressMedia outlived the dialog")
+		}
+	})
+}
+
+// TestDialogServerAnswerRepeatsEarlyAnswer pins that the 200 after
+// ProgressMedia carries the answer the 183 carried, byte for byte: RFC 3261
+// section 13.2.1 has an answer placed in a provisional response be that same
+// exact answer. It holds for each answer that takes the early media, also
+// when the media would describe itself differently by then.
+func TestDialogServerAnswerRepeatsEarlyAnswer(t *testing.T) {
+	answers := []struct {
+		name   string
+		answer func(t *testing.T, d *DialogServerSession, early *DialogMedia) error
+	}{
+		{name: "AnswerEarlyMedia", answer: func(_ *testing.T, d *DialogServerSession, early *DialogMedia) error {
+			return d.AnswerEarlyMedia(early, AnswerOptions{})
+		}},
+		{name: "AnswerContext", answer: func(t *testing.T, d *DialogServerSession, early *DialogMedia) error {
+			med, err := d.AnswerContext(t.Context())
+			if err == nil && med != early {
+				return errors.New("the answer did not return the early media")
+			}
+			return err
+		}},
+		{name: "AnswerOptions", answer: func(t *testing.T, d *DialogServerSession, early *DialogMedia) error {
+			med, err := d.AnswerOptions(t.Context(), AnswerOptions{Codecs: []media.Codec{media.CodecAudioAlaw}})
+			if err == nil && med != early {
+				return errors.New("the answer did not return the early media")
+			}
+			return err
+		}},
+	}
+	for _, tc := range answers {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := newMediaSessionForTest(t)
+			inviteTx := &respondedServerTx{byeServerTx: newByeServerTx(), responded: make(chan *sip.Response, 4)}
+			d := newTestDialogOver(t, inviteTx)
+			d.InviteRequest.SetBody(peer.LocalSDP(false))
+			d.mediaConf = MediaConfig{
+				Codecs: []media.Codec{media.CodecAudioUlaw},
+				bindIP: net.IPv4(127, 0, 0, 1),
+			}
+			t.Cleanup(func() { _ = d.Close() })
+
+			early, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{})
+			require.NoError(t, err)
+			var progress *sip.Response
+			select {
+			case progress = <-inviteTx.responded:
+				require.Equal(t, sip.StatusSessionInProgress, progress.StatusCode)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no 183 was sent")
+			}
+			// A description made now is another one.
+			early.MediaSession().ExternalIP = net.IPv4(192, 0, 2, 1)
+
+			answered := make(chan error, 1)
+			go func() { answered <- tc.answer(t, d, early) }()
+			select {
+			case res := <-inviteTx.responded:
+				require.Equal(t, sip.StatusOK, res.StatusCode)
+				assert.Equal(t, string(progress.Body()), string(res.Body()), "the 200 must repeat the answer of the 183")
+			case <-time.After(5 * time.Second):
+				t.Fatal("no 200 was sent")
+			}
+			readAck(t, d)
+			select {
+			case err := <-answered:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the answer did not return")
 			}
 		})
 	}

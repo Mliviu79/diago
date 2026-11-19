@@ -5,6 +5,7 @@ package diago
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -231,4 +232,51 @@ func TestDialogClientAckKeyingEndsWithDialog(t *testing.T) {
 
 	require.NoError(t, d.Hangup(t.Context()))
 	require.Error(t, requireReturns(t, acked, "Ack"))
+}
+
+// TestDialogClientEarlyMediaDTLSEndsWithInvite is early media whose DTLS
+// handshake the callee never completes. It runs inside the wait for the answer,
+// which cannot see the caller give up while it runs, and it ran with a context
+// that never ends, so Invite never returned. It now ends with the caller's
+// context.
+func TestDialogClientEarlyMediaDTLSEndsWithInvite(t *testing.T) {
+	dg, peer := newSilentDTLSPeerClient(t, sip.StatusSessionInProgress)
+	dialog, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5099}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dialog.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	invited := make(chan error, 1)
+	go func() {
+		_, err := dialog.Invite(ctx, InviteClientOptions{EarlyMediaDetect: true})
+		invited <- err
+	}()
+	requireClientHello(t, peer)
+
+	cancel()
+	assert.Error(t, requireReturns(t, invited, "Invite"))
+}
+
+// TestDialogClientEarlyMediaKeyWaitEndsWithContext pins that the wait for the
+// keys of early media ends with the caller's context and not only with
+// EarlyMediaKeyTimeout, here a minute: Invite returns the context's cause.
+func TestDialogClientEarlyMediaKeyWaitEndsWithContext(t *testing.T) {
+	dg, peer := newSilentDTLSPeerClient(t, sip.StatusSessionInProgress)
+	dialog, err := dg.NewDialog(sip.Uri{User: "peer", Host: "127.0.0.1", Port: 5099}, NewDialogOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dialog.Close() })
+
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	invited := make(chan error, 1)
+	go func() {
+		_, err := dialog.Invite(ctx, InviteClientOptions{EarlyMediaDetect: true, EarlyMediaKeyTimeout: time.Minute})
+		invited <- err
+	}()
+	requireClientHello(t, peer)
+
+	gaveUp := errors.New("the caller gave up")
+	cancel(gaveUp)
+	assert.ErrorIs(t, requireReturns(t, invited, "Invite"), gaveUp)
 }

@@ -35,16 +35,28 @@ var errNoOfferInInvite = errors.New("no sdp present in INVITE")
 // one, and never before (RFC 3261 section 15). The dialog has ended once that
 // BYE is handed to its transaction. Close waits for all of it.
 //
-// A call that has early media is answered with AnswerEarlyMedia.
+// A call ProgressMedia gave early media is answered with that media, which is
+// returned: the 2xx repeats the answer of the 183, and the DTLS handshake
+// ProgressMedia left running is completed or the call declined 488, as
+// AnswerEarlyMedia describes. A refusal waits for its ACK within ctx too.
 func (d *DialogServerSession) AnswerContext(ctx context.Context) (*DialogMedia, error) {
+	if med, early, ok := d.earlyMedia(); ok {
+		return d.answerEarlyMediaWithin(ctx, med, early)
+	}
 	return d.answerOfferWithin(ctx, d.mediaConf, nil)
 }
 
-// AnswerOptions is AnswerContext with the options of Answer.
+// AnswerOptions is AnswerContext with the options of Answer. A call that has
+// early media keeps the codecs and RTPNAT that media was made with.
 func (d *DialogServerSession) AnswerOptions(ctx context.Context, opt AnswerOptions) (*DialogMedia, error) {
 	d.dialogCallbacks.mu.Lock()
 	d.onReferDialog = opt.OnRefer
 	d.dialogCallbacks.mu.Unlock()
+
+	if med, early, ok := d.earlyMedia(); ok {
+		med.setOnMediaUpdate(opt.OnMediaUpdate)
+		return d.answerEarlyMediaWithin(ctx, med, early)
+	}
 
 	conf := d.mediaConf
 	conf.update(opt.Codecs, opt.RTPNAT)

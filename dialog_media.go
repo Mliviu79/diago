@@ -99,6 +99,11 @@ type DialogMedia struct {
 	// abort has nowhere to return it, so Close does.
 	discardErr error
 
+	// earlyKeysOwed is set when onFinalizeWithin left the handshake of early
+	// media running and took away what carries the media, until onFinalize
+	// has waited for the keys and set it up again.
+	earlyKeysOwed bool
+
 	// offerNegotiatedCodecs is MediaConfig.ReInviteNegotiatedCodecs of the
 	// config the media was built from. Set before the media is handed out
 	// and not changed after.
@@ -509,6 +514,8 @@ func (d *DialogMedia) onFinalize(ctx context.Context) error {
 	if err := ms.FinalizeContext(ctx); err != nil {
 		return err
 	}
+	// Early media whose handshake was left running is keyed only now.
+	d.setUpEarlyKeyed()
 	return d.startFirstExchange()
 }
 

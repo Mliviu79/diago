@@ -59,8 +59,8 @@ type sessionState struct {
 
 	// answeringMu guards answering, ackAnswerErr, ackCarriesAnswer and
 	// timerAnswer, which the answer to an inbound call and the reading of its
-	// ACK share, and acking. It is a lock of the session's own and is never
-	// held across a call.
+	// ACK share, acking, and earlyAnswerSDP and earlyUnkeyed. It is a lock of
+	// the session's own and is never held across a call.
 	answeringMu sync.Mutex
 	// answering is set by an answer before it sends its 2xx, and closed when
 	// that answer returns: after the ACK is read and, for an answer that sets
@@ -80,6 +80,20 @@ type sessionState struct {
 	// and closed when that Ack returns: once the media it finalizes is keyed,
 	// or has failed. awaitAck waits on it.
 	acking chan struct{}
+	// earlyAnswerSDP is the answer the 183 of ProgressMedia carried, which the
+	// 2xx repeats: RFC 3261 section 13.2.1 has an answer placed in a
+	// provisional response be "that same exact answer". Describing the media
+	// again could change it, and the media may not be asked to while a
+	// handshake ProgressMedia left running uses it. Nil on a call ProgressMedia
+	// gave no early media.
+	earlyAnswerSDP []byte
+	// earlyUnkeyed is set when the answer in a 183 is out, or was taken, and
+	// the peer had not keyed the media within the wait it was given: on an
+	// inbound call ProgressMedia then returned ErrEarlyMediaNotKeyed, and on
+	// an outbound one the call goes on as one without early media. The
+	// handshake goes on, and the media completes it when the ACK is read, or
+	// sent. It is read until the INVITE is answered, and not after.
+	earlyUnkeyed bool
 	// timerAnswer is the RFC 4028 session timer the answer negotiated, which
 	// its 2xx carries and starts; nil until an answer negotiates one. Guarded
 	// by answeringMu.

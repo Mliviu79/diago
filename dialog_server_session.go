@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
@@ -83,8 +84,22 @@ type ProgressMediaOptions struct {
 
 	// RTPNAT exposes MediaSession property
 	RTPNAT int
+
+	// KeyTimeout bounds how long a DTLS-SRTP ProgressMedia waits for the
+	// caller to key the early media, by completing the DTLS handshake with
+	// us, before it returns ErrEarlyMediaNotKeyed. Zero means five seconds,
+	// for the reasons defaultEarlyMediaKeyTimeout gives. It bounds the wait
+	// only: the handshake goes on, for the answer to complete after the 200.
+	KeyTimeout time.Duration
 }
 
+// ProgressMedia sends 183 Session Progress with our answer and returns the
+// early media of the call.
+//
+// For DTLS-SRTP it returns once the caller has keyed the early media, or
+// ErrEarlyMediaNotKeyed, with the media, when the caller has not within
+// ProgressMediaOptions.KeyTimeout. The call is then answered as any call with
+// early media is, and has no audio before that.
 func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMediaOptions) (*DialogMedia, error) {
 	codecs := opts.Codecs
 	rtpNAT := opts.RTPNAT
@@ -115,6 +130,10 @@ func (d *DialogServerSession) ProgressMedia(ctx context.Context, opts ProgressMe
 			return errors.Join(err, med.Close())
 		}
 		med.registerDialogCallbacks(&d.dialogCallbacks)
+		// The early media carries nothing before the caller has keyed it.
+		if err := d.keyEarlyMedia(med, body, opts.KeyTimeout); err != nil {
+			return err
+		}
 		return rtpSess.MonitorBackgroundContext(d.Context())
 	}()
 	return med, err
@@ -143,6 +162,10 @@ func (d *DialogServerSession) ProgressMediaOptions(ctx context.Context, opt Prog
 		return errors.Join(err, med.Close())
 	}
 	med.registerDialogCallbacks(&d.dialogCallbacks)
+	// The early media carries nothing before the caller has keyed it.
+	if err := d.keyEarlyMedia(med, body, opt.KeyTimeout); err != nil {
+		return err
+	}
 	return rtpSess.MonitorBackgroundContext(d.Context())
 }
 
@@ -250,6 +273,15 @@ func (d *DialogServerSession) Answer(opt AnswerOptions) (*DialogMedia, error) {
 	return med, d.answerSession(med, rtpSess)
 }
 
+// AnswerEarlyMedia answers a call with the early media m.
+//
+// For the media ProgressMedia returned, the 200 repeats the answer of the 183
+// byte for byte (RFC 3261 section 13.2.1). Where ProgressMedia returned
+// ErrEarlyMediaNotKeyed, the DTLS handshake it left running is completed once
+// the 200 is acknowledged, and m has its audio from then on; a handshake that
+// has failed by the time of the answer declines the call 488, and the error
+// says why it failed.
+//
 // TODO Change answerOptions because codecs or RTPNAT makes no sense here
 func (d *DialogServerSession) AnswerEarlyMedia(m *DialogMedia, opt AnswerOptions) error {
 	d.dialogCallbacks.mu.Lock()
@@ -263,6 +295,12 @@ func (d *DialogServerSession) AnswerEarlyMedia(m *DialogMedia, opt AnswerOptions
 	// RFC 4028: mirror Answer and negotiate session timers before the 200 OK.
 	if err := d.prepareSessionTimers(d.Context()); err != nil {
 		return err
+	}
+
+	// The 200 after the 183 of ProgressMedia repeats that 183's answer, and
+	// completes the keying ProgressMedia left running.
+	if early, ok := d.earlyAnswerOf(m); ok {
+		return d.answerEarlyWithin(d.Context(), m, early)
 	}
 
 	if err := d.RespondSDP(d.Context(), m.mediaSession.LocalSDP(true)); err != nil {

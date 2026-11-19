@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
@@ -92,6 +93,11 @@ type InviteClientOptions struct {
 	Headers []sip.Header
 	// Stop on early media. ErrClientEarlyMedia will be returned
 	EarlyMediaDetect bool
+	// EarlyMediaKeyTimeout bounds how long, with EarlyMediaDetect, a DTLS-SRTP
+	// call waits for the callee to key the early media of a 183 before it
+	// takes the call as having none. Zero means five seconds. It bounds the
+	// wait only: the handshake goes on, and Ack completes it.
+	EarlyMediaKeyTimeout time.Duration
 
 	// RTPNAT is media.MediaSession.RTPNAT, set before media starts
 	// Check media.RTPNAT... options
@@ -126,6 +132,9 @@ func (o *InviteClientOptions) WithCaller(displayName string, callerID string, ho
 // - It RETURNS ErrClientEarlyMedia if remote answers with 183 Session in Progress
 // - Media is negotiated and setuped
 // - You need to call WaitAnswer() if you want to proceed with answering call
+// - For DTLS-SRTP, early media the callee does not key within
+// EarlyMediaKeyTimeout is not reported: Invite goes on waiting for the answer,
+// and Ack completes the handshake
 //
 // Errors:
 // - sipgo.ErrDialogResponse
@@ -266,7 +275,7 @@ func (d *DialogClientSession) inviteWith(ctx context.Context, med *DialogMedia, 
 	}
 
 	if opts.EarlyMediaDetect {
-		return d.waitAnswerEarly(ctx, med, ansOpts, wait)
+		return d.waitAnswerEarly(ctx, med, ansOpts, opts.EarlyMediaKeyTimeout, wait)
 	}
 
 	return d.waitAnswerWith(ctx, med, ansOpts, wait)
@@ -314,7 +323,7 @@ func (d *DialogClientSession) WaitAnswer(ctx context.Context, med *DialogMedia, 
 	return d.waitAnswer(ctx, med, opts)
 }
 
-func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
+func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, keyTimeout time.Duration, wait inviteAnswerWait) error {
 	sess := med.mediaSession
 	onResps := opts.OnResponse
 
@@ -344,11 +353,20 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 			return nil
 		}
 
+		// A 183 after the one whose handshake was left running carries
+		// nothing more: the first session description is the answer (RFC
+		// 3261 section 13.2.1).
+		if d.earlyKeyingLeft() {
+			return nil
+		}
+
 		if err := sess.RemoteSDP(remoteSDP, true); err != nil {
 			return err
 		}
 
-		if err := sess.Finalize(); err != nil {
+		// Early media the callee has not keyed in time is none: the call
+		// goes on to its answer, see keyEarlyAnswer.
+		if keyed, err := d.keyEarlyAnswer(ctx, med, keyTimeout); !keyed {
 			return err
 		}
 
@@ -399,6 +417,13 @@ func (d *DialogClientSession) waitAnswerWith(ctx context.Context, med *DialogMed
 func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte) error {
 	sess := med.mediaSession
 
+	// The answer in the 183 stands (RFC 3261 section 13.2.1), and its
+	// handshake is still running on the session, which the media sets up
+	// once Ack has had it keyed.
+	if d.earlyKeyingLeft() {
+		return nil
+	}
+
 	// Apply SDP on existing (Early) media if it exists
 	if err := med.checkEarlyMedia(remoteSDP); err != errNoRTPSession {
 		return err
@@ -426,7 +451,9 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 //
 // Once the ACK is sent, Ack has the media of the call keyed where it needs
 // keys, a DTLS handshake that waits for the peer. That wait ends with ctx or
-// with the dialog, whichever ends first, and Ack then returns an error.
+// with the dialog, whichever ends first, and Ack then returns an error. The
+// handshake of early media the callee had not keyed in time is completed
+// here, and the media has its audio from then on.
 func (d *DialogClientSession) Ack(ctx context.Context) error {
 	inviteRequest := d.InviteRequest
 	recipient := inviteRequest.Recipient

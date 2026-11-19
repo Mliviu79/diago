@@ -279,11 +279,27 @@ func TestDialogServerRequestBeforeAnswerMedia(t *testing.T) {
 // the window certain instead of rare.
 func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 	answers := []struct {
-		name   string
-		answer func(d *DialogServerSession, early *DialogMedia) error
+		name string
+		// progress has the early media made by ProgressMedia, whose 183 is
+		// out before the answer, and not installed by the test.
+		progress bool
+		answer   func(d *DialogServerSession, early *DialogMedia) error
 	}{
 		{name: "AnswerEarlyMedia", answer: func(d *DialogServerSession, early *DialogMedia) error {
 			return d.AnswerEarlyMedia(early, AnswerOptions{})
+		}},
+		// The answers to a call ProgressMedia gave early media run from
+		// their 2xx on on a goroutine of the dialog's, which reads the ACK.
+		{name: "early_media_AnswerEarlyMedia", progress: true, answer: func(d *DialogServerSession, early *DialogMedia) error {
+			return d.AnswerEarlyMedia(early, AnswerOptions{})
+		}},
+		{name: "early_media_AnswerContext", progress: true, answer: func(d *DialogServerSession, _ *DialogMedia) error {
+			_, err := d.AnswerContext(t.Context())
+			return err
+		}},
+		{name: "early_media_AnswerOptions", progress: true, answer: func(d *DialogServerSession, _ *DialogMedia) error {
+			_, err := d.AnswerOptions(t.Context(), AnswerOptions{})
+			return err
 		}},
 		{name: "RespondSDP", answer: func(d *DialogServerSession, early *DialogMedia) error {
 			return d.RespondSDP(t.Context(), early.MediaSession().LocalSDP(true))
@@ -326,6 +342,16 @@ func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 			// Early media: the session exists before the answer.
 			early := &DialogMedia{}
 			early.InitMediaSession(sess, nil, nil)
+			if tc.progress {
+				t.Cleanup(func() { _ = d.Close() })
+				var err error
+				early, err = d.ProgressMedia(t.Context(), ProgressMediaOptions{})
+				require.NoError(t, err)
+				// The 183 is out. The transaction reports the next response,
+				// the 2xx.
+				inviteTx.once = sync.Once{}
+				inviteTx.sent = make(chan struct{})
+			}
 
 			answered := make(chan error, 1)
 			go func() { answered <- tc.answer(d, early) }()
