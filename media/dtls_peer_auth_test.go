@@ -168,12 +168,13 @@ func TestDTLSHandshakeChecksPeerFingerprint(t *testing.T) {
 // binds the self-signed certificate to the signalling, so without one any
 // certificate would complete the handshake.
 func TestDTLSRemoteSDPRequiresFingerprint(t *testing.T) {
-	newSess := func(cert tls.Certificate) *MediaSession {
+	newSess := func(role DTLSEndpointRole, cert tls.Certificate) *MediaSession {
 		t.Helper()
 		s := &MediaSession{
 			Codecs:    []Codec{CodecAudioUlaw},
 			Mode:      sdp.ModeSendrecv,
 			SecureRTP: SecureRTPModeDTLS,
+			DTLSRole:  role,
 			DTLSConf: DTLSConfig{
 				Certificates:     []tls.Certificate{cert},
 				ServerClientAuth: ServerClientAuthRequireCert,
@@ -185,7 +186,7 @@ func TestDTLSRemoteSDPRequiresFingerprint(t *testing.T) {
 		return s
 	}
 
-	offer := string(newSess(testdata.ClientCertificate()).LocalSDP(false))
+	offer := string(newSess(DTLSEndpointRoleOfferer, testdata.ClientCertificate()).LocalSDP(false))
 	fingerprintLine := regexp.MustCompile(`(?m)^a=fingerprint:.*\r\n`)
 	require.Regexp(t, fingerprintLine, offer)
 
@@ -200,7 +201,7 @@ func TestDTLSRemoteSDPRequiresFingerprint(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			answerer := newSess(testdata.ServerCertificate())
+			answerer := newSess(DTLSEndpointRoleAnswerer, testdata.ServerCertificate())
 			err := answerer.RemoteSDP([]byte(tc.offer), false)
 			if tc.wantErr {
 				assert.ErrorContains(t, err, "fingerprint")

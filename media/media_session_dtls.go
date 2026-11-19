@@ -12,8 +12,10 @@ import (
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose
 // attributes are attrs: it takes the peer's a=setup and a=fingerprint values,
-// builds the DTLS conn for the role they leave this session and arms Finalize
-// to run the handshake and key SRTP from it. A session with neither a DTLS
+// builds the DTLS conn for the role dtlsSetupFor gives this session against
+// them and arms Finalize to run the handshake and key SRTP from it. An a=setup
+// value other than active, passive and actpass is refused: RFC 8842 section
+// 5.1 leaves a DTLS association no other. A session with neither a DTLS
 // certificate nor SecureRTP set to DTLS does nothing.
 func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	if len(s.DTLSConf.Certificates) == 0 && s.SecureRTP != 2 {
@@ -55,35 +57,31 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	if setup == "" {
 		return fmt.Errorf("Empty a=setup value attribute for dtls")
 	}
+	switch strings.ToLower(setup) {
+	case dtlsSetupActive, dtlsSetupPassive, dtlsSetupActPass:
+	default:
+		return fmt.Errorf("unknown setup value %q", setup)
+	}
+	// The peer's value is recorded and not acted on directly. Our own role
+	// governs the handshake, and dtlsSetupFor derives it from this value for
+	// LocalSDP too, so the role we advertise and the role we play are one
+	// decision.
+	s.dtlsRemoteSetup = setup
 
 	// THIS may need external or after SIP ACK establishment
 	dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
 	tr := s.dtlsTransport()
 	var err error
-	role := "client"
-	switch setup {
-	case "actpass", "passive":
-		// we are client, as remote wants to be server
-		// if s.dtlsConn == nil {
-		// 	panic("No dtls connection")
-		// }
+	role := "server"
+	if s.dtlsActsAsClient() {
+		role = "client"
 		s.dtlsConn, err = dtls.Client(tr, &s.Raddr, dtlsConf)
-		if err != nil {
-			return fmt.Errorf("failed to setup dlts client conn: %w", err)
-		}
-
-	case "active":
-		role = "server"
-		// we are server as remote wants to be client
-		s.dtlsConn, err = dtls.Server(tr, &s.Raddr, dtlsConf)
-		if err != nil {
-			return fmt.Errorf("failed to setup dlts server conn: %w", err)
-		}
-		// return nil
-
+	} else {
 		// NOTE: setup:active allows the answer and the DTLS handshake to occur in parallel.
-	default:
-		return fmt.Errorf("unknown setup value %q", setup)
+		s.dtlsConn, err = dtls.Server(tr, &s.Raddr, dtlsConf)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to setup dlts %s conn: %w", role, err)
 	}
 	s.dtlsTr = tr
 

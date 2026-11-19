@@ -113,12 +113,13 @@ func TestDTLSTeardownLeavesSessionTransportOpen(t *testing.T) {
 // 4.1.2.7. The loss is silent, which is why it is asserted on a packet count
 // rather than on a single packet.
 func TestDTLSSRTPSessionWithoutICE(t *testing.T) {
-	newSess := func(cert tls.Certificate) *MediaSession {
+	newSess := func(role DTLSEndpointRole, cert tls.Certificate) *MediaSession {
 		t.Helper()
 		s := &MediaSession{
 			Codecs:    []Codec{CodecAudioUlaw},
 			Mode:      sdp.ModeSendrecv,
-			SecureRTP: 2,
+			SecureRTP: SecureRTPModeDTLS,
+			DTLSRole:  role,
 			DTLSConf: DTLSConfig{
 				Certificates: []tls.Certificate{cert},
 				// RFC 5763 section 5: the a=fingerprint binds the certificate to
@@ -133,8 +134,8 @@ func TestDTLSSRTPSessionWithoutICE(t *testing.T) {
 		return s
 	}
 
-	offerer := newSess(testdata.ClientCertificate())
-	answerer := newSess(testdata.ServerCertificate())
+	offerer := newSess(DTLSEndpointRoleOfferer, testdata.ClientCertificate())
+	answerer := newSess(DTLSEndpointRoleAnswerer, testdata.ServerCertificate())
 
 	offer := offerer.LocalSDP(false)
 	require.Contains(t, string(offer), "a=fingerprint:")

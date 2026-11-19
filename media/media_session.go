@@ -153,6 +153,11 @@ type MediaSession struct {
 	// DTLSConf used for DTLS
 	DTLSConf DTLSConfig
 
+	// DTLSRole forces the offer/answer role instead of taking it from the
+	// exchange, which is what the arguments of LocalSDP and RemoteSDP say.
+	// Check DTLSEndpointRole.
+	DTLSRole DTLSEndpointRole
+
 	// mode set after negotiation
 	mode string
 
@@ -192,6 +197,8 @@ type MediaSession struct {
 	// deadlines records the RTP deadlines StopRTP and StartRTP last asked
 	// for. CarryRTPDeadlines hands them to a session replacing this one.
 	deadlines atomic.Pointer[rtpDeadlines]
+
+	mediaSessionState
 
 	sessionID      uint64
 	sessionVersion uint64
@@ -325,6 +332,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		sessionID:      s.sessionID,
 		sessionVersion: s.sessionVersion,
 		DTLSConf:       s.DTLSConf,
+		DTLSRole:       s.DTLSRole,
 	}
 	if s.SecureRTP == 1 {
 		cp.SecureRTP, cp.SRTPAlg = s.SecureRTP, s.SRTPAlg
@@ -435,18 +443,8 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 	if s.SecureRTP == 2 {
 		rtpProfile = "UDP/TLS/RTP/SAVP"
 		dtlsSet = &dtlsSetup{
-			setup:        "active",
+			setup:        s.localDTLSSetup(answered),
 			fingerprints: make([]DTLSFingerprint, len(s.DTLSConf.Certificates)),
-		}
-		if s.Raddr.IP != nil {
-			// We do have remote IP, so probably we are server
-			//  lets be then passive roll
-			dtlsSet.setup = "passive"
-		}
-
-		// Allow overriding
-		if s.DTLSConf.SDPSetupRole != nil {
-			dtlsSet.setup = s.DTLSConf.SDPSetupRole(s.Raddr.IP != nil)
 		}
 		// DTLS
 		// This is only needed for self signed certificates?
@@ -534,6 +532,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 		return fmt.Errorf("%w: unsupported media description protocol proto=%s", ErrNoCommonMedia, md.Proto)
 	}
 	s.remoteProto = md.Proto
+	s.remoteSDPIsAnswer = offered
 
 	codecs := make([]Codec, len(md.Formats))
 	attrs := sd.Values("a")

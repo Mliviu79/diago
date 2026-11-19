@@ -84,6 +84,48 @@ func TestUpdateRemoteCodecsRequiresEqualSampleRate(t *testing.T) {
 	assert.Equal(t, CodecAudioAlaw.Name, m.filterCodecs[0].Name)
 }
 
+// SDPCodecPreferLocalOrder applies to the answerer only. A UAC applying the
+// answer to its own INVITE is the offerer, and must not re-rank what the peer
+// already chose. The session id cannot tell the two apart: it is zero both for a
+// UAS applying its first offer and for a UAC applying its first answer.
+func TestRemoteSDPRoleDecidesCodecOrder(t *testing.T) {
+	prev := SDPCodecPreferLocalOrder
+	SDPCodecPreferLocalOrder = 1
+	t.Cleanup(func() { SDPCodecPreferLocalOrder = prev })
+
+	body := negotiateBody(
+		"v=0",
+		"o=- 1 1 IN IP4 198.51.100.7",
+		"s=-",
+		"c=IN IP4 198.51.100.7",
+		"t=0 0",
+		"m=audio 5004 RTP/AVP 0 8",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+	)
+
+	// Answerer: the body is an offer, so our local order wins.
+	answerer := negotiateSession(CodecAudioAlaw, CodecAudioUlaw)
+	require.NoError(t, answerer.RemoteSDP(body, false))
+	assert.Equal(t, []Codec{CodecAudioAlaw, CodecAudioUlaw}, answerer.filterCodecs)
+
+	// Offerer: the body answers us. It is the peer's decision and its order is
+	// the negotiation result.
+	offerer := negotiateSession(CodecAudioAlaw, CodecAudioUlaw)
+	require.NoError(t, offerer.RemoteSDP(body, true))
+	assert.Equal(t, []Codec{CodecAudioUlaw, CodecAudioAlaw}, offerer.filterCodecs,
+		"the answer lists PCMU first; re-ranking it discards the answer")
+}
+
+// Fork carries the role an application forced, because it is called from
+// inside the re-negotiation path where the fork itself is not reachable to
+// configure.
+func TestForkCarriesRole(t *testing.T) {
+	m := negotiateSession(CodecAudioAlaw)
+	m.DTLSRole = DTLSEndpointRoleAnswerer
+	assert.Equal(t, DTLSEndpointRoleAnswerer, m.Fork().DTLSRole)
+}
+
 // Port 0 means the stream is rejected (RFC 3264 section 6), and it is also what
 // an unparseable port leaves behind. Latching it answered the call and then sat
 // mute.
