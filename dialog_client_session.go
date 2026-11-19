@@ -493,9 +493,9 @@ func (d *DialogClientSession) ack(ctx context.Context, remoteTarget sip.Uri, bod
 // ReInvite sends new invite based on current media session, and has the media
 // take the answer. It waits, bounded by ctx, for a re-INVITE in progress to
 // end, and sends its own again when it is answered 491, after the wait RFC
-// 3261 section 14.1 gives. A 2xx without Contact, which is acknowledged at the
-// remote target in place, and a 2xx without SDP are errors, and leave the
-// media as it was.
+// 3261 section 14.1 gives. A 2xx without Contact is acknowledged at the remote
+// target, which stays as it was, and its answer is taken like any other. A 2xx
+// without SDP is an error, and leaves the media as it was.
 func (d *DialogClientSession) ReInvite(ctx context.Context) error {
 	mediaHanshaker := d.mediaHanshakerLocked()
 	if mediaHanshaker == nil {
@@ -538,8 +538,8 @@ func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) 
 		}
 
 		// A 2xx without Contact is acknowledged at the remote target in
-		// place, and is an error then, see reInviteSendOnce.
-		return reInvite2xxWithContact(reInviteAck(ctx, res, d.ack, d.RemoteContact))
+		// place, see reInviteAck.
+		return res, reInviteAck(ctx, res, d.ack, d.RemoteContact)
 	}
 }
 
@@ -559,8 +559,12 @@ func (d *DialogClientSession) reInviteKeepAlive(ctx context.Context) error {
 		return err
 	}
 
-	// Save new remote target contact
-	d.setRemoteContact(res.Contact())
+	// Save new remote target contact. A 2xx without one leaves the remote
+	// target as it was (RFC 3261 section 12.2.1.2), where setting none
+	// would put it back at the Contact of the answer to the INVITE.
+	if contact := res.Contact(); contact != nil {
+		d.setRemoteContact(contact)
+	}
 
 	return nil
 }

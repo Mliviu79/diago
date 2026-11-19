@@ -26,6 +26,7 @@ type reInviteCall struct {
 	med           *DialogMedia
 	reInvite      func(ctx context.Context) error
 	hold          func(ctx context.Context) error
+	unhold        func(ctx context.Context) error
 	remoteContact func() *sip.ContactHeader
 }
 
@@ -56,7 +57,7 @@ var reInviteSides = []struct {
 			require.NoError(t, err)
 			med.registerDialogCallbacks(&d.dialogCallbacks)
 			installTestMedia(t, med, sess)
-			return reInviteCall{med: med, reInvite: d.ReInvite, hold: d.Hold, remoteContact: d.RemoteContact}
+			return reInviteCall{med: med, reInvite: d.ReInvite, hold: d.Hold, unhold: d.Unhold, remoteContact: d.RemoteContact}
 		},
 	},
 	{
@@ -83,7 +84,7 @@ var reInviteSides = []struct {
 			reInviting = true
 
 			installTestMedia(t, med, sess)
-			return reInviteCall{med: med, reInvite: d.ReInvite, hold: d.Hold, remoteContact: d.RemoteContact}
+			return reInviteCall{med: med, reInvite: d.ReInvite, hold: d.Hold, unhold: d.Unhold, remoteContact: d.RemoteContact}
 		},
 	},
 }

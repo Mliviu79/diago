@@ -180,7 +180,7 @@ func (d *DialogServerSession) reInviteSessionInPlace(ctx context.Context) error 
 	if handshaker == nil {
 		return fmt.Errorf("dialog media is not initialized")
 	}
-	r := d.ownReInvite(handshaker, "", d.reInviteSend)
+	r := d.ownReInvite(handshaker, "")
 	r.inPlace = true
 	return r.run(ctx)
 }

@@ -183,100 +183,76 @@ func reInviteRetryWait(ctx context.Context, callIDOwner bool) error {
 }
 
 // reInviteSendOnce sends req, a re-INVITE, with do, and acknowledges its 2xx
-// with ack. A final response other than 2xx is returned with
-// sipgo.ErrDialogResponse.
-//
-// The ACK goes to the Contact the 2xx carries. A 2xx without Contact is
-// acknowledged at the remote target in place, which remoteTarget returns, and
-// atTarget then reports it: RFC 3261 section 13.2.2.4 has the UAC core
-// "generate an ACK request for each 2xx received", its header fields
-// "constructed in the same way as for any request sent within a dialog", so
-// with the remote target in the Request-URI (section 12.2.1.1), and section
-// 12.2.1.2 has a 2xx replace that target with the URI of its Contact "if
-// present". A 2xx left without its ACK is retransmitted by the peer for
-// 64*T1, after which the peer ends the call (section 13.3.1.4). Only when
-// there is no remote target either is the 2xx returned unacknowledged, with
-// errReInvite2xxWithoutContact.
+// with ack, as reInviteAck describes. A final response other than 2xx is
+// returned with sipgo.ErrDialogResponse.
 func reInviteSendOnce(
 	ctx context.Context,
 	req *sip.Request,
 	do func(context.Context, *sip.Request) (*sip.Response, error),
 	ack func(ctx context.Context, remoteTarget sip.Uri, body []byte) error,
 	remoteTarget func() *sip.ContactHeader,
-) (res *sip.Response, atTarget bool, err error) {
-	res, err = do(ctx, req)
+) (*sip.Response, error) {
+	res, err := do(ctx, req)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !res.IsSuccess() {
-		return res, false, sipgo.ErrDialogResponse{
+		return res, sipgo.ErrDialogResponse{
 			Res: res,
 		}
 	}
-	return reInviteAck(ctx, res, ack, remoteTarget)
+	return res, reInviteAck(ctx, res, ack, remoteTarget)
 }
 
-// reInviteAck acknowledges res, the 2xx to a re-INVITE of ours, with ack, as
-// reInviteSendOnce describes.
+// reInviteAck acknowledges res, the 2xx to a re-INVITE of ours, with ack.
+//
+// The ACK goes to the Contact the 2xx carries. A 2xx without Contact is
+// acknowledged at the remote target in place, which remoteTarget returns, and
+// is a 2xx like any other: the session it answers is in force, so its caller
+// goes on to apply the answer in it. RFC 3261 section 13.2.2.4 has the UAC
+// core "generate an ACK request for each 2xx received", its header fields
+// "constructed in the same way as for any request sent within a dialog", so
+// with the remote target in the Request-URI (section 12.2.1.1), and section
+// 12.2.1.2 has a 2xx replace that target with the URI of its Contact "if
+// present". The header table of section 20 makes the Contact mandatory in
+// that 2xx, which binds the peer that sends it; no section has the UAC refuse
+// the 2xx for it, and section 14.1 leaves the session unchanged after a
+// non-2xx final response only.
+//
+// It returns errReInviteNoRemoteTarget, without acknowledging, when the dialog
+// has no remote target either.
 func reInviteAck(
 	ctx context.Context,
 	res *sip.Response,
 	ack func(ctx context.Context, remoteTarget sip.Uri, body []byte) error,
 	remoteTarget func() *sip.ContactHeader,
-) (*sip.Response, bool, error) {
+) error {
 	// Now do ACK on new Contact
 	if cont := res.Contact(); cont != nil {
-		return res, false, ack(ctx, cont.Address, nil)
+		return ack(ctx, cont.Address, nil)
 	}
 	target := remoteTarget()
 	if target == nil {
-		return res, false, errReInvite2xxWithoutContact
+		return errReInviteNoRemoteTarget
 	}
-	return res, true, ack(ctx, target.Address, nil)
+	return ack(ctx, target.Address, nil)
 }
 
-// errReInvite2xxWithoutContact is the fault of a 2xx to a re-INVITE of ours
-// that carries no Contact: RFC 3261 section 12.1.1 has a 2xx to an INVITE
-// carry one.
-var errReInvite2xxWithoutContact = fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
-
-// reInvite2xxWithContact reports the outcome of reInviteSendOnce to a caller
-// that takes no 2xx without Contact: such a 2xx, acknowledged at the remote
-// target in place, atTarget, is returned with errReInvite2xxWithoutContact,
-// joined with what sending that ACK returned.
-func reInvite2xxWithContact(res *sip.Response, atTarget bool, err error) (*sip.Response, error) {
-	if !atTarget {
-		return res, err
-	}
-	if err != nil {
-		return res, errors.Join(errReInvite2xxWithoutContact, err)
-	}
-	return res, errReInvite2xxWithoutContact
-}
+// errReInviteNoRemoteTarget is why a 2xx to a re-INVITE of ours was not
+// acknowledged: it carries no Contact and the dialog has no remote target,
+// which leaves the ACK no Request-URI.
+var errReInviteNoRemoteTarget = fmt.Errorf("reinvite: 2xx without Contact on a dialog without remote target: %w", sipgo.ErrDialogInviteNoContact)
 
 // reInviteSend sends req, a re-INVITE, once, and acknowledges its 2xx, as
-// reInviteSendOnce describes. A 2xx without Contact is an error, see
-// reInvite2xxWithContact.
+// reInviteSendOnce describes.
 func (d *DialogServerSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	return reInvite2xxWithContact(reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact))
-}
-
-// reInviteSendAtTarget sends req as reInviteSend does, but for a 2xx without
-// Contact, which it returns without an error once it is acknowledged at the
-// remote target in place.
-func (d *DialogServerSession) reInviteSendAtTarget(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	res, _, err := reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact)
-	return res, err
+	return reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact)
 }
 
 // ownReInvite returns the re-INVITE this side of an inbound call sends for
 // itself: its offer is the one handshaker makes for mode, and each attempt
-// goes to the remote target of that moment through send.
-func (d *DialogServerSession) ownReInvite(
-	handshaker mediaHanshaker,
-	mode string,
-	send func(context.Context, *sip.Request) (*sip.Response, error),
-) ownReInvite {
+// goes to the remote target of that moment.
+func (d *DialogServerSession) ownReInvite(handshaker mediaHanshaker, mode string) ownReInvite {
 	return ownReInvite{
 		state:      &d.sessionState,
 		callbacks:  &d.dialogCallbacks,
@@ -294,16 +270,15 @@ func (d *DialogServerSession) ownReInvite(
 				req.AppendHeader(h)
 			}
 			req.SetBody(offer)
-			return send(ctx, req)
+			return d.reInviteSend(ctx, req)
 		},
 	}
 }
 
 // reInviteSend sends req, a re-INVITE, once, and acknowledges its 2xx, as
-// reInviteSendOnce describes. A 2xx without Contact is an error, see
-// reInvite2xxWithContact.
+// reInviteSendOnce describes.
 func (d *DialogClientSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	return reInvite2xxWithContact(reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact))
+	return reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact)
 }
 
 // ownReInvite returns the re-INVITE this side of an outbound call sends for
