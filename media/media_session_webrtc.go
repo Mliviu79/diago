@@ -56,6 +56,9 @@ type MediaSessionWebrtcConfig struct {
 	NetworkTypes []ice.NetworkType
 
 	DTLS DTLSConfig
+
+	// ICE holds the further settings of the ICE agent: see ICEConfig.
+	ICE ICEConfig
 }
 
 // MediaSessionWebrtc is the direct ICE + DTLS-SRTP media stack. It intentionally
@@ -225,6 +228,9 @@ func (m *MediaSessionWebrtc) Init(
 		}
 		opts = append(opts, ice.WithUrls(urls))
 	}
+	if opts, err = appendICEConfigOptions(opts, conf); err != nil {
+		return &ICEError{Phase: ICEPhaseGathering, Err: err}
+	}
 
 	agent, err := ice.NewAgentWithOptions(opts...)
 	if err != nil {
@@ -374,6 +380,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		"a=group:BUNDLE 0",
 		"a=msid-semantic: WMS diago",
 	}
+	lines = append(lines, m.iceLiteLines()...)
 	for _, codec := range codecs {
 		formats = append(formats, strconv.Itoa(int(codec.PayloadType)))
 	}
@@ -421,6 +428,11 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // A description that keeps the ICE credentials of the generation in use and
 // asks for a new DTLS association is refused with an error that wraps
 // ErrWebRTCICERestartRequired, and leaves the session as it was.
+//
+// The agent takes the controlling role for an offer of ours and the
+// controlled one for the peer's, unless exactly one of the two is a lite
+// agent, the peer's being the one whose description carries a=ice-lite: the
+// full agent then controls whichever side offered (RFC 8445 section 6.1.1).
 func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered bool) error {
 	var desc webrtcsdp.SessionDescription
 	if err := desc.Unmarshal(body); err != nil {
@@ -550,6 +562,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	}
 	m.remoteUfrag = remoteUfrag
 	m.remotePwd = remotePwd
+	_, m.remoteICELite = webRTCAttribute(desc.Attributes, md.Attributes, "ice-lite")
 	m.remoteFingerprintAlgorithm = fingerprints[0].Algorithm
 	m.remoteFingerprint = fingerprints[0].Value
 	m.recordDTLSAssociation(localSetup, fingerprints, tlsID, offered)
@@ -564,7 +577,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.Mode = negotiateMediaDirection(remoteMode, m.modePreference)
 
 	var conn *ice.Conn
-	if offered {
+	if m.iceControlling(offered) {
 		// The offerer is the controlling ICE agent and nominates the pair.
 		conn, err = m.agent.StartDial(remoteUfrag, remotePwd)
 	} else {
