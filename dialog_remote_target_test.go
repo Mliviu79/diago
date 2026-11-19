@@ -217,3 +217,50 @@ func TestDialogByeGoesToTheTargetOurReInviteAnswerSet(t *testing.T) {
 		})
 	}
 }
+
+// TestDialogPeerReInviteWithoutContactKeepsTheRemoteTarget pins that a
+// re-INVITE of the peer's that carries no Contact leaves the remote target
+// where it is, on either side, once an earlier target refresh has moved it.
+// RFC 3261 section 12.2.2 has the UAS replace the remote target with the URI
+// from the Contact of a target refresh request "if present". Accepting such a
+// re-INVITE put the target back at the Contact the dialog was established
+// with, and our BYE then went there.
+func TestDialogPeerReInviteWithoutContactKeepsTheRemoteTarget(t *testing.T) {
+	moved := sip.Uri{User: "moved", Host: "127.0.0.9", Port: 5090}
+	for _, side := range remoteTargetSides {
+		t.Run(side.name, func(t *testing.T) {
+			byes := &byeTargets{}
+			d := side.setup(t, func(req *sip.Request) *sip.Response {
+				byes.record(req)
+				return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+			})
+			accept := func(req *sip.Request) {
+				t.Helper()
+				req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+				req.SetBody(peerSDP())
+				inner := newByeServerTx()
+				tx := newAckedServerTx(inner, func() {
+					_ = d.readAck(newReInviteAck(req, nil))
+				})
+				require.NoError(t, d.handleReInvite(req, tx))
+				require.Len(t, inner.responses, 1)
+				require.True(t, inner.responses[0].IsSuccess(), "the re-INVITE was not accepted: %d", inner.responses[0].StatusCode)
+			}
+
+			accept(d.peerReInvite(moved))
+			require.Equal(t, moved.String(), d.remoteContact().Address.String(), "the accepted re-INVITE did not move the remote target")
+
+			req := d.peerReInvite(moved)
+			req.CSeq().SeqNo++
+			req.RemoveHeader("Contact")
+			require.Nil(t, req.Contact())
+			accept(req)
+
+			assert.Equal(t, moved.String(), d.remoteContact().Address.String(), "a re-INVITE without Contact moved the remote target")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, d.hangup(ctx))
+			assert.Equal(t, []string{moved.String()}, byes.sent())
+		})
+	}
+}

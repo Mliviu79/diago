@@ -251,8 +251,12 @@ func (s *sessionState) respondPeerReInvite(ctx context.Context, tx sip.ServerTra
 	}
 	// The re-INVITE is a target refresh request, which moves the remote
 	// target as its 2xx is sent, and never when it is refused (RFC 6141
-	// section 4.6).
-	p.remoteTarget.setRemoteContact(p.req.Contact())
+	// section 4.6). A re-INVITE without Contact leaves the target where it
+	// is: RFC 3261 section 12.2.2 replaces it with the request's Contact "if
+	// present", and nothing refuses such a re-INVITE before it is answered.
+	if contact := p.req.Contact(); contact != nil {
+		p.remoteTarget.setRemoteContact(contact)
+	}
 	// Made before the 2xx goes out, which its ACK can follow at once.
 	p.acked = make(chan struct{})
 	if err := tx.Respond(ctx, res); err != nil {
