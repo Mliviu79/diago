@@ -464,6 +464,18 @@ func newMediaSessionForTest(t *testing.T) *media.MediaSession {
 	return sess
 }
 
+// newICEDialogMedia installs sess in a DialogMedia the way an answered call
+// has it: with an RTP session whose RTCP monitor is running.
+func newICEDialogMedia(t *testing.T, sess *media.MediaSession) *DialogMedia {
+	t.Helper()
+	d := &DialogMedia{}
+	rtpSess := media.NewRTPSession(sess)
+	d.initRTPSessionUnsafe(sess, rtpSess)
+	require.NoError(t, rtpSess.MonitorBackground())
+	t.Cleanup(func() { _ = d.Close() })
+	return d
+}
+
 // newTestDialogMedia gives d media of its own, as an answer does: a media
 // session with no remote description yet, registered with d.
 func newTestDialogMedia(t *testing.T, d *DialogServerSession) *DialogMedia {
