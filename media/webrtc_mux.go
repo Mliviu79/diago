@@ -23,6 +23,7 @@ type webRTCPacketMux struct {
 	rtp  *webRTCMuxEndpoint
 	rtcp *webRTCMuxEndpoint
 	once sync.Once
+	loop webRTCMuxLoop
 }
 
 type webRTCMuxEndpoint struct {
@@ -42,7 +43,7 @@ func newWebRTCPacketMux(conn net.Conn) *webRTCPacketMux {
 		rtp:  newEndpoint(),
 		rtcp: newEndpoint(),
 	}
-	go m.readLoop()
+	m.loop.wg.Go(m.readLoop)
 	return m
 }
 
@@ -51,7 +52,7 @@ func (m *webRTCPacketMux) readLoop() {
 	for {
 		n, err := m.conn.Read(buf)
 		if err != nil {
-			_ = m.Close()
+			m.readEnded(err)
 			return
 		}
 		if n < 1 {
@@ -79,7 +80,7 @@ func (m *webRTCPacketMux) readLoop() {
 	}
 }
 
-func (m *webRTCPacketMux) Close() error {
+func (m *webRTCPacketMux) release() error {
 	var err error
 	m.once.Do(func() {
 		err = errors.Join(m.dtls.Close(), m.rtp.Close(), m.rtcp.Close(), m.conn.Close())
