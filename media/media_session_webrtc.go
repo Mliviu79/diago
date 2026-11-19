@@ -420,10 +420,9 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 	}
 
 	formats := make([]string, 0, len(codecs))
-	originID, originVersion := m.originLocked().next()
 	lines := []string{
 		"v=0",
-		fmt.Sprintf("o=diago %d %d IN %s %s", originID, originVersion, addressType, connectionIP),
+		"", // The o= line, which the origin writes once the rest is known.
 		"s=diago",
 		"t=0 0",
 	}
@@ -467,7 +466,10 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		lines = append(lines, "a=candidate:"+c.Marshal())
 	}
 	lines = append(lines, "a=end-of-candidates", "a=msid:diago audio", "")
-	return streams.around(m.withDeclaredSource(streams, []byte(strings.Join(lines, "\r\n")))), nil
+	return m.originLocked().numbered(func(id int64, version uint64) []byte {
+		lines[1] = fmt.Sprintf("o=diago %d %d IN %s %s", id, version, addressType, connectionIP)
+		return streams.around(m.withDeclaredSource(streams, []byte(strings.Join(lines, "\r\n"))))
+	}), nil
 }
 
 // RemoteSDP parses an answer when offered is true, otherwise it parses an

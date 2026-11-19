@@ -50,6 +50,8 @@ type refreshPeer struct {
 	// INVITE: our dialog's remote tag and remote target.
 	to      string
 	contact string
+	// answerSDP is the session description of that 200.
+	answerSDP []byte
 
 	// seen holds the Via branches of the requests already handed to the
 	// test, so a retransmission is passed over.
@@ -232,6 +234,7 @@ func (p *refreshPeer) call(t *testing.T, headers ...string) *DialogServerSession
 	p.to = res.To().Value()
 	require.NotNil(t, res.Contact())
 	p.contact = res.Contact().Address.String()
+	p.answerSDP = res.Body()
 	p.ack(t, p.cseq)
 	select {
 	case d := <-p.dialogs:
@@ -276,8 +279,15 @@ func (p *refreshPeer) final(t *testing.T, cseq uint32, within time.Duration) *si
 // SDP, and returns its final response, ACKed.
 func (p *refreshPeer) reInvite(t *testing.T, headers ...string) *sip.Response {
 	t.Helper()
+	return p.reInviteOffering(t, p.offer(), headers...)
+}
+
+// reInviteOffering sends a re-INVITE of the peer's with the given offer and
+// extra headers, and returns its final response, ACKed.
+func (p *refreshPeer) reInviteOffering(t *testing.T, offer []byte, headers ...string) *sip.Response {
+	t.Helper()
 	p.cseq++
-	p.write(t, p.request(t, sip.INVITE, p.contact, p.cseq, headers, p.offer()), p.dgAddr)
+	p.write(t, p.request(t, sip.INVITE, p.contact, p.cseq, headers, offer), p.dgAddr)
 	res := p.final(t, p.cseq, 2*time.Second)
 	p.ack(t, p.cseq)
 	return res

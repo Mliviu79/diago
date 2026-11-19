@@ -41,10 +41,16 @@ const (
 // negotiates with. Like them it is not safe for concurrent use, srtpReadState
 // and leftRunning apart. A fork starts an exchange of its own, so Fork carries
 // none of it but the DTLS association the fork continues, see
-// carryDTLSAssociation, and the stream list our SDPs are written around.
+// carryDTLSAssociation, the stream list our SDPs are written around and the
+// numbering of those SDPs.
 type mediaSessionState struct {
 	srtpReadState
 	dtlsAssociationState
+
+	// versions numbers the SDPs LocalSDP writes, for this session and the
+	// sessions forked from it: see sdpVersions. It is nil until the first
+	// of them asks for it.
+	versions *sdpVersions
 
 	// offeredStreams is the stream list of the last offer RemoteSDP applied.
 	// LocalSDP writes one m= line for each of its streams, in the answer to

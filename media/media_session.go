@@ -362,6 +362,9 @@ func (s *MediaSession) Fork() *MediaSession {
 	// RemoteSDP replaces the list rather than changing it, so the two
 	// sessions can share it.
 	cp.offeredStreams = s.offeredStreams
+	// The fork describes the same session, so its SDPs are numbered with
+	// this session's.
+	cp.versions = s.sdpVersionRecord()
 	return &cp
 }
 
@@ -511,7 +514,11 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 		mode = s.Mode
 	}
 
-	return s.offeredStreams.around(s.offeredStreams.withAudioTag(generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet)))
+	// The session version counted above stands for the first description
+	// of the call alone: see numbered.
+	return s.numbered(func(version uint64) []byte {
+		return s.offeredStreams.around(s.offeredStreams.withAudioTag(generateSDPForAudio(s.sessionID, version, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet)))
+	})
 }
 
 // RemoteSDP applies an answer when offered is true, or an offer when false.
@@ -533,7 +540,14 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	//    different entity.  In that case, the version number in the "o=" line
 	//    of the answer is unrelated to the version number in the o line of the
 	//    offer.
-	if s.sessionID != si.SessionID {
+	// Only a session that has no origin of its own takes one from the
+	// peer's. RFC 3264 section 8 has the o= line of an offer of ours be
+	// "identical to that in the previous SDP" but for the version, and RFC
+	// 6337 section 5.2.5 reads it for every SDP of the session: "Changing
+	// the "o=" line, except version number value, during the session is an
+	// error case." So neither the answer to our offer nor a peer that
+	// changes its own session id changes ours.
+	if s.sessionID == 0 {
 		s.sessionID = si.SessionID
 		s.sessionVersion = si.SessionVersion + 1
 	}

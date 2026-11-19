@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-// sdpOrigin numbers the SDPs one call's WebRTC media sends: it gives the
-// session id and the session version of their o= line. RFC 3264 section 8 has
-// the o= line of an offer that modifies the session be "identical to that in
-// the previous SDP, except that the version in the origin field MUST
-// increment by one", so the id is drawn once and every SDP built after the
-// first takes the next version.
+// sdpOrigin gives the o= line of the SDPs one call's WebRTC media sends: the
+// session id, drawn once, and the session version of each, see sdpVersions.
+// RFC 3264 section 8 has the o= line of an offer that modifies the session be
+// "identical to that in the previous SDP, except that the version in the
+// origin field MUST increment by one", and an SDP sent under the version of
+// the one before it be that SDP again.
 //
 // A MediaSessionWebrtc and the ICE generations forked from it share one, since
 // an ICE restart modifies the same session: a generation that numbered its
@@ -20,24 +20,25 @@ import (
 // version the generation before it had already used. It is safe for
 // concurrent use.
 type sdpOrigin struct {
-	mu      sync.Mutex
-	id      int64
-	version int64
+	mu       sync.Mutex
+	id       int64
+	versions sdpVersions
 }
 
-// next returns the session id and the session version of the next SDP.
-func (o *sdpOrigin) next() (id int64, version int64) {
+// numbered returns the SDP write gives under the session id of the call and
+// the session version that SDP is to carry. write returns the SDP for an id
+// and a version, and the same one whenever it is called with the same two.
+func (o *sdpOrigin) numbered(write func(id int64, version uint64) []byte) []byte {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.id == 0 {
 		// A timestamp, as RFC 8866 section 5.2 recommends for a session id,
 		// and the first version is the same value.
 		o.id = time.Now().UnixNano()
-		o.version = o.id
-		return o.id, o.version
 	}
-	o.version++
-	return o.id, o.version
+	id := o.id
+	o.mu.Unlock()
+	body, _ := o.versions.numbered(uint64(id), func(version uint64) []byte { return write(id, version) })
+	return body
 }
 
 // originLocked returns the origin the SDPs of this session are numbered from.

@@ -531,9 +531,11 @@ func TestICEWebrtcReOfferDirection(t *testing.T) {
 
 // TestWebrtcSDPOriginIsStable pins the o= line of the SDPs one session sends
 // in a call: RFC 3264 section 8 has it identical from one SDP to the next but
-// for the version, which increments by one. An ICE restart modifies the same
-// session, so the generation Fork creates goes on from the origin of the one
-// it replaces.
+// for the version, which increments by one when the SDP is modified, and has
+// an SDP sent under the version of the one before it be that SDP again, which
+// is how RFC 4028 section 7.4 has a session refresh say that nothing changed.
+// An ICE restart modifies the same session, so the generation Fork creates
+// goes on from the origin of the one it replaces.
 func TestWebrtcSDPOriginIsStable(t *testing.T) {
 	ctx := t.Context()
 	offerer, answerer, offer, answer := newEstablishedWebrtcPair(t, nil)
@@ -548,9 +550,11 @@ func TestWebrtcSDPOriginIsStable(t *testing.T) {
 		version = gotVersion
 	}
 
+	// The session as it runs, offered again, is the offer it was set up
+	// with: nothing of it has changed.
 	reoffer, err := offerer.ReOffer("")
 	require.NoError(t, err)
-	requireNext(t, reoffer)
+	require.Equal(t, string(offer), string(reoffer), "an offer that changes nothing is the previous SDP")
 	offerer.Rollback()
 
 	hold, err := offerer.ReOffer(sdp.ModeSendonly)

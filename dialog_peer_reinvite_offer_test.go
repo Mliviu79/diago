@@ -118,8 +118,7 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 }
 
 // requireLocalSDP asserts the response carries our published media: the port
-// and the codec identify it, as the o= session version moves with every
-// description made.
+// and the codec identify it.
 func requireLocalSDP(t *testing.T, d *DialogMedia, res *sip.Response) {
 	t.Helper()
 	require.Equal(t, "application/sdp", res.ContentType().Value())
