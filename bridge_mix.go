@@ -32,7 +32,10 @@ func proxyMediaBackground(log *slog.Logger, reader io.Reader, writer io.Writer, 
 
 	written, err := copyWithBuf(reader, writer, buf.([]byte))
 	log.Debug("Proxy media routine finished", "bytes", written)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	// A deadline is how the proxy is stopped. The error is assigned in this
+	// scope: the one sent below is the one cleared.
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
 		log.Debug("Proxy media stopped with timeout. RTP Deadline", "error", err)
 		err = nil
 	}

@@ -220,3 +220,12 @@ func TestRTPDeadlinesSharedOnOneSocket(t *testing.T) {
 		require.NoError(t, within(t, done), "the read was ended by a deadline that had been cleared")
 	})
 }
+
+// TestMediaSessionRTPDeadlineWithoutSocket pins that StopRTP and StartRTP on a
+// session that was never initialized, and so has no RTP socket, return an
+// error: there is no read or write to give a deadline.
+func TestMediaSessionRTPDeadlineWithoutSocket(t *testing.T) {
+	s := &MediaSession{Codecs: []Codec{CodecAudioUlaw}}
+	require.ErrorIs(t, s.StopRTP(1, 0), errNoRTPSocket)
+	require.ErrorIs(t, s.StartRTP(1), errNoRTPSocket)
+}

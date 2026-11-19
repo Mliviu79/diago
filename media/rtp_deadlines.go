@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// errNoRTPSocket is what StopRTP and StartRTP return on a session that has no
+// RTP socket, one that was never initialized: there is no read or write to
+// give a deadline.
+var errNoRTPSocket = errors.New("media: session has no RTP socket")
+
 // rtpDeadlines holds the read and write deadlines StopRTP and StartRTP last
 // asked for on an RTP socket. Sessions that run on one socket share one, once
 // CarryRTPDeadlines has handed it from one to the other, so a deadline asked

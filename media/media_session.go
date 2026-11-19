@@ -299,6 +299,9 @@ func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 }
 
 func (s *MediaSession) StopRTP(rw int8, dur time.Duration) error {
+	if s.rtpConn == nil {
+		return errNoRTPSocket
+	}
 	t := time.Now().Add(dur)
 	defer s.holdRTPDeadline(rw, t)()
 	if rw&1 > 0 {
@@ -313,6 +316,9 @@ func (s *MediaSession) StopRTP(rw int8, dur time.Duration) error {
 }
 
 func (s *MediaSession) StartRTP(rw int8) error {
+	if s.rtpConn == nil {
+		return errNoRTPSocket
+	}
 	defer s.holdRTPDeadline(rw, time.Time{})()
 	if rw&1 > 0 {
 		return s.rtpConn.SetReadDeadline(time.Time{})

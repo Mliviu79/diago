@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,6 +23,9 @@ type BridgeAudioMedia struct {
 	WriterProps MediaProps
 	StopRTP     func() error
 	StartRTP    func() error
+
+	// source is set for audio taken from a DialogMedia by AddDialogMedia.
+	source bridgeMediaSource
 }
 
 type Bridge struct {
@@ -41,12 +45,17 @@ type Bridge struct {
 	WaitDialogsNum int
 
 	wg sync.WaitGroup
+
+	// mu guards dialogs, originator and proxy
+	mu sync.Mutex
+	// proxy is the proxy AddAudioMedia started, nil until it starts
+	proxy *bridgeProxy
 }
 
 // NewBridge creates bridge with default settings.
 func NewBridge() (b Bridge) {
-	// Set up in the result itself: a Bridge holds a sync.WaitGroup, which is
-	// not copied
+	// Set up in the result itself: a Bridge holds a lock and a
+	// sync.WaitGroup, which are not copied
 	b.Init(media.DefaultLogger())
 	return
 }
@@ -63,6 +72,8 @@ func (b *Bridge) Init(log *slog.Logger) {
 }
 
 func (b *Bridge) GetDialogs() []*BridgeAudioMedia {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.dialogs
 }
 
@@ -80,21 +91,23 @@ func (b *Bridge) AddDialogMedia(m *DialogMedia) error {
 	}
 
 	if b.DTMFpass {
+		// The proxy reads and writes through DTMF interceptors of its own,
+		// which are not set on the dialog: once the proxy has ended, a dialog
+		// must not keep sending the keys read on it to the other party. The
+		// proxy passes the keys read on one party to the writer of the other,
+		// see passDTMF.
 		dtmfReader := DTMFReader{}
-		med.Reader, err = m.AudioReader(WithAudioReaderMediaProps(&med.ReaderProps), WithAudioReaderDTMF(&dtmfReader))
-		if err != nil {
+		if _, err := m.AudioReader(WithAudioReaderMediaProps(&med.ReaderProps), bridgeDTMFReader(&dtmfReader)); err != nil {
 			return err
 		}
 		dtmfWriter := DTMFWriter{}
-		med.Writer, err = m.AudioWriter(WithAudioWriterMediaProps(&med.WriterProps), WithAudioWriterDTMF(&dtmfWriter))
-		if err != nil {
+		if _, err := m.AudioWriter(WithAudioWriterMediaProps(&med.WriterProps), bridgeDTMFWriter(&dtmfWriter)); err != nil {
 			return err
 		}
-
-		dtmfReader.OnDTMF(func(dtmf rune) error {
-			return dtmfWriter.WriteDTMF(dtmf)
-		})
+		med.Reader, med.Writer = &dtmfReader, &dtmfWriter
+		med.source.dtmfReader, med.source.dtmfWriter = &dtmfReader, &dtmfWriter
 	}
+	med.source.dialogMedia = m
 	med.StopRTP = func() error {
 		return m.StopRTP(0, 0)
 	}
@@ -158,24 +171,37 @@ func (b *Bridge) AddDialogWebrtc(m *DialogWebrtc) error {
 }
 
 func (b *Bridge) AddAudioMedia(m *BridgeAudioMedia) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// Check can this dialog be added to bridge. NO TRANSCODING
 	if b.originator != nil {
 		// This may look ugly but it is safe way of reading
 		origProps := b.originator.ReaderProps
 		mprops := m.ReaderProps
 
-		err := func() error {
-			if origProps.Codec != mprops.Codec {
-				return fmt.Errorf("no transcoding supported in bridge codec1=%+v codec2=%+v", origProps.Codec, mprops.Codec)
-			}
-			return nil
-		}()
-		if err != nil {
+		if err := bridgeCodecErr(origProps.Codec, mprops.Codec); err != nil {
 			return err
 		}
 	}
 
-	b.dialogs = append(b.dialogs, m)
+	// The media joins once the checks below pass, so a refused one is not
+	// left in the bridge.
+	dialogs := append(slices.Clone(b.dialogs), m)
+	if len(dialogs) >= b.WaitDialogsNum {
+		if len(dialogs) > 2 {
+			return fmt.Errorf("currently bridge only support 2 party")
+		}
+		// Check are both answered
+		for _, m := range dialogs {
+			// TODO remove this double locking. Read once
+			if m.Reader == nil || m.Writer == nil {
+				return fmt.Errorf("dialog session not answered?")
+			}
+		}
+	}
+
+	b.dialogs = dialogs
 	if len(b.dialogs) == 1 {
 		b.originator = m
 	}
@@ -184,52 +210,44 @@ func (b *Bridge) AddAudioMedia(m *BridgeAudioMedia) error {
 		return nil
 	}
 
-	if len(b.dialogs) > 2 {
-		return fmt.Errorf("currently bridge only support 2 party")
-	}
-	// Check are both answered
-	for _, m := range b.dialogs {
-		// TODO remove this double locking. Read once
-		if m.Reader == nil || m.Writer == nil {
-			return fmt.Errorf("dialog session not answered?")
-		}
-	}
-
+	// Nothing hands this proxy a context: StopProxyMedia ends the one it
+	// runs on.
+	ctx, cancel := context.WithCancel(context.Background())
+	proxy := newBridgeProxy(cancel)
+	b.proxy = proxy
 	go func() {
+		defer close(proxy.done)
+		defer cancel()
 		defer func(start time.Time) {
 			b.log.Debug("Proxy media setup", "dur", time.Since(start).String())
 		}(time.Now())
-		m1 := b.dialogs[0]
-		m2 := b.dialogs[1]
-		if err := b.proxyMediaChannels(context.Background(), m1, m2); err != nil {
-			if errors.Is(err, io.EOF) {
-				return
-			}
-
-			b.log.Error("Proxy media stopped", "error", err)
+		m1 := dialogs[0]
+		m2 := dialogs[1]
+		proxy.err = b.proxyMediaChannels(ctx, m1, m2)
+		if proxyEndedWithMedia(proxy.err) {
+			b.log.Debug("Proxy media stopped", "error", proxy.err)
+			return
 		}
+		b.log.Error("Proxy media stopped", "error", proxy.err)
 	}()
 	return nil
 }
 
 // ProxyMedia is explicit call to start proxing media.
+//
+// It returns once the media of either party is closed, as a call's end closes
+// it, once ctx ends, and with an error once a re-INVITE moves either party to
+// a codec the other does not have. The medias can be read again by then. A
+// proxy that ctx ended returns nil.
 func (b *Bridge) ProxyMedia(ctx context.Context) error {
-	if len(b.dialogs) > 2 {
-		return fmt.Errorf("proxy media requieres minimum 2 parties")
-	}
-	// Check are both answered
-	for _, m := range b.dialogs {
-		// TODO remove this double locking. Read once
-		if m.Reader == nil || m.Writer == nil {
-			return fmt.Errorf("dialog session not answered?")
-		}
+	m1, m2, err := b.proxyParties()
+	if err != nil {
+		return err
 	}
 
 	defer func(start time.Time) {
 		b.log.Debug("Proxy media setup", "dur", time.Since(start).String())
 	}(time.Now())
-	m1 := b.dialogs[0]
-	m2 := b.dialogs[1]
 	if err := b.proxyMediaChannels(ctx, m1, m2); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -241,8 +259,19 @@ func (b *Bridge) ProxyMedia(ctx context.Context) error {
 }
 
 func (b *Bridge) proxyMediaChannels(ctx context.Context, m1, m2 *BridgeAudioMedia) error {
-	var err error
 	log := b.log
+
+	// The codecs are watched before the proxy starts, so a media update made
+	// meanwhile is not missed.
+	mismatch, unwatch := watchBridgeCodecs(m1, m2)
+	defer unwatch()
+	select {
+	case err := <-mismatch:
+		return err
+	default:
+	}
+	passDTMF(m1, m2)
+	passDTMF(m2, m1)
 
 	// Lets for now simplify proxy and later optimize
 	errCh := make(chan error, 2)
@@ -267,29 +296,6 @@ func (b *Bridge) proxyMediaChannels(ctx context.Context, m1, m2 *BridgeAudioMedi
 		go proxyMediaBackground(log, r, w, errCh)
 	}()
 
-	// Wait for all to finish or stop on cancelation
-	stopped := false
-	for i := 0; i < 2; i++ {
-		select {
-		case <-ctx.Done():
-			// If we failed to stop, we will have useless block here
-			if !stopped {
-				if err := m1.StopRTP(); err != nil {
-					return err
-				}
-				stopped = true
-			}
-
-			err = errors.Join(err, <-errCh)
-
-		case e := <-errCh:
-			err = errors.Join(err, e)
-		}
-	}
-
-	if stopped {
-		m1.StartRTP() // Make sure we have RTP continued
-	}
-
-	return err
+	// Wait for all to finish, ending both once either ends or on cancelation
+	return proxyWait(ctx, []*BridgeAudioMedia{m1, m2}, errCh, mismatch)
 }
