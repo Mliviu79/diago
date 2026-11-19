@@ -439,7 +439,8 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 	}
 	d.pendingMediaSession = ms
 	if requested {
-		// The peer asked for this offer: it renegotiates nothing.
+		// This offer was asked for as the one of the session in place: it
+		// renegotiates nothing.
 		return negotiatedOffer(ms, d.mediaSession), nil
 	}
 	if mode == "" && d.offerNegotiatedCodecs {

@@ -44,6 +44,10 @@ type Diago struct {
 	auth      sipgo.DigestAuth
 	mediaConf MediaConfig
 
+	// sessionTimers is the RFC 4028 session-timer policy stamped onto each dialog
+	// at construction.
+	sessionTimers SessionTimerPolicy
+
 	log *slog.Logger
 
 	cache            DialogCachePool
@@ -328,7 +332,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			DialogServerSession: dialog,
 			// TODO we may actually just build media session with this conf here
 			mediaConf:    dg.mediaConfForTransport(tran),
-			sessionState: sessionState{log: dg.log},
+			sessionState: sessionState{log: dg.log, sessionTimers: dg.sessionTimers},
 		}
 
 		defer closeAndLog(dWrap, "closing dialog server returned error")

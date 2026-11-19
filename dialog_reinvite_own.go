@@ -28,13 +28,19 @@ type ownReInvite struct {
 	handshaker mediaHanshaker
 	// mode is the direction the offer asks for, empty for the one in place.
 	mode string
+	// inPlace asks the media for the offer of the session in place, which
+	// renegotiates nothing, whatever it is configured to offer in a
+	// re-INVITE of ours otherwise. A session refresh sets it: RFC 4028
+	// section 7.4 has the offer of a re-INVITE that refreshes the session
+	// indicate that the session has not changed.
+	inPlace bool
 	// callIDOwner tells whether we generated the dialog's Call-ID, as the
 	// caller does. It sets the wait after a 491, see reInviteRetryWait.
 	callIDOwner bool
-	// send sends one re-INVITE carrying offer to the remote target and
-	// acknowledges its 2xx. A final response other than 2xx is returned
-	// together with sipgo.ErrDialogResponse.
-	send func(ctx context.Context, offer []byte) (*sip.Response, error)
+	// send sends one re-INVITE carrying offer and headers to the remote
+	// target and acknowledges its 2xx. A final response other than 2xx is
+	// returned together with sipgo.ErrDialogResponse.
+	send func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error)
 }
 
 // run sends the re-INVITE and has the media take the answer in its 2xx. Each
@@ -45,6 +51,10 @@ type ownReInvite struct {
 // not refused 491 again, so two endpoints re-INVITing each other at once do
 // not keep refusing each other. Each attempt has the media make a fresh
 // offer, of the session in place by then.
+//
+// While the session timer runs, each attempt carries its headers and the 2xx
+// to it sets the timer (RFC 4028 sections 7.1, 7.2 and 7.4), whatever becomes
+// of the answer that 2xx carries.
 //
 // It returns errMediaClosed when the dialog has ended or the media is closed,
 // errReInviteAnswerWithoutSDP for a 2xx without SDP, sipgo.ErrDialogResponse
@@ -73,12 +83,31 @@ func (r ownReInvite) attempt(ctx context.Context) (refused bool, err error) {
 	}
 	defer endUpdate()
 
+	if r.inPlace {
+		// No description is handed over to answer: the offer asked for next
+		// is the one of the session as it runs, as it is for a re-INVITE of
+		// the peer's that carries no offer.
+		if err := r.handshaker.onRemoteSDP(ctx, nil, false); err != nil {
+			return false, err
+		}
+	}
 	offer, err := r.handshaker.onLocalSDP(ctx, false, r.mode)
 	if err != nil {
 		return false, err
 	}
-	res, err := r.send(ctx, offer)
+	timer := r.state.timer.Load()
+	var (
+		timerHeaders []sip.Header
+		weRefresh    bool
+	)
+	if timer != nil {
+		timerHeaders, weRefresh = timer.requestHeaders()
+	}
+	res, err := r.send(ctx, offer, timerHeaders)
 	if err == nil {
+		if timer != nil {
+			timer.answered(res, weRefresh)
+		}
 		err = r.applyAnswer(ctx, res)
 	}
 	if err != nil {
@@ -213,10 +242,13 @@ func (d *DialogServerSession) ownReInvite(
 		mode:       mode,
 		// The caller generated the Call-ID.
 		callIDOwner: false,
-		send: func(ctx context.Context, offer []byte) (*sip.Response, error) {
+		send: func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error) {
 			// NOTE: we do not change original invite request
 			req := sip.NewRequest(sip.INVITE, d.RemoteContact().Address)
 			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			for _, h := range headers {
+				req.AppendHeader(h)
+			}
 			req.SetBody(offer)
 			return send(ctx, req)
 		},
@@ -241,11 +273,14 @@ func (d *DialogClientSession) ownReInvite(handshaker mediaHanshaker, mode string
 		mode:       mode,
 		// We generated the Call-ID.
 		callIDOwner: true,
-		send: func(ctx context.Context, offer []byte) (*sip.Response, error) {
+		send: func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error) {
 			// NOTE: we do not change original invite request
 			req := sip.NewRequest(sip.INVITE, d.RemoteContact().Address)
 			req.AppendHeader(d.InviteRequest.Contact())
 			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			for _, h := range headers {
+				req.AppendHeader(h)
+			}
 			req.SetBody(offer)
 			return d.reInviteSend(ctx, req)
 		},

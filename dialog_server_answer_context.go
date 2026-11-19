@@ -59,6 +59,12 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) (*DialogMed
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("answer: %w", context.Cause(ctx))
 	}
+	// RFC 4028: as AnswerContext, negotiate session timers before the 2xx. A
+	// below-floor offer is refused 422 here, and respondSDP adds the timer
+	// headers to the 2xx and starts the timer once it is sent.
+	if err := d.prepareSessionTimers(ctx); err != nil {
+		return nil, err
+	}
 
 	// The media is the dialog's, not the wait's, so its port is chosen on the
 	// dialog's ctx.
@@ -88,6 +94,12 @@ func (d *DialogServerSession) AnswerLateContext(ctx context.Context) (*DialogMed
 func (d *DialogServerSession) answerOfferWithin(ctx context.Context, conf MediaConfig, onMediaUpdate func(*DialogMedia)) (*DialogMedia, error) {
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("answer: %w", context.Cause(ctx))
+	}
+	// RFC 4028: negotiate session timers before the 200 OK. A below-floor offer is
+	// rejected here with 422 and aborts the answer. The timer headers are stashed
+	// for respondSDP, which launches the loop or watchdog once the 200 OK is sent.
+	if err := d.prepareSessionTimers(ctx); err != nil {
+		return nil, err
 	}
 	offer := d.InviteRequest.Body()
 	if offer == nil {

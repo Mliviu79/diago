@@ -57,9 +57,10 @@ type sessionState struct {
 	// Set by OnReferNotifyUnmatched.
 	onReferNotifyUnmatched func(ReferNotify)
 
-	// answeringMu guards answering, ackAnswerErr and ackCarriesAnswer, which
-	// the answer to an inbound call and the reading of its ACK share. It is a
-	// lock of the session's own and is never held across a call.
+	// answeringMu guards answering, ackAnswerErr, ackCarriesAnswer and
+	// timerAnswer, which the answer to an inbound call and the reading of its
+	// ACK share. It is a lock of the session's own and is never held across a
+	// call.
 	answeringMu sync.Mutex
 	// answering is set by an answer before it sends its 2xx, and closed when
 	// that answer returns: after the ACK is read and, for an answer that sets
@@ -75,6 +76,20 @@ type sessionState struct {
 	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
 	// section 13.2.1).
 	ackCarriesAnswer bool
+	// timerAnswer is the RFC 4028 session timer the answer negotiated, which
+	// its 2xx carries and starts; nil until an answer negotiates one. Guarded
+	// by answeringMu.
+	timerAnswer *timerAnswer
+
+	// sessionTimers is the RFC 4028 policy of the Diago that made this dialog,
+	// which the answer to an inbound call negotiates with. Set before the
+	// dialog is handed out and not changed after.
+	sessionTimers SessionTimerPolicy
+	// timer is the running session timer, set once by the 2xx that answered
+	// the INVITE with one, and nil without one. Our re-INVITEs carry its
+	// headers and their 2xx sets it, as does the 2xx we send to a re-INVITE
+	// of the peer's.
+	timer atomic.Pointer[sessionTimer]
 
 	// requestMu makes the peer's re-INVITEs take turns, each held for the
 	// whole of its handling, until the ACK to its 2xx is read. It is taken

@@ -177,10 +177,24 @@ func (d *DialogServerSession) RespondSDP(ctx context.Context, body []byte) error
 // waiting until that is done too.
 func (d *DialogServerSession) respondSDP(ctx context.Context, body []byte) error {
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
+	ta := d.negotiatedTimerAnswer()
+	if ta != nil {
+		headers = append(headers, ta.headers...)
+	}
 	if err := d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...); err != nil {
 		return err
 	}
-	return d.endOnAckAnswerError()
+	if err := d.endOnAckAnswerError(); err != nil {
+		return err
+	}
+
+	// The 200 OK established the session, so start the refresh loop or arm the
+	// peer-refresh watchdog now, exactly once and on the dialog context so
+	// teardown cancels it.
+	if ta != nil {
+		d.launchSessionTimers(ta)
+	}
+	return nil
 }
 
 // Answer creates media session and answers
@@ -212,6 +226,12 @@ func (d *DialogServerSession) Answer(opt AnswerOptions) (*DialogMedia, error) {
 	d.onReferDialog = opt.OnRefer
 	d.dialogCallbacks.mu.Unlock()
 
+	// RFC 4028: negotiate session timers before the 200 OK. A below-floor offer
+	// is rejected here with 422 and aborts the answer.
+	if err := d.prepareSessionTimers(d.Context()); err != nil {
+		return nil, err
+	}
+
 	med := &DialogMedia{}
 	med.onMediaUpdate = opt.OnMediaUpdate
 	conf := d.mediaConf
@@ -239,6 +259,11 @@ func (d *DialogServerSession) AnswerEarlyMedia(m *DialogMedia, opt AnswerOptions
 	m.mu.Lock()
 	m.onMediaUpdate = opt.OnMediaUpdate
 	m.mu.Unlock()
+
+	// RFC 4028: mirror Answer and negotiate session timers before the 200 OK.
+	if err := d.prepareSessionTimers(d.Context()); err != nil {
+		return err
+	}
 
 	if err := d.RespondSDP(d.Context(), m.mediaSession.LocalSDP(true)); err != nil {
 		return err
@@ -295,6 +320,13 @@ func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTP
 // AnswerLate returns errAckCarriesNoAnswer; so does, with its own error, an
 // answer that cannot be applied or keyed.
 func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
+	// RFC 4028: as Answer, negotiate session timers before the 2xx. A
+	// below-floor offer is refused 422 here, and respondSDP adds the timer
+	// headers to the 2xx and starts the timer once it is sent.
+	if err := d.prepareSessionTimers(d.Context()); err != nil {
+		return nil, err
+	}
+
 	m := &DialogMedia{}
 	if err := m.initMediaSessionFromConf(d.Context(), d.mediaConf); err != nil {
 		return nil, err

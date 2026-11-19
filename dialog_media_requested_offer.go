@@ -18,7 +18,9 @@ var errNoMediaSession = errors.New("no media session present")
 // description, when it was not to answer an offer of ours (offered false): a
 // re-INVITE without an offer asks for ours, which our 2xx carries and its ACK
 // answers (RFC 3261 section 14.2). The offer made next is that one, see
-// onLocalSDP.
+// onLocalSDP. The session asks in the same way, with no description to hand
+// over, for the offer of a re-INVITE of its own that is to leave the session
+// as it runs.
 func (d *DialogMedia) noteOfferRequest(offered bool) {
 	if offered {
 		return

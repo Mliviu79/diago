@@ -242,6 +242,13 @@ func (s *sessionState) respondPeerReInvite(ctx context.Context, tx sip.ServerTra
 	if !res.IsSuccess() {
 		return true, tx.Respond(ctx, res)
 	}
+	// RFC 4028 section 9: while the session timer runs, the 2xx to the
+	// re-INVITE carries the timer it sets, which takes effect as it is sent.
+	if timer := s.timer.Load(); timer != nil {
+		for _, h := range timer.answerPeer(p.req) {
+			res.AppendHeader(h)
+		}
+	}
 	// The re-INVITE is a target refresh request, which moves the remote
 	// target as its 2xx is sent, and never when it is refused (RFC 6141
 	// section 4.6).

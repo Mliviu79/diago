@@ -29,6 +29,11 @@ type AnswerWebrtcOptions struct {
 // AnswerWebrtc consumes the WebRTC SDP offer, sends a SIP 200 answer and
 // completes ICE/DTLS-SRTP negotiation before returning.
 func (d *DialogServerSession) AnswerWebrtc(opts AnswerWebrtcOptions) (*DialogWebrtc, error) {
+	// RFC 4028: as Answer, negotiate session timers before the 2xx.
+	if err := d.prepareSessionTimers(d.Context()); err != nil {
+		return nil, err
+	}
+
 	remoteSDP := d.InviteRequest.Body()
 	if remoteSDP == nil {
 		return nil, fmt.Errorf("no SDP present in INVITE")
