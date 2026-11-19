@@ -82,16 +82,22 @@ func (d *DialogClientSession) WaitAnswerLeavePending(ctx context.Context, med *D
 // response within ctx, as RFC 3261 section 9.1 has it. It must not be called
 // while an invite or a wait for the answer is running.
 //
-// None of its results goes on with the media of the INVITE, so Cancel then
-// closes the media the session holds: the media kept for the pending INVITE,
-// and early media. An error of that close is joined to the result.
-//
 // When it returns *sipgo.ErrAnsweredAfterCancel, a 2xx answered the INVITE
 // regardless and the dialog is established. The answer the 2xx carries is not
 // applied, and the caller sends Ack and then Bye, as RFC 3261 section 13.2.2.4
-// requires for a 2xx whose call it does not go on with.
+// requires for a 2xx whose call it does not go on with. The peer sends media
+// to the port of the offer until that BYE, so the media stays bound and Close
+// closes it.
+//
+// No other result leaves a dialog, so Cancel then closes the media the session
+// holds: the media kept for the pending INVITE, and early media. An error of
+// that close is joined to the result.
 func (d *DialogClientSession) Cancel(ctx context.Context) error {
 	err := d.DialogClientSession.Cancel(ctx)
+	var answered *sipgo.ErrAnsweredAfterCancel
+	if errors.As(err, &answered) {
+		return err
+	}
 	if closeErr := d.closeCallbacks(); closeErr != nil {
 		return errors.Join(err, closeErr)
 	}

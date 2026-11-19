@@ -254,9 +254,9 @@ func TestDialogClientCancelWithdrawsPendingInvite(t *testing.T) {
 
 // TestDialogClientCancelAnsweredRegardless has a callee that rings and answers
 // the INVITE 200 when our CANCEL arrives, which it answers 481. Cancel returns
-// the 2xx as *sipgo.ErrAnsweredAfterCancel and closes the media of the INVITE,
-// and the dialog is established: Ack acknowledges the 2xx and Bye ends the
-// call.
+// the 2xx as *sipgo.ErrAnsweredAfterCancel and the dialog is established: Ack
+// acknowledges the 2xx and Bye ends the call. The media of the INVITE stays
+// bound until Close, as the peer sends to its port until the BYE.
 func TestDialogClientCancelAnsweredRegardless(t *testing.T) {
 	var invite *sip.Request
 	callee, methods := newUDPCallee(t, func(req *sip.Request) []*sip.Response {
@@ -286,13 +286,16 @@ func TestDialogClientCancelAnsweredRegardless(t *testing.T) {
 	var answered *sipgo.ErrAnsweredAfterCancel
 	require.ErrorAs(t, err, &answered)
 	require.Equal(t, sip.StatusOK, answered.Res.StatusCode)
-	require.Len(t, alloc.released, 1, "Cancel must close the media of an INVITE answered regardless")
+	require.Empty(t, alloc.released, "the peer sends to the port of an INVITE answered regardless until the BYE")
 	require.Equal(t, sip.DialogStateEstablished, d.LoadState())
 
 	require.NoError(t, d.Ack(t.Context()))
 	require.NoError(t, d.Bye(t.Context()))
 	require.Equal(t, sip.DialogStateEnded, d.LoadState())
 	requireCalleeRead(t, methods, sip.INVITE, sip.CANCEL, sip.ACK, sip.BYE)
+
+	require.NoError(t, d.Close())
+	require.Len(t, alloc.released, 1, "Close must close the media of an INVITE answered regardless")
 }
 
 // TestDialogClientWaitAnswerLeavePendingEarlyMedia has a callee that sends
