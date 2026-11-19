@@ -392,11 +392,8 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 	server.OnInfo(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 		// Handle DTMF out of band
-		contentType := req.ContentType()
-		if contentType == nil || contentType.Value() != "application/dtmf-relay" {
-			return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
-		}
-
+		// The dialog is matched first: an INFO for no live dialog is answered
+		// 481 (RFC 3261 section 12.2.2), whatever it carries.
 		sd, cd, err := dg.cache.MatchDialog(ctx, req)
 		if err != nil {
 			return handleNoDialog(ctx, req, tx, err)
@@ -757,26 +754,27 @@ func (dg *Diago) newSipDialog(recipient sip.Uri, tran *Transport, opts NewDialog
 		dtlsConf:   tran.MediaDTLSConf,
 	}
 
-	// This should be run on ACK
+	// The dialog exists from its 2xx (RFC 3261 section 12.1.2), so it is
+	// stored then, before the ACK goes out. The peer may send an in-dialog
+	// request as soon as the ACK reaches it, and sipgo confirms the dialog only
+	// after the ACK is written, so storing on confirmation answered such a
+	// request 481.
 	d.OnState(func(s sip.DialogState) {
-		if s != sip.DialogStateConfirmed {
+		if s != sip.DialogStateEstablished {
 			return
 		}
 
-		// Now dialog is established and can be add into store
 		if err := dg.cache.client.DialogStore(context.Background(), d.ID, d); err != nil {
 			dg.log.Error("Failed to store in dialog cache", "error", err)
 		}
 	})
 
-	d.Dialog.OnState(func(s sip.DialogState) {
-		if s != sip.DialogStateEnded {
-			return
-		}
-		if err := dg.cache.client.DialogDelete(context.Background(), d.ID); err != nil {
-			dg.log.Error("Failed to delete client dialog", "error", err)
-		}
-	})
+	// The dialog leaves the cache when its owner closes it, not when it ends:
+	// a BYE ends the call, not a REFER subscription set up on the dialog (RFC
+	// 5057 section 5.5), whose NOTIFY must still find it.
+	d.uncache = func() error {
+		return dg.cache.client.DialogDelete(context.Background(), d.ID)
+	}
 	return d, nil
 }
 

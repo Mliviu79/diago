@@ -39,8 +39,9 @@ func (d *DialogClientSession) Close() error {
 		return nil
 	}
 	e1 := d.closeCallbacks()
-	e2 := d.DialogClientSession.Close()
-	return errors.Join(e1, e2)
+	e2 := d.leaveCache()
+	e3 := d.DialogClientSession.Close()
+	return errors.Join(e1, e2, e3)
 }
 
 func (d *DialogClientSession) Id() string {
@@ -600,10 +601,20 @@ func (d *DialogClientSession) handleReferNotify(ctx context.Context, req *sip.Re
 	d.dialogCallbacks.mu.Lock()
 	onReferNotify := d.onReferNotify
 	d.dialogCallbacks.mu.Unlock()
+	if res := notifyDialogEndedResponse(d, req, onReferNotify != nil); res != nil {
+		tx.Respond(ctx, res)
+		return
+	}
 	dialogHandleReferNotify(ctx, d, req, tx, onReferNotify)
 }
 
 func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *sip.Request, tx sip.ServerTransaction) {
+	// A REFER asks to transfer this call, which an ended dialog no longer has.
+	if res := dialogEndedResponse(d, req); res != nil {
+		tx.Respond(ctx, res)
+		return
+	}
+
 	d.dialogCallbacks.mu.Lock()
 	onRefDialog := d.onReferDialog
 	d.dialogCallbacks.mu.Unlock()
@@ -616,6 +627,13 @@ func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *s
 }
 
 func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	// After our BYE an ended dialog stays in the cache until it is closed, so
+	// a re-INVITE can still find it. It is answered 481 without reaching the
+	// media.
+	if res := dialogEndedResponse(d, req); res != nil {
+		return tx.Respond(ctx, res)
+	}
+
 	if err := d.ReadRequest(req, tx); err != nil {
 		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
 	}
@@ -664,6 +682,12 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	if res := dialogEndedResponse(d, req); res != nil {
+		return tx.Respond(ctx, res)
+	}
+	// DTMF relay is not read yet, so an INFO on a live dialog is refused
+	// whatever it carries, without a body and so without a Content-Type (RFC
+	// 3261 section 20.15) too.
 	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 }
 

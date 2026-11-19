@@ -403,3 +403,17 @@ func newAnsweredTestServerCallOverUA(t *testing.T, ua *sipgo.DialogUA) (*DialogS
 	}
 	return d, med
 }
+
+// newInDialogReInvite builds a body-less re-INVITE inside the dialog.
+func newInDialogReInvite(t *testing.T, d *DialogServerSession, seq uint32) *sip.Request {
+	t.Helper()
+
+	inv := d.InviteRequest
+	req := sip.NewRequest(sip.INVITE, inv.Contact().Address)
+	req.AppendHeader(sip.HeaderClone(inv.From()))
+	req.AppendHeader(sip.HeaderClone(inv.To()))
+	req.AppendHeader(sip.HeaderClone(inv.CallID()))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.INVITE})
+	req.AppendHeader(sip.HeaderClone(inv.Contact()))
+	return req
+}
