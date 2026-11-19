@@ -860,7 +860,7 @@ func (m *MediaSessionWebrtc) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	for {
 		n, from, err := mux.rtp.ReadFrom(buf)
 		if err != nil {
-			return 0, err
+			return 0, webRTCReadErr(err)
 		}
 		path := m.packetPath()
 		if path.remoteSRTP == nil {
@@ -889,7 +889,7 @@ func (m *MediaSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
 		return 0, fmt.Errorf("WebRTC RTP transport is not initialized")
 	}
 	n, _, err := mux.rtp.ReadFrom(buf)
-	return n, err
+	return n, webRTCReadErr(err)
 }
 
 // WriteRTP encrypts pkt and sends it to the peer. On a session Finalize has
