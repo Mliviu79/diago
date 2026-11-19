@@ -3,9 +3,11 @@
 package diago
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -164,6 +166,59 @@ func (r *enteringRTPReader) ReadRTP(buf []byte, p *rtp.Packet) (int, error) {
 	return r.RTPReader.ReadRTP(buf, p)
 }
 
+// TestDialogMediaStatsFollowReinvite pins that the RTP statistics the
+// AudioReader and AudioWriter options report are those of the dialog's
+// current RTP session. A re-INVITE replaces that session with a fork, which
+// carries the statistics on and counts what is read and written from then on.
+// The options kept the session they were installed on, whose counts stopped at
+// the re-INVITE.
+func TestDialogMediaStatsFollowReinvite(t *testing.T) {
+	p := newFollowPeer(t)
+
+	var mu sync.Mutex
+	var readCount, writeCount uint64
+	ar, err := p.d.AudioReader(WithAudioReaderRTPStats(func(stats media.RTPReadStats) {
+		mu.Lock()
+		readCount = stats.PacketsCount
+		mu.Unlock()
+	}))
+	require.NoError(t, err)
+	aw, err := p.d.AudioWriter(WithAudioWriterRTPStats(func(stats media.RTPWriteStats) {
+		mu.Lock()
+		writeCount = stats.PacketsCount
+		mu.Unlock()
+	}))
+	require.NoError(t, err)
+
+	counts := func() (uint64, uint64) {
+		mu.Lock()
+		defer mu.Unlock()
+		return readCount, writeCount
+	}
+
+	p.sendAudio(t)
+	_, err = readWithin(t, ar, 5*time.Second)
+	require.NoError(t, err)
+	_, err = aw.Write(make([]byte, 160))
+	require.NoError(t, err)
+	p.recv(t)
+	read, written := counts()
+	require.EqualValues(t, 1, read)
+	require.EqualValues(t, 1, written)
+
+	p.reinvite(t, 101, 2)
+
+	p.sendAudio(t)
+	_, err = readWithin(t, ar, 5*time.Second)
+	require.NoError(t, err)
+	_, err = aw.Write(make([]byte, 160))
+	require.NoError(t, err)
+	p.recv(t)
+	read, written = counts()
+	require.EqualValues(t, 2, read, "the read statistics stopped at the re-INVITE")
+	require.EqualValues(t, 2, written, "the write statistics stopped at the re-INVITE")
+}
+
 // TestDialogMediaDTMFFollowsReinvite pins that DTMF read and written through a
 // dialog's DTMF reader and writer is carried on the telephone-event payload
 // type of the dialog's current media session. telephone-event is a dynamic
@@ -251,6 +306,20 @@ func TestDialogMediaReadDeadlines(t *testing.T) {
 		requireReadable(t, p)
 	})
 
+	t.Run("ListenContext", func(t *testing.T) {
+		p := newFollowPeer(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		require.NoError(t, p.d.ListenContext(ctx))
+		requireReadable(t, p)
+	})
+
+	t.Run("ListenUntil", func(t *testing.T) {
+		p := newFollowPeer(t)
+		require.ErrorIs(t, p.d.ListenUntil(50*time.Millisecond), os.ErrDeadlineExceeded)
+		requireReadable(t, p)
+	})
+
 	t.Run("DTMF Listen across a rebind", func(t *testing.T) {
 		p := newFollowPeer(t)
 		r, err := p.d.AudioReaderDTMF()
@@ -279,6 +348,49 @@ func TestDialogMediaReadDeadlines(t *testing.T) {
 		}
 		requireReadable(t, p)
 	})
+}
+
+// TestDialogMediaRingtoneKeepsReads pins that a ringtone playing in the
+// background changes only the write deadline it stops its writes with, and
+// restores it: a read deadline another helper set, as a listener waiting for
+// DTMF with a timeout does, still ends that read. It also pins that stopping
+// the ringtone between two rings is a clean stop, as stopping it during one
+// is.
+func TestDialogMediaRingtoneKeepsReads(t *testing.T) {
+	p := newFollowPeer(t)
+	ringtone, err := p.d.PlaybackRingtoneCreate()
+	require.NoError(t, err)
+
+	ar, err := p.d.AudioReader()
+	require.NoError(t, err)
+	require.NoError(t, p.d.StopRTP(1, 300*time.Millisecond))
+
+	stop, err := ringtone.PlayBackground()
+	require.NoError(t, err)
+
+	_, err = readWithin(t, ar, 5*time.Second)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded, "the ringtone cleared the read deadline")
+	require.NoError(t, p.d.StartRTP(1, 0))
+
+	// A ring is 2 s of PCMU in 20 ms frames, which go out at the packet
+	// writer's pace. The ringtone is between rings once the peer has the last
+	// of them.
+	for i := 0; i < 100; i++ {
+		p.recv(t)
+	}
+	require.NoError(t, stop(), "a stop between rings is a clean stop")
+	requireSendsAudio(t, p)
+}
+
+// requireSendsAudio requires the dialog's writes to go out, so no write
+// deadline was left set.
+func requireSendsAudio(t *testing.T, p *followPeer) {
+	t.Helper()
+	aw, err := p.d.AudioWriter()
+	require.NoError(t, err)
+	_, err = aw.Write(make([]byte, 160))
+	require.NoError(t, err, "a write deadline was left set")
+	p.recv(t)
 }
 
 // TestDialogMediaAudioHelpersReadMediaUnderLock pins that the DTMF reader and
@@ -320,4 +432,27 @@ func TestDialogMediaAudioHelpersReadMediaUnderLock(t *testing.T) {
 			return err
 		})
 	})
+}
+
+// TestDialogMediaRingtoneFollowsRebind pins that a ringtone made before a
+// re-INVITE moved the dialog's media to new sockets plays and stops on the
+// dialog's current media. It kept the media session it was made on, whose
+// sockets are gone once the media has moved, so starting and stopping it
+// failed there.
+func TestDialogMediaRingtoneFollowsRebind(t *testing.T) {
+	p := newFollowPeer(t)
+	ringtone, err := p.d.PlaybackRingtoneCreate()
+	require.NoError(t, err)
+
+	replaced := p.d.MediaSession()
+	p.rebind(t)
+	// The rebind leaves the sockets it replaced open. They carry nothing any
+	// more, and are closed here as whoever moved the media away closes them.
+	require.NoError(t, replaced.Close())
+
+	stop, err := ringtone.PlayBackground()
+	require.NoError(t, err)
+	p.recv(t)
+	require.NoError(t, stop())
+	requireSendsAudio(t, p)
 }

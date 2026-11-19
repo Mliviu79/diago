@@ -520,15 +520,20 @@ func WithAudioReaderJitterBuffer(opts media.RTPJitterBufferOptions) AudioReaderO
 	}
 }
 
-// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
+// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader.
+// The statistics are those of the dialog's current RTP session, which a media
+// update replaces with one that carries them on. Without an RTP session the
+// option returns ErrNoMediaSetup.
 func WithAudioReaderRTPStats(hook media.OnRTPReadStats) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		r := &media.RTPStatsReader{
-			Reader:         d.getAudioReader(),
-			RTPSession:     d.rtpSession,
-			OnRTPReadStats: hook,
+		if d.rtpSession == nil {
+			return ErrNoMediaSetup
 		}
-		d.audioReader = r
+		d.audioReader = &rtpStatsReader{
+			reader: d.getAudioReader(),
+			dialog: d,
+			hook:   hook,
+		}
 		return nil
 	}
 }
@@ -622,12 +627,16 @@ func (d *DialogMedia) getAudioReader() io.Reader {
 	return d.RTPPacketReader
 }
 
-// audioReaderProps
+// audioReaderProps fills p from the media session and returns the audio
+// reader. It returns nil when there is no reader, and without a media session,
+// which describes the audio.
 func (d *DialogMedia) audioReaderProps(p *MediaProps) io.Reader {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	WithAudioReaderMediaProps(p)(d)
+	if err := WithAudioReaderMediaProps(p)(d); err != nil {
+		return nil
+	}
 	return d.getAudioReader()
 }
 
@@ -653,15 +662,20 @@ func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	}
 }
 
-// WithAudioReaderRTPStats creates RTP Statistics interceptor on audio reader
+// WithAudioWriterRTPStats creates RTP Statistics interceptor on audio writer.
+// The statistics are those of the dialog's current RTP session, which a media
+// update replaces with one that carries them on. Without an RTP session the
+// option returns ErrNoMediaSetup.
 func WithAudioWriterRTPStats(hook media.OnRTPWriteStats) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		w := media.RTPStatsWriter{
-			Writer:          d.getAudioWriter(),
-			RTPSession:      d.rtpSession,
-			OnRTPWriteStats: hook,
+		if d.rtpSession == nil {
+			return ErrNoMediaSetup
 		}
-		d.audioWriter = &w
+		d.audioWriter = &rtpStatsWriter{
+			writer: d.getAudioWriter(),
+			dialog: d,
+			hook:   hook,
+		}
 		return nil
 	}
 }
@@ -767,11 +781,16 @@ func (d *DialogMedia) getAudioWriter() io.Writer {
 	return d.RTPPacketWriter
 }
 
+// audioWriterProps fills p from the media session and returns the audio
+// writer. It returns nil when there is no writer, and without a media session,
+// which describes the audio.
 func (d *DialogMedia) audioWriterProps(p *MediaProps) io.Writer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	WithAudioWriterMediaProps(p)(d)
+	if err := WithAudioWriterMediaProps(p)(d); err != nil {
+		return nil
+	}
 	return d.getAudioWriter()
 }
 
@@ -811,7 +830,12 @@ func (d *DialogMedia) PlaybackCreate() (AudioPlayback, error) {
 	}
 	p := NewAudioPlayback(w, mprops.Codec)
 	// On each play it needs reset RTP timestamp
-	p.onPlay = d.RTPPacketWriter.ResetTimestamp
+	d.mu.Lock()
+	packetWriter := d.RTPPacketWriter
+	d.mu.Unlock()
+	if packetWriter != nil {
+		p.onPlay = packetWriter.ResetTimestamp
+	}
 	return p, nil
 }
 
@@ -847,10 +871,10 @@ func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
 	}
 
 	ar := AudioRingtone{
-		writer:       &encoder,
-		ringtone:     ringtone,
-		sampleSize:   mprops.Codec.Samples16(),
-		mediaSession: d.mediaSession,
+		writer:     &encoder,
+		ringtone:   ringtone,
+		sampleSize: mprops.Codec.Samples16(),
+		dialog:     d,
 	}
 	return ar, nil
 }
@@ -933,21 +957,21 @@ func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
 }
 
 // ListenContext listens until context is canceled.
-func (d *DialogMedia) ListenContext(pctx context.Context) error {
+//
+// The context's end stops the read with a read deadline, which is cleared
+// again before ListenContext returns, and ListenContext then returns nil.
+func (d *DialogMedia) ListenContext(pctx context.Context) (err error) {
 	buf := make([]byte, media.RTPBufSize)
-	ctx, cancel := context.WithCancel(pctx)
-	defer cancel()
-
-	go func() {
-		<-ctx.Done()
-		if pctx.Err() != nil {
-			d.StopRTP(1, 0)
-		}
-	}()
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
+	restoreReads := d.stopReadsAtEnd(pctx)
+	defer func() {
+		if restoreErr := restoreReads(); err == nil {
+			err = restoreErr
+		}
+	}()
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -959,14 +983,23 @@ func (d *DialogMedia) ListenContext(pctx context.Context) error {
 	}
 }
 
-func (d *DialogMedia) ListenUntil(dur time.Duration) error {
+// ListenUntil listens for dur, and returns the read deadline's error when dur
+// has passed. The read deadline is cleared again before it returns.
+func (d *DialogMedia) ListenUntil(dur time.Duration) (err error) {
 	buf := make([]byte, media.RTPBufSize)
 
-	d.StopRTP(1, dur)
 	audioReader, err := d.AudioReader()
 	if err != nil {
 		return err
 	}
+	if err := d.StopRTP(1, dur); err != nil {
+		return err
+	}
+	defer func() {
+		if startErr := d.StartRTP(1, 0); startErr != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+			err = errors.Join(err, startErr)
+		}
+	}()
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
