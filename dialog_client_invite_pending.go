@@ -75,8 +75,8 @@ func (d *DialogClientSession) WaitAnswerLeavePending(ctx context.Context, med *D
 	return d.waitAnswerWith(ctx, med, opts, d.DialogClientSession.WaitAnswerLeavePending)
 }
 
-// Cancel withdraws the INVITE that InviteLeavePending or
-// WaitAnswerLeavePending left pending. It is the Cancel of the embedded
+// Cancel withdraws the INVITE that InviteLeavePending, WaitAnswerLeavePending
+// or one of their WebRTC forms left pending. It is the Cancel of the embedded
 // session, with its results, on ctx, the context of whoever owns the call the
 // INVITE attempts: it sends the CANCEL and waits for the INVITE's final
 // response within ctx, as RFC 3261 section 9.1 has it. It must not be called

@@ -42,6 +42,11 @@ type InviteWebrtcOptions struct {
 // The caller can use the returned media immediately, then call
 // WaitAnswerWebrtc to wait for the final response and ACK it.
 func (d *DialogClientSession) InviteWebrtc(ctx context.Context, opts InviteWebrtcOptions) (*DialogWebrtc, error) {
+	return d.inviteWebrtcWith(ctx, opts, d.DialogClientSession.WaitAnswer)
+}
+
+// inviteWebrtcWith is InviteWebrtc, waiting for the INVITE's answer with wait.
+func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteWebrtcOptions, wait inviteAnswerWait) (*DialogWebrtc, error) {
 	conf, err := prepareWebrtcConfig(opts.WebrtcConfig)
 	if err != nil {
 		return nil, err
@@ -100,7 +105,7 @@ func (d *DialogClientSession) InviteWebrtc(ctx context.Context, opts InviteWebrt
 				return ErrClientEarlyMedia
 			}
 		}
-		if err = d.DialogClientSession.WaitAnswer(ctx, answerOpts); err != nil {
+		if err = wait(ctx, answerOpts); err != nil {
 			return err
 		}
 		answered = true
