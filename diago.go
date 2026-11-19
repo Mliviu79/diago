@@ -193,6 +193,10 @@ type MediaConfig struct {
 	//
 	// False offers every configured codec, among which the peer chooses
 	// again. Hold and Unhold offer every configured codec either way.
+	//
+	// It applies to the media of DialogMedia and of DialogWebrtc alike: the
+	// offer of a DialogWebrtc, which moves the call to a new ICE generation,
+	// carries every configured codec too unless this is set.
 	ReInviteNegotiatedCodecs bool
 
 	// Used internally

@@ -163,6 +163,9 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 	if mode != "" {
 		fork.Mode = mode
 	}
+	if mode == "" && d.offersNegotiatedCodecs() {
+		offerNegotiatedCodecs(fork, current)
+	}
 	d.setPendingMediaSession(fork)
 	localSDP, err := fork.LocalSDP(ctx, false)
 	if err != nil {
@@ -204,8 +207,7 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 			return err
 		}
 		if pending == current {
-			d.commitCurrentMediaSession()
-			return nil
+			return d.commitCurrentMediaSession()
 		}
 		return d.replaceMediaSession(pending)
 	}
@@ -245,8 +247,7 @@ func (d *DialogWebrtc) onFinalize(ctx context.Context) error {
 		return err
 	}
 	if pending == current {
-		d.commitCurrentMediaSession()
-		return nil
+		return d.commitCurrentMediaSession()
 	}
 	return d.replaceMediaSession(pending)
 }
@@ -275,16 +276,20 @@ func (d *DialogWebrtc) abortPendingMediaSession() {
 	}
 }
 
-func (d *DialogWebrtc) commitCurrentMediaSession() {
+func (d *DialogWebrtc) commitCurrentMediaSession() error {
 	d.mu.Lock()
 	d.pendingMediaSession = nil
 	if d.RTPPacketWriter != nil && d.rtpSession != nil && d.mediaSession != nil {
-		d.RTPPacketWriter.UpdateWriter(d.rtpSession, d.mediaSession.Codec())
+		if err := d.RTPPacketWriter.UpdateWriter(d.rtpSession, d.mediaSession.Codec()); err != nil {
+			d.mu.Unlock()
+			return fmt.Errorf("dialog WebRTC media update: %w", err)
+		}
 	}
 	d.followInPlaceUpdateUnsafe()
 	d.noteInstallUnsafe()
 	d.mu.Unlock()
 	d.mediaInstalled()
+	return nil
 }
 
 func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error {
@@ -321,8 +326,14 @@ func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error
 		d.mu.Unlock()
 		return errors.Join(fmt.Errorf("carrying RTP deadlines to the new media session: %w", err), rtpSession.MonitorClose(), sess.Close())
 	}
+	// The writer refuses a codec it cannot pace before anything has moved,
+	// so the call stays on the session it runs on.
+	if err := writer.UpdateWriter(rtpSession, sess.Codec()); err != nil {
+		d.pendingMediaSession = nil
+		d.mu.Unlock()
+		return errors.Join(fmt.Errorf("dialog WebRTC media replacement: %w", err), rtpSession.MonitorClose(), sess.Close())
+	}
 	d.moveRTPReadsUnsafe(rtpSession)
-	writer.UpdateWriter(rtpSession, sess.Codec())
 	d.mediaSession = sess
 	d.rtpSession = rtpSession
 	d.pendingMediaSession = nil

@@ -55,7 +55,7 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 	if err = sess.Init(ctx, conf, opts.OnICEStateChange); err != nil {
 		return nil, err
 	}
-	med := &DialogWebrtc{}
+	med := &DialogWebrtc{dialogWebrtcState: dialogWebrtcState{offerNegotiatedCodecs: d.mediaConfig.ReInviteNegotiatedCodecs}}
 	answered := false
 	acked := false
 

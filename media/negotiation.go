@@ -17,7 +17,9 @@ import (
 // carries the specifics.
 var (
 	// ErrNoCommonCodec means the audio formats do not intersect: the peer
-	// offered no codec we support, or none that could be parsed.
+	// offered no codec we support, or none that could be parsed, or the only
+	// formats it shares with us are telephone-event or comfort noise, which
+	// carry no audio of their own.
 	ErrNoCommonCodec = errors.New("no common codec")
 
 	// ErrNoCommonCrypto means the media is negotiable but the keying is not.

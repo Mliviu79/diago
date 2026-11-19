@@ -34,6 +34,11 @@ type dialogWebrtcState struct {
 	// front of the packet reader, nil without one. Media updates move it
 	// and Close waits for its read loop.
 	jitterBuffer *media.RTPJitterBuffer
+
+	// offerNegotiatedCodecs is MediaConfig.ReInviteNegotiatedCodecs of the
+	// config the media was built from. Set before the media is handed out
+	// and not changed after.
+	offerNegotiatedCodecs bool
 }
 
 var _ MediaHandle = (*DialogWebrtc)(nil)

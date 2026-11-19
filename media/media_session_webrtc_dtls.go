@@ -62,6 +62,12 @@ type webrtcSessionState struct {
 	// SetRTPDeadline last asked for. CarryRTPDeadlines hands them to the
 	// session of the ICE generation that replaces this one. It guards itself.
 	deadlines rtpDeadlines
+
+	// setupCodecs are the codecs the session was set up with, before the
+	// first negotiation narrowed Codecs to those in common: see
+	// keepSetupCodecsLocked. Nil until then, and handed to a fork. Guarded by
+	// mu.
+	setupCodecs []Codec
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is

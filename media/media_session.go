@@ -598,6 +598,9 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	if s.updateRemoteCodecs(codecs[:n], !offered) == 0 {
 		return fmt.Errorf("%w: no supported codecs found", ErrNoCommonCodec)
 	}
+	if err := audioInCommon(s.filterCodecs); err != nil {
+		return err
+	}
 
 	ci, err := sd.ConnectionInformation()
 	if err != nil {

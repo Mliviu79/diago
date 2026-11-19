@@ -50,7 +50,7 @@ func (d *DialogServerSession) AnswerWebrtc(opts AnswerWebrtcOptions) (*DialogWeb
 	if err = sess.Init(d.Context(), conf, opts.OnICEStateChange); err != nil {
 		return nil, err
 	}
-	med := &DialogWebrtc{}
+	med := &DialogWebrtc{dialogWebrtcState: dialogWebrtcState{offerNegotiatedCodecs: d.mediaConf.ReInviteNegotiatedCodecs}}
 	answered := false
 	d.OnState(func(state sip.DialogState) {
 		if state == sip.DialogStateEnded {

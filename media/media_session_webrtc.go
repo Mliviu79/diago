@@ -130,6 +130,13 @@ type MediaSessionWebrtc struct {
 // Fork creates a fresh WebRTC transport for a locally initiated ICE restart.
 // Codec and configuration slices are copied because SDP negotiation mutates the
 // session's codec list, while certificates and filters remain immutable config.
+//
+// The fork starts from every codec the session was set up with, not only those
+// the last negotiation kept, as MediaSession.Fork does: its offer offers them
+// all, and its answer to an offer is made from them all. A caller that wants
+// an offer of the negotiated codecs alone sets the fork's Codecs to
+// CommonCodecs before LocalSDP; the fork still hands the configured ones on to
+// its own forks.
 func (m *MediaSessionWebrtc) Fork(ctx context.Context) (*MediaSessionWebrtc, error) {
 	m.mu.Lock()
 	conf := m.Config
@@ -140,13 +147,14 @@ func (m *MediaSessionWebrtc) Fork(ctx context.Context) (*MediaSessionWebrtc, err
 	conf.DTLS.Certificates = slices.Clone(conf.DTLS.Certificates)
 	conf.DTLS.SRTPProfiles = slices.Clone(conf.DTLS.SRTPProfiles)
 	conf.DTLS.EllipticCurves = slices.Clone(conf.DTLS.EllipticCurves)
-	codecs := slices.Clone(m.Codecs)
+	codecs := m.forkCodecsLocked()
 	mode := m.Mode
 	modePreference := m.modePreference
 	onICEStateChange := m.onICEStateChange
 	m.mu.Unlock()
 
 	fork := &MediaSessionWebrtc{Codecs: codecs, Mode: mode, modePreference: modePreference}
+	fork.setupCodecs = slices.Clone(codecs)
 	fork.origin = m.sharedOrigin()
 	fork.streams.current = m.forkedStreams()
 	fork.source = m.sharedSource()
@@ -548,6 +556,9 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	if len(common) == 0 {
 		return fmt.Errorf("remote has no supported audio codec, remote=%v local=%v: %w", remoteCodecs, localCodecs, ErrNoCommonCodec)
 	}
+	if err := audioInCommon(common); err != nil {
+		return fmt.Errorf("remote=%v local=%v: %w", remoteCodecs, localCodecs, err)
+	}
 
 	remoteCandidates := make([]ice.Candidate, 0, 4)
 	for _, attr := range webRTCCandidateAttributes(&desc, unread, md) {
@@ -639,6 +650,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.offerAccepted(proto, offered)
 	m.keepOfferedStreams(webRTCOfferedStreams(&desc, unread, md), offered)
 	m.filterCodecs = common
+	m.keepSetupCodecsLocked()
 	m.Codecs = slices.Clone(common)
 	m.codec, _ = CodecAudioFromList(common)
 	if m.modePreference == "" {

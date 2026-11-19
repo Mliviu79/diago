@@ -251,11 +251,19 @@ func (w *RTPPacketWriter) UpdateRTPSession(rtpSess *RTPSession) {
 	// rtpSess.writeStats.sampleRate = w.sampleRate
 }
 
-func (w *RTPPacketWriter) UpdateWriter(writer RTPWriter, codec Codec) {
+// UpdateWriter has the writer write to writer with codec from now on. A codec
+// the writer cannot pace, one with no sample rate or sample duration, is
+// refused with an error that wraps ErrCodecNotPaceable, and the writer keeps
+// the writer and codec it had.
+func (w *RTPPacketWriter) UpdateWriter(writer RTPWriter, codec Codec) error {
+	if err := checkPaceable(codec); err != nil {
+		return err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	w.codec = codec
 	w.writer = writer
 	w.clockReset()
+	return nil
 }
