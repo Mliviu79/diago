@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media/sdp"
-	"github.com/emiago/dtls/v3"
+	"github.com/pion/dtls/v3"
 	"github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -108,6 +108,8 @@ type MediaSessionWebrtc struct {
 	writeRTPBuf                []byte
 	writeRTCPBuf               []byte
 	onICEStateChange           func(ice.ConnectionState)
+
+	webrtcSessionState
 }
 
 // Fork creates a fresh WebRTC transport for a locally initiated ICE restart.
@@ -582,10 +584,11 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		Algorithm: fingerprintFields[0],
 		Value:     fingerprintFields[1],
 	}})
+	dtlsTr := m.dtlsTransport()
 	if localDTLSClient {
-		m.dtlsConn, err = dtls.Client(m.mux.dtls, conn.RemoteAddr(), dtlsConf)
+		m.dtlsConn, err = dtls.Client(dtlsTr, conn.RemoteAddr(), dtlsConf)
 	} else {
-		m.dtlsConn, err = dtls.Server(m.mux.dtls, conn.RemoteAddr(), dtlsConf)
+		m.dtlsConn, err = dtls.Server(dtlsTr, conn.RemoteAddr(), dtlsConf)
 	}
 	if err != nil {
 		return fmt.Errorf("create DTLS transport: %w", err)
@@ -624,6 +627,9 @@ func (m *MediaSessionWebrtc) Finalize(ctx context.Context) error {
 	}
 	if err := dtlsConn.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("DTLS handshake: %w", err)
+	}
+	if err := m.retireDTLS(dtlsConn); err != nil {
+		return err
 	}
 	state, ok := dtlsConn.ConnectionState()
 	if !ok {

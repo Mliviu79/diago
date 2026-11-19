@@ -21,7 +21,7 @@ import (
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
-	"github.com/emiago/dtls/v3"
+	"github.com/pion/dtls/v3"
 	"github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"

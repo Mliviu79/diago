@@ -12,8 +12,8 @@ import (
 	"net"
 	"strings"
 
-	"github.com/emiago/dtls/v3"
-	"github.com/emiago/dtls/v3/pkg/crypto/elliptic"
+	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
 	"github.com/pion/logging"
 )
 
@@ -105,7 +105,6 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
 			}
 			return dtlsVerifyConnection(state, fingerprints)
 		},
-		StopReaderAfterHandshake: true,
 	}
 
 	if conf.SRTPProfiles != nil {

@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media/sdp"
-	"github.com/emiago/dtls/v3"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/dtls/v3"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
@@ -183,6 +183,9 @@ type MediaSession struct {
 
 	// DTLS
 	dtlsConn *dtls.Conn
+	// dtlsTr is the transport dtlsConn was built on. It is held so the handshake
+	// can hand the socket back once the keying material is exported.
+	dtlsTr *dtlsKeyExchangeConn
 
 	onFinalize func() error
 
@@ -636,124 +639,8 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	s.SetRemoteAddr(&remoteAddr)
 
 	// Check for DTLS
-	if len(s.DTLSConf.Certificates) > 0 || s.SecureRTP == 2 {
-		setup := ""
-		fingerprints := make([]DTLSFingerprint, 0, 1) // at least must be 1
-		for _, v := range attrs {
-			if strings.HasPrefix(v, "setup:") {
-				setup = strings.TrimSpace(v[len("setup:"):])
-				continue
-			}
-
-			// This may only needed to be done when answering call
-			if strings.HasPrefix(v, "fingerprint:") {
-				vals := strings.Split(v[len("fingerprint:"):], " ")
-				if len(vals) < 2 {
-					return fmt.Errorf("sdp: bad fingerprint attribute attr=%q", v)
-				}
-				alg := vals[0]
-				fp := vals[1]
-				// TODO fingerprint validation
-				fingerprints = append(fingerprints, DTLSFingerprint{
-					Algorithm: alg,
-					Value:     fp,
-				})
-			}
-		}
-
-		if setup == "" {
-			return fmt.Errorf("Empty a=setup value attribute for dtls")
-		}
-
-		// THIS may need external or after SIP ACK establishment
-		dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
-		role := "client"
-		switch setup {
-		case "actpass", "passive":
-			// we are client, as remote wants to be server
-			// if s.dtlsConn == nil {
-			// 	panic("No dtls connection")
-			// }
-			s.dtlsConn, err = dtls.Client(s.rtpConn, &s.Raddr, dtlsConf)
-			if err != nil {
-				return fmt.Errorf("failed to setup dlts client conn: %w", err)
-			}
-
-		case "active":
-			role = "server"
-			// we are server as remote wants to be client
-			s.dtlsConn, err = dtls.Server(s.rtpConn, &s.Raddr, dtlsConf)
-			if err != nil {
-				return fmt.Errorf("failed to setup dlts server conn: %w", err)
-			}
-			// return nil
-
-			// NOTE: setup:active allows the answer and the DTLS handshake to occur in parallel.
-		default:
-			return fmt.Errorf("unknown setup value %q", setup)
-		}
-
-		s.onFinalize = func() error {
-			DefaultLogger().Debug("Starting dtls handshake",
-				"setup", setup,
-				"role", role,
-				"laddr", s.dtlsConn.LocalAddr().String(),
-				"raddr", s.dtlsConn.RemoteAddr().String(),
-			)
-			if err := s.dtlsConn.Handshake(); err != nil {
-				return fmt.Errorf("dtls conn handshake: %w", err)
-			}
-
-			DefaultLogger().Debug("Handshake finished. Checking DTLS State")
-
-			state, ok := s.dtlsConn.ConnectionState()
-			if !ok {
-				return fmt.Errorf("failed to get dtls client state")
-			}
-
-			// Setup now SRTP for encryption
-			prof, _ := s.dtlsConn.SelectedSRTPProtectionProfile()
-			p := srtp.ProtectionProfile(prof)
-			masterKeyLen, err := p.KeyLen()
-			if err != nil {
-				return fmt.Errorf("dtls - failed to get master keylen: %w", err)
-			}
-			masterSaltLen, err := p.SaltLen()
-			if err != nil {
-				return fmt.Errorf("dtls - failed to get master saltlen: %w", err)
-			}
-			keyingMaterial, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 2*(masterKeyLen+masterSaltLen))
-			if err != nil {
-				return fmt.Errorf("dtls - failed to export keying material: %w", err)
-			}
-
-			clientKey := keyingMaterial[:masterKeyLen]
-			serverKey := keyingMaterial[masterKeyLen : 2*masterKeyLen]
-			clientSalt := keyingMaterial[2*masterKeyLen : 2*masterKeyLen+masterSaltLen]
-			serverSalt := keyingMaterial[2*masterKeyLen+masterSaltLen:]
-
-			if role == "server" {
-				// Change order
-				clientKey, serverKey = serverKey, clientKey
-				clientSalt, serverSalt = serverSalt, clientSalt
-			}
-
-			s.localCtxSRTP, err = srtp.CreateContext(clientKey, clientSalt, p)
-			if err != nil {
-				return fmt.Errorf("failed to create SRTP context: %w", err)
-			}
-
-			// s.localCtxSRTP, err = srtp.CreateContext(serverKey, serverSalt, p)
-			remoteContext, err := srtp.CreateContext(serverKey, serverSalt, p)
-			if err != nil {
-				return fmt.Errorf("failed to create SRTP context: %w", err)
-			}
-
-			s.remoteCtxSRTP = newSRTPReceiver(remoteContext)
-
-			DefaultLogger().Debug("DTLS SRTP setuped")
-			return nil
-		}
+	if err := s.negotiateDTLS(attrs); err != nil {
+		return err
 	}
 
 	// Offerer path: we called LocalSDP() before RemoteSDP(), so localCtxSRTP
