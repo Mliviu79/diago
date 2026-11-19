@@ -5,8 +5,13 @@ package media
 import "io"
 
 // webrtcSessionState is the state a MediaSessionWebrtc keeps beside the ICE,
-// DTLS and SRTP fields it negotiates with. MediaSessionWebrtc.mu guards it.
+// DTLS and SRTP fields it negotiates with. MediaSessionWebrtc.mu guards it,
+// srtpDiscards and leftRunning apart.
 type webrtcSessionState struct {
+	// srtpDiscards is what ReadRTP and ReadRTCP record of the packets they
+	// discard. It is atomic.
+	srtpDiscards
+
 	// dtlsTr is the transport dtlsConn was built on. It is held so Finalize
 	// can take the DTLS stream of the mux back from the DTLS stack once the
 	// keying material is exported.

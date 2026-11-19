@@ -741,47 +741,69 @@ func (m *MediaSessionWebrtc) StopRTP(rw int8, duration time.Duration) error {
 	return nil
 }
 
+// ReadRTP reads and decrypts the next RTP packet of the peer into pkt.
+//
+// A packet that is not the peer's media is discarded and the next one is read:
+// one the SRTP context refuses (RFC 3711 section 3.3), and every packet that
+// arrives before Finalize has keyed the session (RFC 5764 section 5.1). A read
+// on a session that is not keyed therefore waits for its keys, and returns
+// like any other read when the session is closed or a deadline StopRTP set
+// passes. Only a session without a remote description, which has nothing to
+// read from, returns an error at once.
 func (m *MediaSessionWebrtc) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	if len(buf) < RTPBufSize {
 		return 0, io.ErrShortBuffer
 	}
-	if !m.ready || m.mux == nil || m.remoteCtxSRTP == nil {
+	mux := m.packetPath().mux
+	if mux == nil {
 		return 0, fmt.Errorf("WebRTC media is not finalized")
 	}
-	n, _, err := m.mux.rtp.ReadFrom(buf)
-	if err != nil {
-		return 0, err
+	for {
+		n, from, err := mux.rtp.ReadFrom(buf)
+		if err != nil {
+			return 0, err
+		}
+		path := m.packetPath()
+		if path.remoteSRTP == nil {
+			logUnkeyedRTP(from, n)
+			continue
+		}
+		decrypted, err := path.remoteSRTP.DecryptRTP(buf, buf[:n], &pkt.Header)
+		if err != nil {
+			m.discardUnauthenticRTP(from, n, err)
+			continue
+		}
+		n = len(decrypted)
+		if err = rtpUnmarshalPayload(decrypted, pkt); err != nil {
+			return n, fmt.Errorf("unmarshal WebRTC RTP: %w", err)
+		}
+		if path.mode == sdp.ModeSendonly || path.mode == "inactive" {
+			return 0, nil
+		}
+		return n, nil
 	}
-	decrypted, err := m.remoteCtxSRTP.DecryptRTP(buf, buf[:n], &pkt.Header)
-	if err != nil {
-		return n, fmt.Errorf("decrypt WebRTC SRTP: %w", err)
-	}
-	n = len(decrypted)
-	if err = rtpUnmarshalPayload(decrypted, pkt); err != nil {
-		return n, fmt.Errorf("unmarshal WebRTC RTP: %w", err)
-	}
-	if m.Mode == sdp.ModeSendonly || m.Mode == "inactive" {
-		return 0, nil
-	}
-	return n, nil
 }
 
 func (m *MediaSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
-	if m.mux == nil {
+	mux := m.packetPath().mux
+	if mux == nil {
 		return 0, fmt.Errorf("WebRTC RTP transport is not initialized")
 	}
-	n, _, err := m.mux.rtp.ReadFrom(buf)
+	n, _, err := mux.rtp.ReadFrom(buf)
 	return n, err
 }
 
+// WriteRTP encrypts pkt and sends it to the peer. On a session Finalize has
+// not keyed it sends nothing and returns an error that wraps ErrDTLSNotKeyed.
 func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 	if m.leftRunning.unkeyed.Load() {
 		return ErrDTLSNotKeyed
 	}
-	if !m.ready || m.mux == nil || m.localCtxSRTP == nil {
-		return fmt.Errorf("WebRTC media is not finalized")
+	path := m.packetPath()
+	if path.mux == nil || path.localSRTP == nil {
+		return fmt.Errorf("WebRTC media is not finalized: %w", ErrDTLSNotKeyed)
 	}
-	if m.Mode == sdp.ModeRecvonly || m.Mode == "inactive" {
+	if path.mode == sdp.ModeRecvonly || path.mode == "inactive" {
 		return nil
 	}
 
@@ -792,9 +814,9 @@ func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 	n, err := pkt.MarshalTo(buf)
 	if err == nil {
 		var data []byte
-		data, err = m.localCtxSRTP.EncryptRTP(buf, buf[:n], &pkt.Header)
+		data, err = path.localSRTP.EncryptRTP(buf, buf[:n], &pkt.Header)
 		if err == nil {
-			n, err = m.mux.rtp.WriteTo(data, nil)
+			n, err = path.mux.rtp.WriteTo(data, nil)
 			if err == nil && n != len(data) {
 				err = io.ErrShortWrite
 			}
@@ -806,21 +828,36 @@ func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
 	return nil
 }
 
+// ReadRTCP reads and decrypts the next RTCP datagram of the peer into pkts and
+// returns the number of packets it held. Like ReadRTP, it discards a datagram
+// the SRTCP context refuses (RFC 3711 section 3.4) and every datagram that
+// arrives before Finalize has keyed the session, and reads the next one.
 func (m *MediaSessionWebrtc) ReadRTCP(buf []byte, pkts []rtcp.Packet) (int, error) {
-	if !m.ready || m.mux == nil || m.remoteCtxSRTCP == nil {
+	mux := m.packetPath().mux
+	if mux == nil {
 		return 0, fmt.Errorf("WebRTC media is not finalized")
 	}
-	n, _, err := m.mux.rtcp.ReadFrom(buf)
-	if err != nil {
-		return 0, err
+	for {
+		n, from, err := mux.rtcp.ReadFrom(buf)
+		if err != nil {
+			return 0, err
+		}
+		path := m.packetPath()
+		if path.remoteSRTCP == nil {
+			logUnkeyedRTCP(from, n)
+			continue
+		}
+		data, err := path.remoteSRTCP.DecryptRTCP(buf, buf[:n], nil)
+		if err != nil {
+			m.discardUnauthenticRTCP(from, n, err)
+			continue
+		}
+		return RTCPUnmarshal(data, pkts)
 	}
-	data, err := m.remoteCtxSRTCP.DecryptRTCP(buf, buf[:n], nil)
-	if err != nil {
-		return 0, fmt.Errorf("decrypt WebRTC SRTCP: %w", err)
-	}
-	return RTCPUnmarshal(data, pkts)
 }
 
+// WriteRTCP encrypts pkt and sends it to the peer. On a session Finalize has
+// not keyed it sends nothing and returns an error that wraps ErrDTLSNotKeyed.
 func (m *MediaSessionWebrtc) WriteRTCP(pkt rtcp.Packet) error {
 	if m.leftRunning.unkeyed.Load() {
 		return ErrDTLSNotKeyed
@@ -830,8 +867,9 @@ func (m *MediaSessionWebrtc) WriteRTCP(pkt rtcp.Packet) error {
 		return err
 	}
 
-	if !m.ready || m.mux == nil || m.localCtxSRTCP == nil {
-		return fmt.Errorf("WebRTC media is not finalized")
+	path := m.packetPath()
+	if path.mux == nil || path.localSRTCP == nil {
+		return fmt.Errorf("WebRTC media is not finalized: %w", ErrDTLSNotKeyed)
 	}
 
 	needed := len(data) + 64
@@ -839,12 +877,12 @@ func (m *MediaSessionWebrtc) WriteRTCP(pkt rtcp.Packet) error {
 		m.writeRTCPBuf = make([]byte, needed)
 	}
 	buf := m.writeRTCPBuf[:needed]
-	data, err = m.localCtxSRTCP.EncryptRTCP(buf, data, nil)
+	data, err = path.localSRTCP.EncryptRTCP(buf, data, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt WebRTC SRTCP: %w", err)
 	}
 	m.writeRTCPBuf = data[:cap(data)]
-	n, err := m.mux.rtcp.WriteTo(data, nil)
+	n, err := path.mux.rtcp.WriteTo(data, nil)
 	if err == nil && n != len(data) {
 		err = io.ErrShortWrite
 	}

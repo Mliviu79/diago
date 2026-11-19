@@ -146,7 +146,7 @@ func (s *RTPSessionWebrtc) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 		s.rtcpMU.Lock()
 		stats := &s.readStats
 		if stats.SSRC != pkt.SSRC || stats.PacketsCount == 0 {
-			codec, codecErr := webRTCRTPCodec(s.Sess.Codecs, pkt.PayloadType)
+			codec, codecErr := webRTCRTPCodec(s.Sess.packetPath().codecs, pkt.PayloadType)
 			if codecErr != nil {
 				s.rtcpMU.Unlock()
 				return 0, codecErr
@@ -202,8 +202,8 @@ func (s *RTPSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
 // WriteRTP encrypts through MediaSessionWebrtc and updates sender-report
 // counters only after the packet has been written successfully.
 func (s *RTPSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
-	mode := s.Sess.Mode
-	codecs := s.Sess.Codecs
+	path := s.Sess.packetPath()
+	mode, codecs := path.mode, path.codecs
 	if mode == "recvonly" || mode == "inactive" {
 		return s.Sess.WriteRTP(pkt)
 	}

@@ -97,8 +97,8 @@ func (m *MediaSessionWebrtc) resendClientHello() error {
 // for it. Finalize then waits for it as long as its own ctx lives and at most
 // ICEConnectTimeout plus DTLSHandshakeTimeout, and ends it when either ends
 // first. The session carries no media meanwhile: WriteRTP and WriteRTCP return
-// ErrDTLSNotKeyed, and nothing may read from the session or apply a
-// description to it, since the negotiation does both.
+// ErrDTLSNotKeyed, ReadRTP and ReadRTCP discard what arrives, and nothing may
+// apply a description to the session, which the negotiation reads.
 //
 // A negotiation that ends within wait, successfully or not, is reported as
 // Finalize reports it. One that failed stays failed: every later

@@ -7,17 +7,25 @@ import (
 	"sync/atomic"
 )
 
-// srtpReadState is what the read path of a MediaSession keeps about SRTP. Both
-// fields are atomic, because a session is read while it is keyed: a leg is
-// bridged, and so read, ahead of the ACK that runs its DTLS handshake.
-type srtpReadState struct {
+// srtpDiscards records the packets a read path discards instead of handing
+// them to its reader. Both media session types keep one: the rules are those
+// of SRTP and of DTLS-SRTP, whichever transport the packets arrive on.
+type srtpDiscards struct {
 	// srtpAuthFailures counts the RTP packets ReadRTP discarded because the
 	// SRTP context refused them (RFC 3711 section 3.3). They are normal in
 	// small numbers, media in flight before a handshake settles or a stray
 	// datagram to a port named in the SDP, so the count is the diagnostic and
 	// not any single occurrence: one that climbs with the stream means the
-	// keys disagree.
+	// keys disagree. It is atomic, since a session is read on another
+	// goroutine than the ones that negotiate it.
 	srtpAuthFailures atomic.Uint64
+}
+
+// srtpReadState is what the read path of a MediaSession keeps about SRTP. All
+// of it is atomic, because a session is read while it is keyed: a leg is
+// bridged, and so read, ahead of the ACK that runs its DTLS handshake.
+type srtpReadState struct {
+	srtpDiscards
 
 	// dtlsKeyed is set once the SRTP contexts of a DTLS handshake are in
 	// place. ReadRTP and ReadRTCP discard every packet of a DTLS-SRTP session
@@ -49,10 +57,7 @@ func (s *MediaSession) discardUnkeyedRTP(from net.Addr, n int) bool {
 	if !s.awaitsDTLSKeys() {
 		return false
 	}
-	DefaultLogger().Debug("DTLS-SRTP: discarding RTP that arrived before the session is keyed",
-		"from", from,
-		"bytes", n,
-	)
+	logUnkeyedRTP(from, n)
 	return true
 }
 
@@ -62,11 +67,25 @@ func (s *MediaSession) discardUnkeyedRTCP(from net.Addr, n int) bool {
 	if !s.awaitsDTLSKeys() {
 		return false
 	}
+	logUnkeyedRTCP(from, n)
+	return true
+}
+
+// logUnkeyedRTP records an RTP datagram of n bytes, read from from, that a
+// DTLS-SRTP session discards because its handshake has not keyed it yet.
+func logUnkeyedRTP(from net.Addr, n int) {
+	DefaultLogger().Debug("DTLS-SRTP: discarding RTP that arrived before the session is keyed",
+		"from", from,
+		"bytes", n,
+	)
+}
+
+// logUnkeyedRTCP is logUnkeyedRTP for an RTCP datagram.
+func logUnkeyedRTCP(from net.Addr, n int) {
 	DefaultLogger().Debug("DTLS-SRTP: discarding RTCP that arrived before the session is keyed",
 		"from", from,
 		"bytes", n,
 	)
-	return true
 }
 
 // discardUnauthenticRTP records an RTP datagram the SRTP context refused with
@@ -82,8 +101,8 @@ func (s *MediaSession) discardUnkeyedRTCP(from net.Addr, n int) bool {
 // port named in the SDP. A caller handed that as a read error cannot tell it
 // from a socket that is gone and stops reading on either, so one datagram
 // would end the media of a healthy call.
-func (s *MediaSession) discardUnauthenticRTP(from net.Addr, n int, err error) {
-	total := s.srtpAuthFailures.Add(1)
+func (d *srtpDiscards) discardUnauthenticRTP(from net.Addr, n int, err error) {
+	total := d.srtpAuthFailures.Add(1)
 	DefaultLogger().Debug("SRTP: discarding packet that failed authentication",
 		"from", from,
 		"bytes", n,
@@ -96,7 +115,7 @@ func (s *MediaSession) discardUnauthenticRTP(from net.Addr, n int, err error) {
 // with err, which ReadRTCP discards before it reads the next one: "Secure RTCP
 // follows the definition of Secure RTP" (RFC 3711 section 3.4), so
 // discardUnauthenticRTP gives the reason.
-func (s *MediaSession) discardUnauthenticRTCP(from net.Addr, n int, err error) {
+func (*srtpDiscards) discardUnauthenticRTCP(from net.Addr, n int, err error) {
 	DefaultLogger().Debug("SRTCP: discarding packet that failed authentication",
 		"from", from,
 		"bytes", n,
