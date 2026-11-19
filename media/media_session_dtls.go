@@ -18,7 +18,7 @@ import (
 // 5.1 leaves a DTLS association no other. A session with neither a DTLS
 // certificate nor SecureRTP set to DTLS does nothing.
 func (s *MediaSession) negotiateDTLS(attrs []string) error {
-	if len(s.DTLSConf.Certificates) == 0 && s.SecureRTP != 2 {
+	if !s.dtlsSRTP() {
 		return nil
 	}
 
@@ -147,6 +147,9 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 		}
 
 		s.remoteCtxSRTP = newSRTPReceiver(remoteContext)
+
+		// Last, once the contexts above are set: see srtpReadState.dtlsKeyed.
+		s.dtlsKeyed.Store(true)
 
 		DefaultLogger().Debug("DTLS SRTP setuped")
 		return nil

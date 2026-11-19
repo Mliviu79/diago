@@ -793,36 +793,54 @@ func (s *MediaSession) listenRTPandRTCP(laddr *net.UDPAddr) error {
 
 // ReadRTP reads data from network and parses to pkt
 // buffer is passed in order to avoid extra allocs
+//
+// A packet that is not the peer's media is discarded and the next one is read:
+// one the SRTP context refuses (RFC 3711 section 3.3), and every packet of a
+// DTLS-SRTP session until its handshake has keyed it (RFC 5764 section 5.1).
+// An error of the socket, a passed deadline included, is returned.
 func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	if len(buf) < RTPBufSize {
 		return 0, io.ErrShortBuffer
 	}
 
-	n, from, err := m.rtpConn.ReadFrom(buf)
-	if err != nil {
-		return 0, err
-	}
-
-	if m.remoteCtxSRTP != nil {
-		decrypted, err := m.remoteCtxSRTP.DecryptRTP(buf, buf[:n], &pkt.Header)
+	var (
+		n    int
+		from net.Addr
+		err  error
+	)
+	for {
+		n, from, err = m.rtpConn.ReadFrom(buf)
 		if err != nil {
-			return n, fmt.Errorf("Read SRTP Decrypt error: %w", err)
-		}
-		if len(decrypted) > len(buf) {
-			DefaultLogger().Warn("Growing Decrypted RTP buffer", "diff", len(decrypted)-len(buf))
+			return 0, err
 		}
 
-		buf = decrypted
-		n = len(decrypted)
+		if m.discardUnkeyedRTP(from, n) {
+			continue
+		}
 
-		// NOTE this is optimiation to avoid double unmarshaling RTP header
-		if err := rtpUnmarshalPayload(buf, pkt); err != nil {
-			return n, fmt.Errorf("rtp unmarshal failed: %w", err)
+		if m.remoteCtxSRTP != nil {
+			decrypted, err := m.remoteCtxSRTP.DecryptRTP(buf, buf[:n], &pkt.Header)
+			if err != nil {
+				m.discardUnauthenticRTP(from, n, err)
+				continue
+			}
+			if len(decrypted) > len(buf) {
+				DefaultLogger().Warn("Growing Decrypted RTP buffer", "diff", len(decrypted)-len(buf))
+			}
+
+			buf = decrypted
+			n = len(decrypted)
+
+			// NOTE this is optimiation to avoid double unmarshaling RTP header
+			if err := rtpUnmarshalPayload(buf, pkt); err != nil {
+				return n, fmt.Errorf("rtp unmarshal failed: %w", err)
+			}
+		} else {
+			if err := RTPUnmarshal(buf[:n], pkt); err != nil {
+				return n, err
+			}
 		}
-	} else {
-		if err := RTPUnmarshal(buf[:n], pkt); err != nil {
-			return n, err
-		}
+		break
 	}
 
 	logRTPRead(m, from, pkt)
@@ -900,18 +918,35 @@ func (m *MediaSession) ReadRTPRawDeadline(buf []byte, t time.Time) (int, error) 
 
 // ReadRTCP is optimized reads and unmarshals RTCP packets. Buffers is only used for unmarshaling.
 // Caller needs to be aware of size this buffer and allign with MTU
+//
+// Like ReadRTP, it discards a packet the SRTP context refuses, and every
+// packet of a DTLS-SRTP session until its handshake has keyed it, and reads
+// the next one.
 func (m *MediaSession) ReadRTCP(buf []byte, pkts []rtcp.Packet) (n int, err error) {
-	nn, from, err := m.ReadRTCPRaw(buf)
-	if err != nil {
-		return n, err
-	}
-	data := buf[:nn]
-
-	if m.remoteCtxSRTP != nil {
-		data, err = m.remoteCtxSRTP.DecryptRTCP(data, data, nil)
+	var (
+		data []byte
+		from net.Addr
+	)
+	for {
+		var nn int
+		nn, from, err = m.ReadRTCPRaw(buf)
 		if err != nil {
-			return 0, errors.Join(errRTCPFailedToUnmarshal, err)
+			return n, err
 		}
+		data = buf[:nn]
+
+		if m.discardUnkeyedRTCP(from, nn) {
+			continue
+		}
+
+		if m.remoteCtxSRTP != nil {
+			data, err = m.remoteCtxSRTP.DecryptRTCP(data, data, nil)
+			if err != nil {
+				m.discardUnauthenticRTCP(from, nn, err)
+				continue
+			}
+		}
+		break
 	}
 
 	n, err = RTCPUnmarshal(data, pkts)

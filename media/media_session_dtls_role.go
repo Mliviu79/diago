@@ -36,9 +36,11 @@ const (
 )
 
 // mediaSessionState is the state a MediaSession keeps beside the fields it
-// negotiates with. Like them it is not safe for concurrent use, and Fork does
-// not carry it: a fork starts an exchange of its own.
+// negotiates with. Like them it is not safe for concurrent use, srtpReadState
+// apart, and Fork does not carry it: a fork starts an exchange of its own.
 type mediaSessionState struct {
+	srtpReadState
+
 	// remoteSDPIsAnswer is the offered argument of the last RemoteSDP: the
 	// body it applied answered an offer of ours. Together with remoteProto,
 	// which RemoteSDP sets on every body, it says whether an offer was
