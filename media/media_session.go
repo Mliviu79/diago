@@ -269,16 +269,12 @@ func (s *MediaSession) String() string {
 // InitWithSDP allows creating media session with own SDP and bypassing other needs
 func (s *MediaSession) InitWithSDP(localSDP []byte) error {
 	s.sdp = localSDP
-	sd := sdp.SessionDescription{}
-	if err := sdp.Unmarshal(localSDP, &sd); err != nil {
-		return fmt.Errorf("fail to parse received SDP: %w", err)
-	}
-
-	ci, err := sd.ConnectionInformation()
+	sd, md, _, err := readAudioStream(localSDP)
 	if err != nil {
 		return err
 	}
-	md, err := sd.MediaDescription("audio")
+
+	ci, err := sd.ConnectionInformation()
 	if err != nil {
 		return err
 	}
@@ -350,6 +346,11 @@ func (s *MediaSession) Fork() *MediaSession {
 		cp.srtpRemoteTag = s.srtpRemoteTag
 	}
 	s.carryDTLSAssociation(&cp)
+	// Every later SDP of ours keeps the streams of the offer, the rejected
+	// ones included (RFC 3264 section 8), until a new offer is applied.
+	// RemoteSDP replaces the list rather than changing it, so the two
+	// sessions can share it.
+	cp.offeredStreams = s.offeredStreams
 	return &cp
 }
 
@@ -495,16 +496,16 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 		mode = s.Mode
 	}
 
-	return generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet)
+	return s.offeredStreams.around(generateSDPForAudio(s.sessionID, s.sessionVersion, rtpProfile, ip, connIP, rtpPort, mode, codecs, localSDES, dtlsSet))
 }
 
 // RemoteSDP applies an answer when offered is true, or an offer when false.
 // NOTE: It must called ONCE or single thread while negotiation happening.
 // For multi negotiation Fork Must be called before
 func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
-	sd := sdp.SessionDescription{}
-	if err := sdp.Unmarshal(sdpReceived, &sd); err != nil {
-		return fmt.Errorf("fail to parse received SDP: %w", err)
+	sd, md, streams, err := readAudioStream(sdpReceived)
+	if err != nil {
+		return err
 	}
 
 	si, err := sd.SessionInformation()
@@ -521,15 +522,6 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 		s.sessionID = si.SessionID
 		s.sessionVersion = si.SessionVersion + 1
 	}
-	// TODO: check below. For now we expect and handle only single audio media
-	// For each "m=" line in the offer, there MUST be a corresponding "m="
-	//    line in the answer.  The answer MUST contain exactly the same number
-	//    of "m=" lines as the offer.
-	md, err := sd.MediaDescription("audio")
-	if err != nil {
-		return err
-	}
-
 	// Confirm it is supported profile
 	secureRequest := s.SecureRTP == 1 && s.remoteCtxSRTP != nil
 	prof, ok := parseRTPProfile(md.Proto)
@@ -541,6 +533,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	}
 	s.remoteProto = md.Proto
 	s.remoteSDPIsAnswer = offered
+	s.keepOfferedStreams(streams, offered)
 
 	codecs := make([]Codec, len(md.Formats))
 	attrs := sd.Values("a")

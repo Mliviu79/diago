@@ -40,10 +40,18 @@ const (
 // mediaSessionState is the state a MediaSession keeps beside the fields it
 // negotiates with. Like them it is not safe for concurrent use, srtpReadState
 // apart. A fork starts an exchange of its own, so Fork carries none of it but
-// the DTLS association the fork continues: see carryDTLSAssociation.
+// the DTLS association the fork continues, see carryDTLSAssociation, and the
+// stream list our SDPs are written around.
 type mediaSessionState struct {
 	srtpReadState
 	dtlsAssociationState
+
+	// offeredStreams is the stream list of the last offer RemoteSDP applied.
+	// LocalSDP writes one m= line for each of its streams, in the answer to
+	// that offer and in every later SDP of ours (RFC 3264 sections 6 and 8).
+	// Its zero value, before any offer, has LocalSDP write the audio stream
+	// alone.
+	offeredStreams offeredStreams
 
 	// remoteSDPIsAnswer is the offered argument of the last RemoteSDP: the
 	// body it applied answered an offer of ours. Together with remoteProto,
