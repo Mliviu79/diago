@@ -39,9 +39,11 @@ const (
 
 // mediaSessionState is the state a MediaSession keeps beside the fields it
 // negotiates with. Like them it is not safe for concurrent use, srtpReadState
-// apart, and Fork does not carry it: a fork starts an exchange of its own.
+// apart. A fork starts an exchange of its own, so Fork carries none of it but
+// the DTLS association the fork continues: see carryDTLSAssociation.
 type mediaSessionState struct {
 	srtpReadState
+	dtlsAssociationState
 
 	// remoteSDPIsAnswer is the offered argument of the last RemoteSDP: the
 	// body it applied answered an offer of ours. Together with remoteProto,
@@ -108,9 +110,22 @@ func (s *MediaSession) dtlsSetupFor(role DTLSEndpointRole, peer string) string {
 // whether the body it builds answers the offer RemoteSDP applied, or is an
 // offer of ours. An offer opens an exchange in which the peer has said
 // nothing, so an a=setup value of an earlier body of its does not count.
+//
+// An answer on a DTLS association the session continues repeats the role the
+// association was built with. RFC 8842 section 5.3 has such an answer "insert
+// an SDP "setup" attribute with an attribute value that does not change the
+// previously negotiated DTLS roles", and deriving the role afresh from the
+// offer changes it whenever the choice falls the other way: a subsequent
+// offer carries actpass (section 5.5), which leaves the choice to this
+// endpoint again. A session starting a new association has no record of one,
+// and takes its role from the offer. A subsequent offer of ours keeps
+// actpass, which is what section 5.5 asks of the offerer.
 func (s *MediaSession) localDTLSSetup(answered bool) string {
 	if !answered {
 		return s.dtlsSetupFor(s.dtlsEndpointRoleAs(true), "")
+	}
+	if s.dtlsAssoc != nil {
+		return s.dtlsAssoc.setup
 	}
 	return s.dtlsSetupFor(s.dtlsEndpointRoleAs(false), s.dtlsRemoteSetup)
 }

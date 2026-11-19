@@ -20,10 +20,12 @@ var (
 	// ErrDTLSNotKeyed is returned by WriteRTP and WriteRTCP while a
 	// negotiation FinalizeWithin left running has not keyed SRTP, and after
 	// it failed, and is wrapped by the error of a write on a
-	// MediaSessionWebrtc that no Finalize has keyed. The media is refused
-	// rather than sent unprotected: SRTP processing does not start before
-	// the handshake completes (RFC 5764 section 5.1), and the profile
-	// protects media with nothing else.
+	// MediaSessionWebrtc that no Finalize has keyed. A DTLS-SRTP
+	// MediaSession returns it from WriteRTP, WriteRTCP and WriteRTCPs until
+	// its handshake has keyed it, a fork that starts a new DTLS association
+	// included. The media is refused rather than sent unprotected: SRTP
+	// processing does not start before the handshake completes (RFC 5764
+	// section 5.1), and the profile protects media with nothing else.
 	ErrDTLSNotKeyed = errors.New("dtls-srtp not keyed")
 )
 

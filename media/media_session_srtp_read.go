@@ -27,11 +27,15 @@ type srtpDiscards struct {
 type srtpReadState struct {
 	srtpDiscards
 
-	// dtlsKeyed is set once the SRTP contexts of a DTLS handshake are in
-	// place. ReadRTP and ReadRTCP discard every packet of a DTLS-SRTP session
-	// while it is clear. The handshake sets it only after the contexts, so a
-	// reader that finds it set finds them too, although another goroutine set
-	// them, and a reader that finds it clear reads neither.
+	// dtlsKeyed is set once the SRTP contexts of a DTLS association are in
+	// place: by the handshake once it has keyed SRTP, and by Fork for a fork
+	// that continues its association. ReadRTP and ReadRTCP discard every
+	// packet of a DTLS-SRTP session while it is clear, and WriteRTP,
+	// WriteRTCP and WriteRTCPs send nothing. It is set only after the
+	// contexts, so a reader or writer that finds it set finds them too,
+	// although another goroutine set them, and one that finds it clear reads
+	// neither. RemoteSDP clears it where a fork that carried an association
+	// starts a new one, which is before anything reads or writes the fork.
 	dtlsKeyed atomic.Bool
 }
 

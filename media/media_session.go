@@ -318,6 +318,11 @@ func (s *MediaSession) StartRTP(rw int8) error {
 
 // Fork is special call to be used in case when there is session update
 // It preserves connections and negotiated SDES contexts for media updates.
+//
+// A fork of a keyed DTLS session carries a read-only record of its DTLS
+// association and the SRTP contexts in use, so it renegotiates over that
+// association instead of running a handshake. RemoteSDP only arms a new
+// handshake when the peer asks for a new association (RFC 8842 section 3.1).
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
 		Laddr:          s.Laddr, // TODO clone it although it is read only
@@ -344,6 +349,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		cp.remoteCtxSRTP = s.remoteCtxSRTP
 		cp.srtpRemoteTag = s.srtpRemoteTag
 	}
+	s.carryDTLSAssociation(&cp)
 	return &cp
 }
 
@@ -448,6 +454,7 @@ func (s *MediaSession) LocalSDP(answered bool) []byte {
 		dtlsSet = &dtlsSetup{
 			setup:        s.localDTLSSetup(answered),
 			fingerprints: make([]DTLSFingerprint, len(s.DTLSConf.Certificates)),
+			tlsID:        s.localSDPTLSID(answered),
 		}
 		// DTLS
 		// This is only needed for self signed certificates?
@@ -652,7 +659,9 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 	// Offerer path: we called LocalSDP() before RemoteSDP(), so localCtxSRTP
 	// may already be set. If the remote answer has no crypto, clear it to
 	// avoid sending encrypted RTP to a peer expecting plaintext.
-	if s.localCtxSRTP != nil && remoteKey == "" && !secureRequest {
+	// A context a DTLS association keyed is not an SDES one: its SDP never
+	// carries a=crypto, and it stays for as long as the association does.
+	if s.localCtxSRTP != nil && remoteKey == "" && !secureRequest && s.dtlsAssoc == nil {
 		s.localCtxSRTP = nil
 		s.localSDES = sdesInline{}
 	}
@@ -993,6 +1002,9 @@ func (m *MediaSession) ReadRTCPRawDeadline(buf []byte, t time.Time) (int, error)
 }
 
 func (m *MediaSession) WriteRTP(p *rtp.Packet) error {
+	if err := m.refuseUnkeyedWrite(); err != nil {
+		return err
+	}
 	if m.mode == sdp.ModeRecvonly {
 		// We block here as we would violate our media direction
 		return nil
@@ -1047,6 +1059,9 @@ func (m *MediaSession) WriteRTPRaw(data []byte) (n int, err error) {
 }
 
 func (m *MediaSession) WriteRTCP(p rtcp.Packet) error {
+	if err := m.refuseUnkeyedWrite(); err != nil {
+		return err
+	}
 	logRTCPWrite(m, p)
 
 	// TODO: rtcp library needs to support MarshalTo v2
@@ -1088,6 +1103,9 @@ func (m *MediaSession) WriteRTCPDeadline(p rtcp.Packet, deadline time.Time) erro
 
 // Use this to write Multi RTCP packets if they can fit in MTU=1500
 func (m *MediaSession) WriteRTCPs(pkts []rtcp.Packet) error {
+	if err := m.refuseUnkeyedWrite(); err != nil {
+		return err
+	}
 	data, err := rtcpMarshal(pkts)
 	if err != nil {
 		return err
@@ -1160,6 +1178,8 @@ type sdesInline struct {
 type dtlsSetup struct {
 	setup        string
 	fingerprints []DTLSFingerprint
+	// tlsID is our a=tls-id value, "" to write none.
+	tlsID string
 }
 
 func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile string, originIP net.IP, connectionIP net.IP, rtpPort int, mode string, codecs []Codec, sdes sdesInline, dtlsSet *dtlsSetup) []byte {
@@ -1212,13 +1232,17 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 		fingerprints := dtlsSet.fingerprints
 		dtlsSetup := dtlsSet.setup
 
+		// No a=connection: RFC 5763 section 5 forbids it for DTLS-SRTP, and
+		// RFC 8842 section 5.1 defines no use of it for a DTLS association.
 		s = append(s, "a=setup:"+dtlsSetup)
-		s = append(s, "a=connection:new") // Cane be new or existing. Marks it needs new transport
 		for _, d := range fingerprints {
 			if d.Value == "" {
 				continue
 			}
 			s = append(s, fmt.Sprintf("a=fingerprint:%s %s", d.Algorithm, d.Value))
+		}
+		if dtlsSet.tlsID != "" {
+			s = append(s, "a=tls-id:"+dtlsSet.tlsID)
 		}
 	}
 

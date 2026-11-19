@@ -22,22 +22,30 @@ import (
 var DTLSHandshakeTimeout = 30 * time.Second
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose
-// attributes are attrs: it takes the peer's a=setup and a=fingerprint values,
-// builds the DTLS conn for the role dtlsSetupFor gives this session against
-// them and arms Finalize to run the handshake and key SRTP from it. An a=setup
-// value other than active, passive and actpass is refused: RFC 8842 section
-// 5.1 leaves a DTLS association no other. A session with neither a DTLS
-// certificate nor SecureRTP set to DTLS does nothing.
+// attributes are attrs: it takes the peer's a=setup, a=fingerprint and
+// a=tls-id values and hands them to negotiateDTLSAssociation, which continues
+// the DTLS association the session has or arms the handshake of a new one. An
+// a=setup value other than active, passive and actpass is refused: RFC 8842
+// section 5.1 leaves a DTLS association no other. A session with neither a
+// DTLS certificate nor SecureRTP set to DTLS does nothing.
 func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	if !s.dtlsSRTP() {
 		return nil
 	}
 
 	setup := ""
+	tlsID := ""
 	fingerprints := make([]DTLSFingerprint, 0, 1) // at least must be 1
 	for _, v := range attrs {
 		if strings.HasPrefix(v, "setup:") {
 			setup = strings.TrimSpace(v[len("setup:"):])
+			continue
+		}
+
+		// RFC 8842 section 4: the peer changes it to ask for a new DTLS
+		// association.
+		if strings.HasPrefix(v, "tls-id:") {
+			tlsID = strings.TrimSpace(v[len("tls-id:"):])
 			continue
 		}
 
@@ -76,14 +84,36 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	// LocalSDP too, so the role we advertise and the role we play are one
 	// decision.
 	s.dtlsRemoteSetup = setup
+	s.dtlsRemoteTLSID = tlsID
 
+	return s.negotiateDTLSAssociation(setup, fingerprints, tlsID)
+}
+
+// armDTLSHandshake prepares the DTLS association RemoteSDP negotiated: it
+// builds the DTLS conn for the role dtlsSetupFor gives this session against
+// the peer's a=setup value, setup, and arms Finalize to run the handshake and
+// key SRTP from it. fingerprints and tlsID are the certificate fingerprints
+// and the tls-id the peer sent.
+func (s *MediaSession) armDTLSHandshake(setup string, fingerprints []DTLSFingerprint, tlsID string) error {
 	// THIS may need external or after SIP ACK establishment
 	dtlsConf := s.DTLSConf.ToLibConf(fingerprints)
 	tr := s.dtlsTransport()
+	// What a later offer or answer is compared against, once the handshake
+	// has completed: the transport is the one signalled in this exchange.
+	assoc := &dtlsAssociation{
+		setup:              dtlsSetupPassive,
+		localFingerprints:  fingerprintSet(s.localDTLSFingerprints()),
+		remoteFingerprints: fingerprintSet(fingerprints),
+		remoteTLSID:        tlsID,
+		localTLSID:         s.localTLSID,
+		laddr:              s.Laddr,
+		raddr:              s.Raddr,
+	}
 	var err error
 	role := "server"
 	if s.dtlsActsAsClient() {
 		role = "client"
+		assoc.setup = dtlsSetupActive
 		s.dtlsConn, err = dtls.Client(tr, &s.Raddr, dtlsConf)
 	} else {
 		// NOTE: setup:active allows the answer and the DTLS handshake to occur in parallel.
@@ -161,6 +191,12 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 
 		s.remoteCtxSRTP = newSRTPReceiver(remoteContext)
 
+		// Recorded only now, with the handshake done and both directions
+		// keyed: a fork that finds the record continues the association
+		// without a handshake of its own, so it must never see one that is
+		// not yet usable.
+		s.dtlsAssoc = assoc
+
 		// Last, once the contexts above are set: see srtpReadState.dtlsKeyed.
 		s.dtlsKeyed.Store(true)
 
@@ -203,4 +239,19 @@ func (s *MediaSession) dtlsTransport() *dtlsKeyExchangeConn {
 // dtlsKeyExchangeConn.retire.
 func (s *MediaSession) retireDTLS() error {
 	return s.dtlsTr.retire(s.dtlsConn)
+}
+
+// refuseUnkeyedWrite returns ErrDTLSNotKeyed for a DTLS-SRTP session its
+// handshake has not keyed, and nil for every other session. WriteRTP,
+// WriteRTCP and WriteRTCPs send nothing for such a session: its media is SRTP
+// and there is nothing yet to protect it with, so a packet sent now would
+// carry the payload in the clear, to whatever address the SDP named. The
+// refusal does not depend on who holds the session or when it is put in
+// place of another: a fork that starts a new association is unkeyed from the
+// moment RemoteSDP finds it asked for until its own handshake has completed.
+func (s *MediaSession) refuseUnkeyedWrite() error {
+	if s.awaitsDTLSKeys() {
+		return ErrDTLSNotKeyed
+	}
+	return nil
 }
