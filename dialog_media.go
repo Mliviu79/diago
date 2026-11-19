@@ -329,10 +329,10 @@ func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {
 	if d.mediaSession == nil {
 		return fmt.Errorf("no media session present")
 	}
-	if err := d.mediaSession.RemoteSDP(remoteSDP, true); err != nil {
-		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
-	}
-	return nil
+	// Applied to a fork, which then takes the place of the session: the
+	// session in place carries the early media, and its readers and its RTCP
+	// monitor read what a description applied to it would write.
+	return d.sdpUpdateUnsafe(remoteSDP, true)
 }
 
 func (d *DialogMedia) sdpUpdateUnsafe(sdp []byte, offered bool) error {
