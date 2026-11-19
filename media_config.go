@@ -4,6 +4,8 @@ package diago
 
 import (
 	"context"
+
+	"github.com/emiago/diago/media"
 )
 
 // RTPPortAllocator hands out and takes back local RTP ports for media sessions.
@@ -39,11 +41,36 @@ func (dg *Diago) mediaConfForTransport(tran *Transport) MediaConfig {
 		// config, so a config that does not carry it leaves every dialog on
 		// the default port choice while the allocator sits unused.
 		RTPPortAllocator: dg.mediaConf.RTPPortAllocator,
-		secureRTP:        tran.MediaSRTP,
-		bindIP:           tran.mediaBindIP,
-		externalIP:       tran.MediaExternalIP,
-		dtlsConf:         tran.MediaDTLSConf,
+		// Resolved here, so every media session a dialog on tran builds
+		// starts from the same DTLS config, the Diago wide one when set.
+		DTLSConfig: dg.dtlsConfForTransport(tran),
+		secureRTP:  tran.MediaSRTP,
+		bindIP:     tran.mediaBindIP,
+		externalIP: tran.MediaExternalIP,
+		dtlsConf:   tran.MediaDTLSConf,
 	}
+}
+
+// dtlsConfForTransport resolves the DTLS config a dialog on tran starts from.
+// A Diago wide DTLSConfig is opt in and wins; otherwise the transport keeps
+// supplying its own MediaDTLSConf, which is always a value and so cannot say
+// "unset". The transport config is copied so a dialog cannot mutate it.
+func (dg *Diago) dtlsConfForTransport(tran *Transport) *media.DTLSConfig {
+	if dg.mediaConf.DTLSConfig != nil {
+		return dg.mediaConf.DTLSConfig
+	}
+	conf := tran.MediaDTLSConf
+	return &conf
+}
+
+// dtlsConfig returns the DTLS config of a media session built from conf, which
+// takes it by value: DTLSConfig when it is set, and otherwise the config the
+// transport supplied, the zero one for a caller that never touched DTLS.
+func (conf MediaConfig) dtlsConfig() media.DTLSConfig {
+	if conf.DTLSConfig != nil {
+		return *conf.DTLSConfig
+	}
+	return conf.dtlsConf
 }
 
 // allocateRTPPort chooses the local RTP port of one media that is built from

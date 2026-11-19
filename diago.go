@@ -164,6 +164,16 @@ type MediaConfig struct {
 	// Experimental
 	SecureRTPAlg uint16
 
+	// DTLSConfig is the DTLS-SRTP config every media session built from this
+	// config starts from. It is the Diago wide counterpart of
+	// Transport.MediaDTLSConf and, being a pointer, is opt in: when set it wins
+	// over the transport's own MediaDTLSConf, and nil leaves each transport
+	// supplying it as before.
+	//
+	// It configures DTLS but does not switch it on. That stays per transport,
+	// with MediaSRTP = media.SecureRTPModeDTLS.
+	DTLSConfig *media.DTLSConfig
+
 	// RTPPortAllocator, when non nil, chooses the local RTP port that every media
 	// session built from this config binds, instead of leaving the choice to the
 	// OS. It supersedes the media package RTPPortStart/RTPPortEnd globals, which
