@@ -583,7 +583,9 @@ func TestMediaSessionRTPSymetric(t *testing.T) {
 		},
 	}
 
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		var seq uint16 = 0
 		for ; seq < 4; seq++ {
 			pkt := rtp.Packet{
@@ -596,7 +598,19 @@ func TestMediaSessionRTPSymetric(t *testing.T) {
 			if err != nil {
 				return
 			}
-			writer.Write(data)
+			if _, err := writer.Write(data); err != nil {
+				return
+			}
+		}
+	}()
+	// The test reads one of the four packets. Closing the pipe refuses the
+	// rest, which ends the writer, and the test waits for it.
+	defer func() {
+		reader.Close()
+		select {
+		case <-writerDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the pipe writer did not stop")
 		}
 	}()
 

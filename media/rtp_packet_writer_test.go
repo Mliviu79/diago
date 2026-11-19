@@ -23,7 +23,7 @@ func fakeMediaSessionWriter(lport int, rport int, rtpWriter io.Writer) *MediaSes
 
 	conn := &fakes.UDPConn{
 		Writers: map[string]io.Writer{
-			sess.Raddr.String(): bytes.NewBuffer([]byte{}),
+			sess.Raddr.String(): rtpWriter,
 		},
 	}
 	sess.rtpConn = conn
@@ -59,8 +59,22 @@ func BenchmarkRTPPacketWriter(b *testing.B) {
 	w := NewRTPPacketWriterSession(rtpSess)
 	w.clockTicker.Reset(1 * time.Nanosecond)
 
+	readerDone := make(chan error, 1)
 	go func() {
-		io.ReadAll(reader)
+		_, err := io.Copy(io.Discard, reader)
+		readerDone <- err
+	}()
+	// Closing the write side ends the reader, and the benchmark waits for it.
+	defer func() {
+		writer.Close()
+		select {
+		case err := <-readerDone:
+			if err != nil {
+				b.Error(err)
+			}
+		case <-time.After(5 * time.Second):
+			b.Error("the pipe reader did not stop")
+		}
 	}()
 
 	data := make([]byte, 160)
