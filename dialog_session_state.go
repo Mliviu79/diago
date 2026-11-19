@@ -76,6 +76,36 @@ type sessionState struct {
 	// section 13.2.1).
 	ackCarriesAnswer bool
 
+	// requestMu makes the peer's re-INVITEs take turns, each held for the
+	// whole of its handling, until the ACK to its 2xx is read. It is taken
+	// before answerMu and mediaUpdateMu.
+	requestMu sync.Mutex
+
+	// answerMu makes the peer's BYE and the final response to its re-INVITE
+	// take turns. The BYE holds it while it ends the dialog and answers, and
+	// answers a re-INVITE still pending 487 (RFC 3261 section 15.1.2); a
+	// re-INVITE is answered under it only while the dialog is live. A
+	// re-INVITE is then answered either before a BYE ends the dialog or with
+	// 487, never with a 200 behind the BYE's, and the BYE never waits for the
+	// re-INVITE's media update.
+	answerMu sync.Mutex
+	// peerReInvite is the peer's re-INVITE being handled, until its handling
+	// ends. Guarded by answerMu.
+	peerReInvite *pendingReInvite
+	// ackTimers are the timers of the retransmission of a 2xx to a re-INVITE
+	// of the peer's. They are set before the dialog is used, and zero outside
+	// tests.
+	ackTimers ackTimers
+
+	// mediaUpdateMu guards mediaUpdateDone.
+	mediaUpdateMu sync.Mutex
+	// mediaUpdateDone is set while a re-INVITE of the peer's or one of ours
+	// is in progress, and closed when it ends. Our re-INVITE waits for the
+	// peer's to end, and the peer's finding ours in progress is answered 491
+	// (RFC 3261 sections 14.1 and 14.2), so the media is asked for one
+	// offer/answer exchange at a time.
+	mediaUpdateDone chan struct{}
+
 	// answers counts the answers still running from their final response on,
 	// each on a goroutine of the dialog's (answerWithin). Close waits for
 	// them.

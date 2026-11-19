@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtcp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -489,4 +491,49 @@ func TestDialogMediaAudioBeforeSetup(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The RTCP monitors of the session a re-INVITE installs run as long as the
+// dialog, not as long as the request that installed them: the request's ctx
+// ends when its handler returns.
+func TestHandleMediaUpdateKeepsRTCPMonitorAfterRequestCtxEnds(t *testing.T) {
+	d, med := newAnsweredTestServerCall(t)
+	req := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(peerSDP())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	inner := newByeServerTx()
+	tx := newAckedServerTx(inner, func() {
+		_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+	})
+	require.NoError(t, d.handleReInvite(ctx, req, tx))
+	require.Len(t, inner.responses, 1)
+	require.Equal(t, sip.StatusOK, inner.responses[0].StatusCode)
+	cancel()
+
+	read := make(chan struct{}, 1)
+	med.RTPSession().OnReadRTCP(func(rtcp.Packet, media.RTPReadStats) {
+		select {
+		case read <- struct{}{}:
+		default:
+		}
+	})
+	raw, err := (&rtcp.ReceiverReport{SSRC: 1}).Marshal()
+	require.NoError(t, err)
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	rtcpAddr := med.MediaSession().Laddr
+	rtcpAddr.Port++
+	for range 20 {
+		_, err = peer.WriteToUDP(raw, &rtcpAddr)
+		require.NoError(t, err)
+		select {
+		case <-read:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("the session a re-INVITE installed stopped reading RTCP when the request's ctx ended")
 }

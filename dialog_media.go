@@ -352,6 +352,12 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 	}
 
 	d.mu.Lock()
+	if d.closed {
+		// Close has taken what it closes already, and would not close what
+		// this exchange installed.
+		d.mu.Unlock()
+		return errMediaClosed
+	}
 	if !offered && d.awaitsFirstExchangeUnsafe() {
 		// The call's first offer: there is nothing running to update.
 		err := d.stageFirstOfferUnsafe(remoteSDP)
@@ -390,6 +396,11 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.closed {
+		// Nothing is described, and for an offer of ours nothing forked, on
+		// media that is closed.
+		return nil, errMediaClosed
+	}
 	if d.mediaSession == nil {
 		return nil, fmt.Errorf("dialog media is not initialized")
 	}

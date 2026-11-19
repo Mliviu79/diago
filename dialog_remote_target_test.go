@@ -39,9 +39,15 @@ func (b *byeTargets) sent() []string {
 // remoteTargetDialog is a confirmed dialog with media, seen through what the
 // remote target tests drive and read.
 type remoteTargetDialog struct {
-	reInvite      func(ctx context.Context) error
-	hangup        func(ctx context.Context) error
-	remoteContact func() *sip.ContactHeader
+	// initial is the remote target the dialog was established with.
+	initial sip.Uri
+	// peerReInvite builds a re-INVITE of the peer's whose Contact is contact.
+	peerReInvite   func(contact sip.Uri) *sip.Request
+	handleReInvite func(req *sip.Request, tx sip.ServerTransaction) error
+	readAck        func(ack *sip.Request) error
+	reInvite       func(ctx context.Context) error
+	hangup         func(ctx context.Context) error
+	remoteContact  func() *sip.ContactHeader
 }
 
 // remoteTargetSides builds, for each side of a call, a confirmed dialog with
@@ -61,6 +67,16 @@ var remoteTargetSides = []struct {
 			client.TxRequester = &clientTxRequester{onRequest: onRequest}
 			d, _ := newAnsweredTestServerCallOverUA(t, &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}}})
 			return remoteTargetDialog{
+				initial: d.InviteRequest.Contact().Address,
+				peerReInvite: func(contact sip.Uri) *sip.Request {
+					req := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
+					req.ReplaceHeader(&sip.ContactHeader{Address: contact})
+					return req
+				},
+				handleReInvite: func(req *sip.Request, tx sip.ServerTransaction) error {
+					return d.handleReInvite(t.Context(), req, tx)
+				},
+				readAck:       func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
 				reInvite:      d.ReInvite,
 				hangup:        d.Hangup,
 				remoteContact: d.RemoteContact,
@@ -93,12 +109,82 @@ var remoteTargetSides = []struct {
 			require.NoError(t, d.Ack(ctx))
 			established = true
 			return remoteTargetDialog{
+				initial: initial,
+				peerReInvite: func(contact sip.Uri) *sip.Request {
+					req := newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1)
+					req.ReplaceHeader(&sip.ContactHeader{Address: contact})
+					return req
+				},
+				handleReInvite: func(req *sip.Request, tx sip.ServerTransaction) error {
+					return d.handleReInvite(t.Context(), req, tx)
+				},
+				readAck:       func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
 				reInvite:      d.ReInvite,
 				hangup:        d.Hangup,
 				remoteContact: d.RemoteContact,
 			}
 		},
 	},
+}
+
+// TestDialogPeerReInviteMovesTheRemoteTargetOnlyWhenAccepted pins when a
+// re-INVITE of the peer's carrying a new Contact moves the dialog's remote
+// target, on either side. RFC 6141 section 4.6 has the UA replace the remote
+// target on sending a 2xx to the target refresh request, and not update it
+// when it answers with an error response. A rejected re-INVITE kept its
+// Contact as the target, and our BYE then went there. The BYE goes to the
+// remote target (RFC 3261 section 12.2.1.1), whichever way it is sent.
+func TestDialogPeerReInviteMovesTheRemoteTargetOnlyWhenAccepted(t *testing.T) {
+	moved := sip.Uri{User: "moved", Host: "127.0.0.9", Port: 5090}
+	for _, side := range remoteTargetSides {
+		t.Run(side.name+"/rejected", func(t *testing.T) {
+			byes := &byeTargets{}
+			d := side.setup(t, func(req *sip.Request) *sip.Response {
+				byes.record(req)
+				return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+			})
+
+			req := d.peerReInvite(moved)
+			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			req.SetBody([]byte("not a session description"))
+			tx := newByeServerTx()
+			// The handler reports the offer it refused.
+			require.Error(t, d.handleReInvite(req, tx))
+			require.Len(t, tx.responses, 1)
+			require.False(t, tx.responses[0].IsSuccess(), "the re-INVITE was not rejected: %d", tx.responses[0].StatusCode)
+
+			assert.Equal(t, d.initial.String(), d.remoteContact().Address.String(), "the rejected re-INVITE moved the remote target")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, d.hangup(ctx))
+			assert.Equal(t, []string{d.initial.String()}, byes.sent())
+		})
+
+		t.Run(side.name+"/accepted", func(t *testing.T) {
+			byes := &byeTargets{}
+			d := side.setup(t, func(req *sip.Request) *sip.Response {
+				byes.record(req)
+				return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+			})
+
+			req := d.peerReInvite(moved)
+			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			req.SetBody(peerSDP())
+			inner := newByeServerTx()
+			tx := newAckedServerTx(inner, func() {
+				_ = d.readAck(newReInviteAck(req, nil))
+			})
+			require.NoError(t, d.handleReInvite(req, tx))
+			require.Len(t, inner.responses, 1)
+			require.True(t, inner.responses[0].IsSuccess(), "the re-INVITE was not accepted: %d", inner.responses[0].StatusCode)
+
+			assert.Equal(t, moved.String(), d.remoteContact().Address.String(), "the accepted re-INVITE did not move the remote target")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, d.hangup(ctx))
+			assert.Equal(t, []string{moved.String()}, byes.sent())
+		})
+	}
 }
 
 // TestDialogByeGoesToTheTargetOurReInviteAnswerSet pins that the BYE the

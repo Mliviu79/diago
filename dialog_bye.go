@@ -41,7 +41,11 @@ func (d *DialogClientSession) TerminatingBye() *sip.Request {
 // wait is for the media: an answer that starts its media after the ACK would
 // otherwise have that media closed under it by the BYE's handler. It also has
 // the answer see the ACK the peer sent ahead of the BYE, rather than the dialog
-// ending before any ACK, which the answer would report as a missing ACK.
+// ending before any ACK, which the answer would report as a missing ACK. A BYE
+// that arrives while a re-INVITE is being handled does not wait for it: the BYE
+// is answered, and the re-INVITE, when it has no final response yet, is
+// answered 487 (RFC 3261 section 15.1.2), so the peer never gets a 200 to the
+// re-INVITE after the one to its BYE.
 //
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
@@ -62,10 +66,12 @@ func (d *DialogServerSession) ReadBye(ctx context.Context, req *sip.Request, tx 
 	return d.readPeerBye(ctx, req, tx, &d.Dialog, d.DialogServerSession.ReadBye)
 }
 
-// ReadBye reads the peer's BYE as the embedded session does. A BYE the
-// embedded session refuses as out of order, with sipgo.ErrDialogInvalidCseq,
-// is answered 500 once, as DialogServerSession.ReadBye describes, and the
-// dialog goes on.
+// ReadBye reads the peer's BYE as the embedded session does. It does not wait
+// for a re-INVITE being handled: a re-INVITE with no final response yet is
+// answered 487 (RFC 3261 section 15.1.2), so none is answered 200 after the
+// BYE that ended the dialog. A BYE the embedded session refuses as out of
+// order, with sipgo.ErrDialogInvalidCseq, is answered 500 once, as
+// DialogServerSession.ReadBye describes, and the dialog goes on.
 //
 // The BYE is stashed for TerminatingBye before the embedded session ends the
 // dialog, and rolled back when it was refused or did not end the dialog, as
@@ -77,7 +83,14 @@ func (d *DialogClientSession) ReadBye(ctx context.Context, req *sip.Request, tx 
 // readPeerBye stashes req, the peer's BYE, hands it to readBye, the ReadBye of
 // the embedded sipgo session of dialog, and drops the stash again when the BYE
 // was not dialog's ending.
+//
+// It holds answerMu while the BYE ends the dialog and is answered, so the
+// final response to a re-INVITE of the peer's goes out either before that or
+// not at all: a re-INVITE still pending once the BYE has ended the dialog is
+// answered 487 here (RFC 3261 section 15.1.2).
 func (s *sessionState) readPeerBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, dialog *sipgo.Dialog, readBye func(context.Context, *sip.Request, sip.ServerTransaction) error) error {
+	s.answerMu.Lock()
+	defer s.answerMu.Unlock()
 	s.terminatingBye.Store(req)
 	if err := readByeOnce(ctx, req, tx, readBye); err != nil {
 		// Not this dialog's ending: leave no cause planted on it. A BYE
@@ -87,7 +100,7 @@ func (s *sessionState) readPeerBye(ctx context.Context, req *sip.Request, tx sip
 		}
 		return err
 	}
-	return nil
+	return s.terminatePeerReInviteLocked(ctx)
 }
 
 // readByeOnce hands the peer's BYE to readBye, the ReadBye of an embedded

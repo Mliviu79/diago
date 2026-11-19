@@ -164,7 +164,9 @@ func TestDialogEndedAnswersInDialogRequests481(t *testing.T) {
 // TestDialogServerReInviteEndedDialog pins how a re-INVITE for a dialog that is
 // no longer live is answered. An ended dialog stays in the cache until the call
 // handler returns, so the request still finds it. It matches no live dialog,
-// and is answered 481 (RFC 3261 section 12.2.2) without reaching the media.
+// and is answered 481 (RFC 3261 section 12.2.2) without reaching the media. A
+// re-INVITE still pending when a BYE tears the media down gets 487 (RFC 3261
+// section 15.1.2) instead of an answer built on closed media.
 func TestDialogServerReInviteEndedDialog(t *testing.T) {
 	t.Run("ended", func(t *testing.T) {
 		d, _ := newAnsweredTestServerCall(t)
@@ -177,13 +179,25 @@ func TestDialogServerReInviteEndedDialog(t *testing.T) {
 		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
 	})
+
+	t.Run("media closed", func(t *testing.T) {
+		d, med := newAnsweredTestServerCall(t)
+		require.NoError(t, med.Close())
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(t.Context(), newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
+	})
 }
 
 // TestDialogClientReInviteEndedDialog pins how a peer's re-INVITE for an
 // outgoing dialog that is no longer live is answered. After our BYE the dialog
 // stays in the cache until it is closed, so the request still finds it. It
 // matches no live dialog, and is answered 481 (RFC 3261 section 12.2.2)
-// without reaching the media.
+// without reaching the media. A re-INVITE still pending when a BYE tears the
+// media down gets 487 (RFC 3261 section 15.1.2) instead of an answer built on
+// closed media.
 func TestDialogClientReInviteEndedDialog(t *testing.T) {
 	t.Run("ended", func(t *testing.T) {
 		d, _ := newAnsweredTestClientDialog(t)
@@ -195,5 +209,15 @@ func TestDialogClientReInviteEndedDialog(t *testing.T) {
 		require.Len(t, tx.responses, 1)
 		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, tx.responses[0].StatusCode)
 		assert.Nil(t, d.remoteContactTarget, "the re-INVITE reached the media")
+	})
+
+	t.Run("media closed", func(t *testing.T) {
+		d, med, _ := newAnsweredTestClientCall(t)
+		require.NoError(t, med.Close())
+
+		tx := newByeServerTx()
+		require.NoError(t, d.handleReInvite(t.Context(), newPeerReInvite(d, 5), tx))
+		require.Len(t, tx.responses, 1)
+		assert.Equal(t, sip.StatusRequestTerminated, tx.responses[0].StatusCode)
 	})
 }

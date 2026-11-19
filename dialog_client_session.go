@@ -475,6 +475,13 @@ func (d *DialogClientSession) ReInvite(ctx context.Context) error {
 	if mediaHanshaker == nil {
 		return fmt.Errorf("dialog media is not initialized")
 	}
+	// One re-INVITE at a time: ours waits for one of the peer's to end, and
+	// one of the peer's arriving meanwhile is answered 491.
+	endUpdate, err := d.beginOwnMediaUpdate(ctx, &d.Dialog)
+	if err != nil {
+		return err
+	}
+	defer endUpdate()
 	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, "")
 	if err != nil {
 		return err
@@ -622,59 +629,108 @@ func (d *DialogClientSession) handleRefer(ctx context.Context, dg *Diago, req *s
 	dialogHandleRefer(ctx, d, dg, req, tx, onRefDialog)
 }
 
-func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) (err error) {
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
+
 	// After our BYE an ended dialog stays in the cache until it is closed, so
 	// a re-INVITE can still find it. It is answered 481 without reaching the
-	// media.
-	if res := dialogEndedResponse(d, req); res != nil {
-		return tx.Respond(ctx, res)
+	// media. A live one is answered through respondPeerReInvite, or 487 by a
+	// BYE that ends the dialog first.
+	if answered, err := d.beginPeerReInvite(ctx, &d.Dialog, &d.dialogCallbacks, req, tx); answered {
+		return err
 	}
+	// Once a 2xx has been sent, its ACK is waited for, and only then is the
+	// re-INVITE no longer in progress. A 2xx whose ACK does not come ends the
+	// call (RFC 3261 section 13.3.1.4). The media commits the update when that
+	// ACK is read, so a re-INVITE that ends without it has the media drop what
+	// the offer left staged.
+	var endUpdate func()
+	offered := false
+	defer func() {
+		acked, ackErr := d.endPeerReInvite(tx)
+		if offered && !acked {
+			d.abortMedia()
+		}
+		if ackErr != nil {
+			err = errors.Join(err, ackErr, d.hangupNoMedia())
+		}
+		if endUpdate != nil {
+			endUpdate()
+		}
+	}()
 
 	if err := d.ReadRequest(req, tx); err != nil {
-		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request - "+err.Error(), nil))
+		return err
+	}
+
+	// RFC 3261 section 14.2: a re-INVITE arriving while one of ours is in
+	// progress is answered 491.
+	var ok bool
+	endUpdate, ok = d.beginPeerMediaUpdate()
+	if !ok {
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return err
 	}
 
 	mediaHanshaker := d.mediaHanshakerLocked()
-	if mediaHanshaker != nil {
-		d.setRemoteContact(req.Contact())
-		if err := mediaHanshaker.onRemoteSDP(d.Context(), req.Body(), false); err != nil {
-			return errors.Join(
-				err,
-				tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil)),
-			)
-		}
-		localSDP, err := mediaHanshaker.onLocalSDP(d.Context(), true, "")
-		if err != nil {
-			d.dialogCallbacks.abortMedia()
-			return errors.Join(
-				err,
-				tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil)),
-			)
-		}
-		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", localSDP)
-		res.AppendHeader(d.InviteRequest.Contact())
-		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-		if err := tx.Respond(ctx, res); err != nil {
-			d.dialogCallbacks.abortMedia()
-			return err
-		}
-		return nil
+	if mediaHanshaker == nil {
+		_, err := d.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+		return err
 	}
 
-	return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
+	offered = true
+	if err := mediaHanshaker.onRemoteSDP(d.Context(), req.Body(), false); err != nil {
+		return d.refusePeerReInvite(ctx, req, tx, err)
+	}
+	localSDP, err := mediaHanshaker.onLocalSDP(d.Context(), true, "")
+	if err != nil {
+		return d.refusePeerReInvite(ctx, req, tx, err)
+	}
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", localSDP)
+	res.AppendHeader(d.InviteRequest.Contact())
+	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	// The remote target moves to the re-INVITE's Contact as this 2xx is sent,
+	// and stays where it was when the re-INVITE is refused or a BYE ends it.
+	_, err = d.respondPeerReInvite(ctx, tx, res)
+	return err
 }
 
+// handleReInviteACK reads the ACK to our 2xx to a re-INVITE of the peer's: it
+// ends the retransmission of that 2xx, hands the media the answer the ACK
+// carries, if any, and has it commit the update, which the handling of the
+// re-INVITE waits for.
+//
+// An ACK cannot be refused, so media that the ACK leaves unusable ends the
+// call with a BYE.
 func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
+	// A copy of an ACK already read, sent for a retransmission of our 2xx,
+	// brings the media nothing more.
+	ackHandled, first := d.ackPeerReInvite(req)
+	if !first {
+		return nil
+	}
+	defer ackHandled()
+
 	mediaHanshaker := d.mediaHanshakerLocked()
 	if mediaHanshaker == nil {
 		return nil
 	}
+	var err error
 	if body := req.Body(); body != nil {
-		if err := mediaHanshaker.onRemoteSDP(d.Context(), body, true); err != nil {
-			return err
-		}
+		err = mediaHanshaker.onRemoteSDP(d.Context(), body, true)
 	}
-	return mediaHanshaker.onFinalize(d.Context())
+	if err == nil {
+		err = mediaHanshaker.onFinalize(d.Context())
+	}
+	if err != nil {
+		// Nothing was installed: the media drops what the exchange left
+		// staged.
+		d.abortMedia()
+		return errors.Join(err, d.hangupNoMedia())
+	}
+	return nil
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
@@ -714,6 +770,13 @@ func (d *DialogClientSession) reInviteMode(
 	mediaHanshaker mediaHanshaker,
 	mode string,
 ) error {
+	// One re-INVITE at a time: ours waits for one of the peer's to end, and
+	// one of the peer's arriving meanwhile is answered 491.
+	endUpdate, err := d.beginOwnMediaUpdate(ctx, &d.Dialog)
+	if err != nil {
+		return err
+	}
+	defer endUpdate()
 	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, mode)
 	if err != nil {
 		return err

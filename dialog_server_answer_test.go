@@ -25,15 +25,28 @@ type recordingMedia struct {
 	answers   []string
 	finalized int
 	aborted   int
+	// offerErr, when set, is what onRemoteSDP returns for an offer, as media
+	// that refuses it.
+	offerErr error
+	// onOffer and onCommit, when set, are called while the media is handed an
+	// offer and while it is asked to commit, with mu released.
+	onOffer  func()
+	onCommit func()
 }
 
 func (m *recordingMedia) onRemoteSDP(_ context.Context, remoteSDP []byte, offered bool) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if offered {
 		m.answers = append(m.answers, string(remoteSDP))
+		m.mu.Unlock()
+		return nil
 	}
-	return nil
+	onOffer, offerErr := m.onOffer, m.offerErr
+	m.mu.Unlock()
+	if onOffer != nil {
+		onOffer()
+	}
+	return offerErr
 }
 
 func (m *recordingMedia) onLocalSDP(context.Context, bool, string) ([]byte, error) {
@@ -42,9 +55,30 @@ func (m *recordingMedia) onLocalSDP(context.Context, bool, string) ([]byte, erro
 
 func (m *recordingMedia) onFinalize(context.Context) error {
 	m.mu.Lock()
+	onCommit := m.onCommit
+	m.mu.Unlock()
+	if onCommit != nil {
+		onCommit()
+	}
+	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.finalized++
 	return m.finalizeErr
+}
+
+// refuseOffers makes the media refuse every later offer with err.
+func (m *recordingMedia) refuseOffers(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.offerErr = err
+}
+
+// hook has onOffer called while the media is handed an offer, and onCommit
+// while it is asked to commit. Either may be nil.
+func (m *recordingMedia) hook(onOffer, onCommit func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onOffer, m.onCommit = onOffer, onCommit
 }
 
 func (m *recordingMedia) abort() {
@@ -132,15 +166,20 @@ func TestDialogServerAckCommitsTheMedia(t *testing.T) {
 	reInvite := newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1)
 	reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	reInvite.SetBody(peerSDP())
+	// The handling of a re-INVITE answered 2xx waits for the ACK, which the
+	// peer sends once the 2xx is out.
 	tx := newRespondedServerTx()
-	require.NoError(t, d.handleReInvite(t.Context(), reInvite, tx))
+	ackRead := make(chan error, 1)
+	require.NoError(t, d.handleReInvite(t.Context(), reInvite, newAckedServerTx(tx, func() {
+		ackRead <- d.ReadAck(newReInviteAck(reInvite, nil), newByeServerTx())
+	})))
 	select {
 	case res := <-tx.responded:
 		require.Equal(t, sip.StatusOK, res.StatusCode)
 	default:
 		t.Fatal("the re-INVITE was not answered")
 	}
-	require.NoError(t, d.ReadAck(newReInviteAck(reInvite, nil), newByeServerTx()))
+	require.NoError(t, <-ackRead)
 	_, finalized, _ = med.seen()
 	assert.Equal(t, 2, finalized, "the ACK to the re-INVITE's 2xx commits its update")
 	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())

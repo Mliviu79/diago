@@ -358,6 +358,20 @@ func newTestClientDialog(t *testing.T, state sip.DialogState) *DialogClientSessi
 	return d
 }
 
+// newPeerReInvite builds a body-less re-INVITE the peer sends inside d.
+func newPeerReInvite(d *DialogClientSession, seq uint32) *sip.Request {
+	inv := d.InviteRequest
+	toParams := sip.NewParams()
+	toParams.Add("tag", "callee-tag")
+	req := sip.NewRequest(sip.INVITE, inv.Contact().Address)
+	req.AppendHeader(&sip.FromHeader{Address: inv.To().Address, Params: toParams})
+	req.AppendHeader(&sip.ToHeader{Address: inv.From().Address, Params: inv.From().Params.Clone()})
+	req.AppendHeader(sip.HeaderClone(inv.CallID()))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.INVITE})
+	req.AppendHeader(&sip.ContactHeader{Address: inv.To().Address})
+	return req
+}
+
 // newPeerInDialogRequest builds a request of the given method the peer sends
 // inside a dialog.
 func newPeerInDialogRequest(method sip.RequestMethod, seq uint32) *sip.Request {
