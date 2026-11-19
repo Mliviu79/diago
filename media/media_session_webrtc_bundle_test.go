@@ -517,9 +517,10 @@ func TestMediaSessionWebrtcAnswersAPionOfferOfVideoThenAudio(t *testing.T) {
 
 // FuzzWebRTCStreamIdentification reads the identification of the streams of an
 // arbitrary SDP as RemoteSDP does and writes the lines our SDPs would carry
-// for it. Whatever the body, the group of our SDP lists the audio stream's tag
-// alone, no line of ours carries a line break, and a packet takes the tag of a
-// mapped extension and gives it back.
+// for it. Whatever the body, the stream list has one stream for each m= line
+// read, the sections its SDP parser was not given included, the group of our
+// SDP lists the audio stream's tag alone, no line of ours carries a line
+// break, and a packet takes the tag of a mapped extension and gives it back.
 func FuzzWebRTCStreamIdentification(f *testing.F) {
 	const session = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
 	const audio = "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n"
@@ -530,18 +531,28 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 	f.Add([]byte(session + "a=extmap:300/recvonly urn:ietf:params:rtp-hdrext:sdes:mid\r\na=group:BUNDLE\r\na=group:LS a\r\n" +
 		audio + "a=mid:a\r\na=extmap:0 urn:ietf:params:rtp-hdrext:sdes:mid\r\nm=text 0 RTP/AVP 98\r\na=bundle-only\r\n"))
 	f.Add([]byte(session + "a=group:BUNDLE " + strings.Repeat("t", 300) + "\r\n" + audio + "a=mid:" + strings.Repeat("t", 300) + "\r\na=extmap:15 urn:ietf:params:rtp-hdrext:sdes:mid\r\n"))
+	f.Add([]byte(session + "m=image 30004 udptl t38\r\na=mid:fax\r\na=T38FaxVersion:0\r\n" +
+		audio + "a=mid:1\r\na=ssrc:1234 cname:peer\r\n" +
+		"m=video 9 RTP/AVP/FOO 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 bad name/1\r\n"))
+	f.Add([]byte(session + audio + "m=video 9 UDP/TLS/RTP/SAVPF 96 0\r\na=rtpmap:96 VP8/90000/\r\na=rtpmap:96 H264/90000\r\na=rtpmap:98 VP9/90000\r\n"))
 
 	f.Fuzz(func(t *testing.T, body []byte) {
-		var desc webrtcsdp.SessionDescription
-		if err := desc.Unmarshal(body); err != nil {
+		desc, unread, err := unmarshalWebRTCDescription(body)
+		if err != nil {
 			return
 		}
 		md := webRTCAudioStream(&desc)
 		if md == nil {
 			return
 		}
-		streams := webRTCOfferedStreams(&desc, md)
+		streams := unread.among(webRTCOfferedStreams(&desc, md))
 		webRTCCandidateAttributes(&desc, md)
+		require.Len(t, streams.media, len(desc.MediaDescriptions)+len(unread), "one stream for each m= line")
+		require.Len(t, streams.formatLines, len(streams.media))
+		require.Equal(t, webRTCMediaLine(md), streams.media[streams.audio], "the stream that carries the call")
+		for _, stream := range unread {
+			require.Equal(t, stream.media, streams.media[stream.index], "an unread stream stands where the body has it")
+		}
 
 		group := streams.bundleGroupLines()
 		if len(group) > 0 {

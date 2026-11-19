@@ -477,9 +477,14 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // with no candidate is refused with an *ICEError that matches
 // ErrICEConnection. The candidates are those of the audio section, or, when
 // it lists none, of the sections bundled with it under its ICE credentials.
+//
+// A stream beside the audio one whose m= line the SDP parser does not read, a
+// media type or a transport outside those it knows, does not make the
+// description one the session cannot meet: the stream is answered rejected,
+// like every other stream the session does not carry.
 func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered bool) error {
-	var desc webrtcsdp.SessionDescription
-	if err := desc.Unmarshal(body); err != nil {
+	desc, unread, err := unmarshalWebRTCDescription(body)
+	if err != nil {
 		return fmt.Errorf("parse remote WebRTC SDP: %w", err)
 	}
 	md := webRTCAudioStream(&desc)
@@ -598,7 +603,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		m.pendingMode = negotiateMediaDirection(remoteMode, localPreference)
 		m.pendingRTCPReducedSize = remoteRTCPReducedSize
 		m.offerAccepted(proto, offered)
-		m.stageOfferedStreams(webRTCOfferedStreams(&desc, md), offered)
+		m.stageOfferedStreams(unread.among(webRTCOfferedStreams(&desc, md)), offered)
 		return nil
 	}
 	for _, candidate := range remoteCandidates {
@@ -614,7 +619,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.recordDTLSAssociation(localSetup, fingerprints, tlsID, offered)
 	m.rtcpReducedSize = remoteRTCPReducedSize
 	m.offerAccepted(proto, offered)
-	m.keepOfferedStreams(webRTCOfferedStreams(&desc, md), offered)
+	m.keepOfferedStreams(unread.among(webRTCOfferedStreams(&desc, md)), offered)
 	m.filterCodecs = common
 	m.Codecs = slices.Clone(common)
 	m.codec, _ = CodecAudioFromList(common)

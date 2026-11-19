@@ -42,6 +42,13 @@ const (
 		"a=sctp-port:5000"
 	webrtcStreamsRejectedData = "m=application 0 UDP/DTLS/SCTP webrtc-datachannel"
 
+	// webrtcStreamsImage is a T.38 fax stream, whose m= line the SDP parser
+	// of a WebRTC session reads neither the media type nor the transport of.
+	webrtcStreamsImage = "m=image 30004 udptl t38\r\n" +
+		"a=T38FaxVersion:0\r\n" +
+		"a=T38FaxRateManagement:transferredTCF"
+	webrtcStreamsRejectedImage = "m=image 0 udptl t38"
+
 	webrtcStreamsText = "m=text 9 UDP/TLS/RTP/SAVPF 98\r\n" +
 		"a=mid:3\r\n" +
 		"a=rtpmap:98 t140/1000"
@@ -126,6 +133,9 @@ func webrtcReOfferMediaLines(t *testing.T, m *MediaSessionWebrtc) []string {
 // of ours: "Deleted media streams from a previous SDP MUST NOT be removed in a
 // new SDP".
 //
+// A stream whose m= line the SDP parser of the session refuses, a T.38 image
+// stream for one, is answered like the others.
+//
 // A stream rejected out of a BUNDLE group is written the same way, which is
 // what RFC 8843 section 7.3.3 asks: a zero port and no a=bundle-only. The
 // a=group:BUNDLE list of our SDP names the tag of its audio stream alone, and
@@ -196,6 +206,28 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 				"a=ice-pwd:videovideovideovideovideo\r\n" +
 				"a=inactive"},
 			wantBefore: []string{"m=video 0 UDP/TLS/RTP/SAVPF 0"},
+		},
+		{
+			name:      "audio_and_a_T.38_image_stream",
+			after:     []string{webrtcStreamsImage},
+			wantAfter: []string{webrtcStreamsRejectedImage},
+		},
+		{
+			name:       "a_T.38_image_stream_then_audio",
+			before:     []string{webrtcStreamsImage},
+			wantBefore: []string{webrtcStreamsRejectedImage},
+		},
+		{
+			name:       "an_identified_T.38_image_stream_among_others",
+			before:     []string{webrtcStreamsVideo, webrtcStreamsImage + "\r\na=mid:fax"},
+			after:      []string{webrtcStreamsImage, webrtcStreamsData},
+			wantBefore: []string{webrtcStreamsRejectedVideo, webrtcStreamsRejectedImage},
+			wantAfter:  []string{webrtcStreamsRejectedImage, webrtcStreamsRejectedData},
+		},
+		{
+			name:      "an_audio_stream_on_a_transport_the_parser_refuses",
+			after:     []string{"m=audio 9 udptl t38\r\na=mid:1"},
+			wantAfter: []string{"m=audio 0 udptl t38"},
 		},
 		{
 			name:      "a_BUNDLE_group_of_audio_and_video",
@@ -408,6 +440,21 @@ func TestMediaSessionWebrtcRefusesAnOfferWithoutAnAudioStreamToCarry(t *testing.
 			name: "audio_on_a_transport_we_do_not_carry",
 			rewrite: func(t *testing.T, alone []byte) []byte {
 				return sdpWithProto(t, alone, "TCP/MSRP")
+			},
+		},
+		{
+			// A transport the SDP parser of the session does not read.
+			name: "audio_on_a_transport_the_parser_refuses",
+			rewrite: func(t *testing.T, alone []byte) []byte {
+				return sdpWithProto(t, alone, "udptl")
+			},
+		},
+		{
+			// A media type the SDP parser of the session does not read.
+			name: "an_image_stream_in_place_of_the_audio",
+			rewrite: func(t *testing.T, alone []byte) []byte {
+				require.Equal(t, 1, strings.Count(string(alone), "\r\nm=audio "), "the offer\n%s", alone)
+				return []byte(strings.Replace(string(alone), "\r\nm=audio ", "\r\nm=image ", 1))
 			},
 		},
 	} {

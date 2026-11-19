@@ -139,12 +139,15 @@ func TestMediaSessionWebrtcRejectedStreamKeepsItsRTPMaps(t *testing.T) {
 	}
 	untagged := "m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=rtpmap:100 AV1/90000"
 	wantUntagged := []string{"m=video 0 UDP/TLS/RTP/SAVPF 100", "a=rtpmap:100 AV1/90000"}
+	// A stream the SDP parser of the session does not read keeps them too.
+	unread := "m=video 9 RTP/AVP/FOO 101\r\na=mid:odd\r\na=rtpmap:101 H263/90000\r\na=rtpmap:101 bad name/1"
+	wantUnread := []string{"m=video 0 RTP/AVP/FOO 101", "a=mid:odd", "a=rtpmap:101 H263/90000"}
 	wantData := []string{"m=application 0 UDP/DTLS/SCTP webrtc-datachannel", "a=mid:2"}
-	want := [][]string{wantVideo, wantUntagged, wantData}
+	want := [][]string{wantVideo, wantUnread, wantUntagged, wantData}
 
 	ctx := t.Context()
 	offerer, answerer, _, answer := newEstablishedWebrtcPair(t, func(offer string) string {
-		return string(withStreamsAround(t, []byte(offer), []string{video}, []string{untagged, webrtcStreamsData}))
+		return string(withStreamsAround(t, []byte(offer), []string{video, unread}, []string{untagged, webrtcStreamsData}))
 	})
 	assert.Equal(t, want, rejectedSections(answer), "the answer\n%s", answer)
 
