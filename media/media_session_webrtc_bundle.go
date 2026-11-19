@@ -66,25 +66,44 @@ func webRTCBundledAudio(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.Med
 	return bundledAudio{grouped: true, mid: webRTCMIDExtension(desc.Attributes, audio.Attributes, tag)}
 }
 
+// ownAudioTag is the identification-tag our own first offer gives its audio
+// stream when it offers it in a BUNDLE group.
+const ownAudioTag = "0"
+
+// ownOfferStreams returns the stream list a session writes its SDPs around
+// before any offer of the peer: the audio stream alone, identified as our own
+// first offer identifies it. That is under the tag 0 and in a BUNDLE group of
+// its own, or, when withoutBundle is set, with neither the tag nor the group.
+//
+// Both are an offerer's to write. The group is in "the first offer, within an
+// SDP session" of an offerer that "wants to negotiate a given BUNDLE group"
+// (RFC 8843 section 7.2), and an offerer that asks for none writes an SDP
+// without the grouping framework, where a stream needs no tag.
+func ownOfferStreams(withoutBundle bool) offeredStreams {
+	if withoutBundle {
+		return offeredStreams{}
+	}
+	return offeredStreams{tags: []string{ownAudioTag}, bundle: bundledAudio{grouped: true}}
+}
+
 // bundleGroupLines returns the session-level a=group lines of an SDP of ours
 // written around the stream list.
 //
-// A list whose offer identified no stream, and the list before any offer, has
-// the group of an offer of ours: the audio stream under the tag 0. Otherwise
-// the offer decides. RFC 8843 section 7.3: "The answerer is only allowed to
-// include a BUNDLE group in an initial BUNDLE answer if the offerer requested
-// the BUNDLE group to be created in the corresponding initial BUNDLE offer"
-// and "is only allowed to include a bundled "m=" section in an answer if the
-// "m=" section was indicated as bundled in the corresponding offer", so the
-// group is written only when the offer listed the audio stream in one. Its
-// list is the tag of the audio stream alone, since section 7.3.3 has the
-// answerer that rejects a bundled stream "MUST NOT place the
-// identification-tag associated with the "m=" section in the SDP
-// 'group:BUNDLE' attribute identification-tag list".
+// RFC 8843 section 7.3: "The answerer is only allowed to include a BUNDLE
+// group in an initial BUNDLE answer if the offerer requested the BUNDLE group
+// to be created in the corresponding initial BUNDLE offer" and "is only
+// allowed to include a bundled "m=" section in an answer if the "m=" section
+// was indicated as bundled in the corresponding offer", so the group is
+// written only when the offer listed the audio stream in one: an offer
+// without an a=group line, or without an a=mid line a group could list, is
+// answered without the line. The list of the group is the tag of the audio
+// stream alone, since section 7.3.3 has the answerer that rejects a bundled
+// stream "MUST NOT place the identification-tag associated with the "m="
+// section in the SDP 'group:BUNDLE' attribute identification-tag list".
+//
+// The list before any offer of the peer has the group of our own offer: see
+// ownOfferStreams.
 func (o offeredStreams) bundleGroupLines() []string {
-	if !o.tagged() {
-		return []string{"a=group:" + bundleSemantics + " 0"}
-	}
 	if !o.bundle.grouped {
 		return nil
 	}
@@ -92,14 +111,15 @@ func (o offeredStreams) bundleGroupLines() []string {
 }
 
 // bundledAudioLines returns the lines that identify the audio section of an
-// SDP of ours written around the stream list: its a=mid line, which is the
-// offer's (RFC 5888 section 9.1) and the tag 0 where no offer identified a
-// stream, and the a=extmap line of the tag's header extension when the offer
-// mapped one.
+// SDP of ours written around the stream list: its a=mid line, and the
+// a=extmap line of the tag's header extension when the offer mapped one.
+//
+// The a=mid line is the offer's (RFC 5888 section 9.1), and an audio stream
+// the offer gave no tag has none: RFC 8829 section 5.3.1 has each m= section
+// of an answer contain, "If and only if present in the offer, an "a=mid"
+// line". The list before any offer of the peer has the tag of our own offer:
+// see ownOfferStreams.
 func (o offeredStreams) bundledAudioLines() []string {
-	if !o.tagged() {
-		return []string{midLine("0")}
-	}
 	var lines []string
 	if tag := o.audioTag(); tag != "" {
 		lines = append(lines, midLine(tag))

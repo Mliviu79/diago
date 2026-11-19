@@ -59,6 +59,17 @@ type MediaSessionWebrtcConfig struct {
 
 	// ICE holds the further settings of the ICE agent: see ICEConfig.
 	ICE ICEConfig
+
+	// OfferWithoutBundle makes the first offer of the session, the one it
+	// writes before any offer of the peer, describe the audio stream with no
+	// a=group:BUNDLE line and no a=mid line. The zero value offers the stream
+	// under the tag 0, in a BUNDLE group of its own.
+	//
+	// The SDPs of ours that follow that offer keep its form, a session made
+	// by Fork included, until an offer of the peer is committed: from then on
+	// they identify the streams as that offer did. An answer always follows
+	// its offer, whatever this field holds.
+	OfferWithoutBundle bool
 }
 
 // MediaSessionWebrtc is the direct ICE + DTLS-SRTP media stack. It intentionally
@@ -328,9 +339,11 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // The streams are identified as that offer identified them: each under its
 // a=mid tag (RFC 5888 section 9.1), the audio stream alone in the BUNDLE group
 // the offer listed it in (RFC 8843 sections 7.3 and 7.3.3), with the header
-// extension the offer mapped to its tag (RFC 8843 section 9.1). Before any
-// offer of the peer, and after one that identified no stream, the audio stream
-// has the tag 0 in a group of its own.
+// extension the offer mapped to its tag (RFC 8843 section 9.1). A stream the
+// offer gave no tag has no a=mid line, and a body whose offer listed the audio
+// stream in no BUNDLE group has no a=group line. Before any offer of the peer
+// the audio stream has the tag 0 in a group of its own, or neither line when
+// Config.OfferWithoutBundle is set.
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

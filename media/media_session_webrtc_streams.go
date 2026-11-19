@@ -30,7 +30,8 @@ import (
 // extension of the audio one. See offeredStreams.bundleGroupLines.
 type webrtcStreams struct {
 	// current is the stream list of the last offer the session committed to.
-	// Its zero value, before any offer, is the audio stream alone.
+	// Its zero value, before any offer, is the audio stream alone, which our
+	// SDPs identify as our own first offer does: see localStreams.
 	current offeredStreams
 
 	// staged is the stream list of an offer accepted on a negotiated session
@@ -126,14 +127,29 @@ func (m *MediaSessionWebrtc) dropStagedStreams() {
 	m.streams = webrtcStreams{current: m.streams.current}
 }
 
+// ofAnOffer reports whether the list is that of an offer of the peer, which
+// holds at least the m= line of the audio stream. The zero value is the list
+// before any offer.
+func (o offeredStreams) ofAnOffer() bool {
+	return len(o.media) > 0
+}
+
 // localStreams returns the stream list the body LocalSDP builds is written
 // around, where answered says the body answers the offer RemoteSDP accepted:
 // that offer's list, which is a staged one on a negotiated session. An offer
-// of ours is written around the list the session has committed to. The caller
-// holds m.mu.
+// of ours is written around the list the session has committed to.
+//
+// A session that has committed to no offer of the peer writes around the list
+// of our own first offer, in the form Config.OfferWithoutBundle chooses. The
+// form is read from the configuration each time, which Fork copies, so every
+// SDP of ours keeps the form of the first until an offer of the peer is
+// committed. The caller holds m.mu.
 func (m *MediaSessionWebrtc) localStreams(answered bool) offeredStreams {
 	if answered && m.streams.hasStaged {
 		return m.streams.staged
+	}
+	if !m.streams.current.ofAnOffer() {
+		return ownOfferStreams(m.Config.OfferWithoutBundle)
 	}
 	return m.streams.current
 }

@@ -64,8 +64,13 @@ func webrtcTaggedOffer(t *testing.T, alone []byte, group, audioTag string, befor
 // and a stream in it, only where the offer had them, and section 7.3.3 keeps
 // the tag of a rejected stream out of the group's list.
 //
-// An offer that identifies no stream is answered as before: the audio stream
-// under the tag 0, in a group of its own.
+// An offer that identifies no stream and asks for no group is answered with
+// neither line. RFC 8829 section 5.3.1 has each m= section of an answer
+// contain, "If and only if present in the offer, an "a=mid" line", and the
+// same sentence of RFC 8843 section 7.3 that keeps a group the offer did not
+// ask for out of the answer applies: "The answerer is only allowed to include
+// a BUNDLE group in an initial BUNDLE answer if the offerer requested the
+// BUNDLE group to be created in the corresponding initial BUNDLE offer".
 func TestMediaSessionWebrtcAnswerKeepsTheOfferedTags(t *testing.T) {
 	type row struct {
 		name string
@@ -143,24 +148,31 @@ func TestMediaSessionWebrtcAnswerKeepsTheOfferedTags(t *testing.T) {
 			wantTags: []string{"", "v"},
 		},
 		{
-			name:      "no_tag_and_no_group",
-			after:     []string{webrtcTaggedSection("video", "")},
-			wantGroup: []string{"a=group:BUNDLE 0"},
-			wantTags:  []string{"0", ""},
+			// RFC 8829 section 5.3.1 and RFC 8843 section 7.3: neither an
+			// a=mid line nor a BUNDLE group the offer did not have.
+			name:     "no_tag_and_no_group",
+			after:    []string{webrtcTaggedSection("video", "")},
+			wantTags: []string{"", ""},
 		},
 		{
-			name:      "one_audio_stream_with_no_tag_and_no_group",
-			wantGroup: []string{"a=group:BUNDLE 0"},
-			wantTags:  []string{"0"},
+			name:     "one_audio_stream_with_no_tag_and_no_group",
+			wantTags: []string{""},
+		},
+		{
+			// A group lists streams by their tags, so one over streams
+			// without any lists none of them.
+			name:     "a_group_and_no_tag",
+			group:    "a=group:BUNDLE 0",
+			wantTags: []string{""},
 		},
 		{
 			// RFC 5888 section 4: a tag is a token. A value that is not one
-			// is not written back, and the stream counts as not identified.
-			name:      "an_audio_tag_that_is_no_token",
-			group:     "a=group:BUNDLE a b",
-			audioTag:  "a b",
-			wantGroup: []string{"a=group:BUNDLE 0"},
-			wantTags:  []string{"0"},
+			// is not written back, and the stream counts as not identified:
+			// no tag, and in no group.
+			name:     "an_audio_tag_that_is_no_token",
+			group:    "a=group:BUNDLE a b",
+			audioTag: "a b",
+			wantTags: []string{""},
 		},
 		{
 			name:      "a_rejected_stream_whose_tag_is_no_token",
@@ -186,6 +198,8 @@ func TestMediaSessionWebrtcAnswerKeepsTheOfferedTags(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, r.wantGroup, sdpLines(answer, "a=group:"), "the answer's group\n%s", answer)
 			assert.Equal(t, r.wantTags, streamTagsOf(answer), "the answer's tags\n%s", answer)
+			assert.Len(t, sdpLines(answer, "a=mid:"), len(slices.DeleteFunc(slices.Clone(r.wantTags), func(tag string) bool { return tag == "" })),
+				"the answer's a=mid lines\n%s", answer)
 			assert.Empty(t, sdpLines(answer, "a=bundle-only"), "the answer\n%s", answer)
 			assert.Len(t, mediaLines(answer), len(mediaLines(offer)), "the answer's m= lines\n%s", answer)
 
@@ -530,8 +544,12 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 		webRTCCandidateAttributes(&desc, md)
 
 		group := streams.bundleGroupLines()
-		if streams.tagged() && len(group) > 0 {
+		if len(group) > 0 {
+			require.NotEmpty(t, streams.audioTag(), "a group is written for an audio stream the offer identified alone")
 			require.Equal(t, []string{"a=group:BUNDLE " + streams.audioTag()}, group)
+		}
+		if streams.audioTag() == "" {
+			require.Empty(t, streams.bundledAudioLines(), "an audio stream the offer gave no tag is written with none")
 		}
 		before, after := streams.rejected()
 		for _, l := range slices.Concat(group, streams.bundledAudioLines(), before, after) {

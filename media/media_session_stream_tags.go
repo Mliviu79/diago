@@ -75,18 +75,13 @@ func notTokenChar(r rune) bool {
 
 // streamTags returns tags, the identification-tag of each stream of an offer
 // in the offer's order, as a stream list keeps them: nil when the offer
-// identifies no stream. The SDPs written around such a list are the ones
-// written before any offer.
+// identifies no stream. The SDPs written around such a list carry no a=mid
+// line.
 func streamTags(tags []string) []string {
 	if !slices.ContainsFunc(tags, func(tag string) bool { return tag != "" }) {
 		return nil
 	}
 	return tags
-}
-
-// tagged reports whether the offer identified a stream.
-func (o offeredStreams) tagged() bool {
-	return len(o.tags) > 0
 }
 
 // tag returns the identification-tag of stream i, or "" when the offer gave it

@@ -19,7 +19,9 @@ type offeredStreams struct {
 
 	// tags holds the identification-tag the offer gave each stream of media
 	// in its a=mid line, empty for a stream it gave none. It is nil when the
-	// offer identifies no stream: see streamTags.
+	// offer identifies no stream: see streamTags. The list a WebRTC session
+	// writes its own first offer around holds the tag of ours instead: see
+	// ownOfferStreams.
 	tags []string
 
 	// bundle is what the offer says of the BUNDLE group of its audio stream.
