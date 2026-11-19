@@ -233,6 +233,10 @@ func resumeRead(reader RTPReader) {
 		r.restoreRTPReadDeadline()
 	case *RTPSession:
 		r.Sess.restoreRTPReadDeadline()
+	case *MediaSessionWebrtc:
+		r.restoreRTPReadDeadline()
+	case *RTPSessionWebrtc:
+		r.Sess.restoreRTPReadDeadline()
 	}
 }
 
@@ -260,7 +264,7 @@ func (r *RTPPacketReader) UpdateReader(reader RTPReader) {
 		s.Sess.rtpConn.SetReadDeadline(time.Now())
 	}
 	if s, ok := r.reader.(*RTPSessionWebrtc); ok {
-		_ = s.Sess.StopRTP(1, -time.Nanosecond)
+		_ = s.Sess.interruptRTPRead()
 	}
 	r.reader = reader
 	// TODO we need to make sure that current Audio Reading is really stopped before updating

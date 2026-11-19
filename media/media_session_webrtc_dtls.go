@@ -52,6 +52,11 @@ type webrtcSessionState struct {
 	// leftRunning is the negotiation FinalizeWithin left running. It guards
 	// itself.
 	leftRunning negotiationLeftRunning
+
+	// deadlines records the RTP deadlines StopRTP, StartRTP and
+	// SetRTPDeadline last asked for. CarryRTPDeadlines hands them to the
+	// session of the ICE generation that replaces this one. It guards itself.
+	deadlines rtpDeadlines
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is

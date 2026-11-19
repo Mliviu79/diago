@@ -758,8 +758,13 @@ func (m *MediaSessionWebrtc) Close() error {
 	return errors.Join(muxErr, agentErr, m.closeICESocket())
 }
 
-func (m *MediaSessionWebrtc) StartRTP(rw int8) error { return m.StopRTP(rw, 0) }
+// StartRTP clears the read deadline StopRTP set, for the same values of rw.
+func (m *MediaSessionWebrtc) StartRTP(rw int8) error { return m.startRTP(rw) }
 
+// StopRTP sets the deadline of the session's RTP reads to duration from now,
+// when rw has bit 1 set or is zero, and does nothing for any other rw. As on
+// a MediaSession, no duration stops the reads at once; StartRTP is what
+// clears the deadline. SetRTPDeadline also reaches the write side.
 func (m *MediaSessionWebrtc) StopRTP(rw int8, duration time.Duration) error {
 	m.mu.Lock()
 	mux := m.mux
@@ -767,12 +772,9 @@ func (m *MediaSessionWebrtc) StopRTP(rw int8, duration time.Duration) error {
 	if mux == nil {
 		return fmt.Errorf("WebRTC RTP transport is not initialized")
 	}
-	deadline := time.Time{}
-	if duration != 0 {
-		deadline = time.Now().Add(duration)
-	}
+	deadline := time.Now().Add(duration)
 	if rw&1 != 0 || rw == 0 {
-		return mux.rtp.SetReadDeadline(deadline)
+		return m.setRTPDeadline(mux, 1, deadline)
 	}
 	return nil
 }
