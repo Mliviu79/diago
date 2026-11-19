@@ -695,10 +695,14 @@ func (dg *Diago) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 	return d, med, nil
 }
 
-// InviteBridge makes outgoing call leg and does bridging.
-// Outgoing session will be added into bridge on answer
-// If bridge has Originator (first participant) it will be used for creating outgoing call leg as in B2BUA
-// When bridge is provided then this call will be bridged with any participant already present in bridge
+// InviteBridge makes an outgoing call leg and bridges it. The leg's media is
+// added to bridge once the INVITE is answered, before the ACK, and is bridged
+// with any party already in it; a call the bridge refuses is acknowledged and
+// ended with a BYE. The leg is invited as Invite would invite it: the bridge's
+// parties play no part in it. To create the leg from an originating leg, as
+// in a B2BUA, pass that leg in InviteOptions.Originator: the INVITE then
+// takes its From and offers only the codecs of its offer, so the bridge need
+// not transcode.
 func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Bridge, opts InviteOptions) (d *DialogClientSession, med *DialogMedia, err error) {
 	d, err = dg.NewDialog(recipient, NewDialogOptions{})
 	if err != nil {
