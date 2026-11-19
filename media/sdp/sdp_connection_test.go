@@ -62,8 +62,8 @@ func TestConnectionInformationSessionLevel(t *testing.T) {
 // section, so with several m= lines the last c= may belong to some other stream.
 // ConnectionInformation keeps answering such a body with its first c=, the
 // session level one here, and never with the video section's address.
-// MediaDescription rejects the body, which is what stops a media session from
-// being set up on it.
+// MediaDescription rejects the body: a body of several m= lines is read by
+// section, with UnmarshalSections, where each stream has its own c=.
 func TestConnectionInformationMultipleMediaLines(t *testing.T) {
 	sd := SessionDescription{}
 	require.NoError(t, Unmarshal(offer(
@@ -139,6 +139,13 @@ func TestUnmarshalMalformedNoPanic(t *testing.T) {
 			_ = Unmarshal(body, &sd)
 			_, _ = sd.ConnectionInformation()
 			_, _ = sd.MediaDescription("audio")
+
+			sections, err := UnmarshalSections(body)
+			if err == nil {
+				for i := range sections.Media {
+					_, _ = sections.Description(i).ConnectionInformation()
+				}
+			}
 		})
 	}
 }

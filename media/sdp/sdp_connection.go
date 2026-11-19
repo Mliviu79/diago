@@ -15,7 +15,8 @@ package sdp
 // With more than one m= line the last c= may belong to another stream, so the
 // first is returned: RFC 4566 section 5 fixes the order of the lines, which
 // makes it the session level c= whenever the body has one, the default for
-// every stream without its own.
+// every stream without its own. A body read by section does bind each c=:
+// see Sections.Description.
 func (sd SessionDescription) connectionValue() (string, bool) {
 	values := sd.Values("c")
 	if len(values) == 0 {
