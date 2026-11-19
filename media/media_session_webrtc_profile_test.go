@@ -192,6 +192,7 @@ func TestWebrtcProfileRemoteSDPRefusesOtherTransports(t *testing.T) {
 				m := newSetupRoleWebrtcSession(ctx, t, testdata.ServerCertificate(), nil)
 				err := m.RemoteSDP(ctx, sdpWithProto(t, body, tc.proto), offered)
 				require.ErrorContains(t, err, `unsupported WebRTC audio transport "`+tc.proto+`"`)
+				require.ErrorIs(t, err, ErrNoCommonMedia)
 			})
 		}
 	}

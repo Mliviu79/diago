@@ -232,7 +232,7 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 		require.True(t, found)
 
 		err = answerer.RemoteSDP(ctx, []byte(session+"\r\n"+webrtcStreamsVideo+"\r\n"), false)
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrNoCommonMedia)
 	})
 
 	t.Run("a_truncated_m=_line", func(t *testing.T) {
@@ -355,8 +355,8 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 }
 
 // TestMediaSessionWebrtcRefusesAnOfferWithoutAnAudioStreamToCarry pins the
-// offers no audio stream of which can carry the call: they are refused, and
-// the session answers nothing.
+// offers no audio stream of which can carry the call: they are refused with
+// ErrNoCommonMedia, and the session answers nothing.
 func TestMediaSessionWebrtcRefusesAnOfferWithoutAnAudioStreamToCarry(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -387,7 +387,7 @@ func TestMediaSessionWebrtcRefusesAnOfferWithoutAnAudioStreamToCarry(t *testing.
 			require.NoError(t, err)
 
 			offer := withStreamsAround(t, tc.rewrite(t, alone), nil, []string{webrtcStreamsVideo})
-			require.Error(t, answerer.RemoteSDP(ctx, offer, false), "the offer\n%s", offer)
+			require.ErrorIs(t, answerer.RemoteSDP(ctx, offer, false), ErrNoCommonMedia, "the offer\n%s", offer)
 			_, err = answerer.LocalSDP(ctx, true)
 			require.Error(t, err, "an answer to the refused offer")
 		})

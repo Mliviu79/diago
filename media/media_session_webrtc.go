@@ -440,6 +440,14 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // controlled one for the peer's, unless exactly one of the two is a lite
 // agent, the peer's being the one whose description carries a=ice-lite: the
 // full agent then controls whichever side offered (RFC 8445 section 6.1.1).
+//
+// A description this session cannot meet is refused with an error that wraps
+// ErrNoCommonMedia, when it has no audio stream or carries it over a transport
+// outside the RTP profile family, or ErrNoCommonCodec, when none of its audio
+// formats is one of ours. An a=candidate line the ICE stack cannot read is
+// left out and the candidates of the other lines are used; a description left
+// with no candidate is refused with an *ICEError that matches
+// ErrICEConnection.
 func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered bool) error {
 	var desc webrtcsdp.SessionDescription
 	if err := desc.Unmarshal(body); err != nil {
@@ -447,12 +455,12 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	}
 	md := webRTCAudioStream(&desc)
 	if md == nil {
-		return fmt.Errorf("remote WebRTC SDP has no audio media description")
+		return fmt.Errorf("remote WebRTC SDP has no audio media description: %w", ErrNoCommonMedia)
 	}
 	proto := strings.Join(md.MediaName.Protos, "/")
 	prof, ok := parseRTPProfile(proto)
 	if !ok {
-		return fmt.Errorf("unsupported WebRTC audio transport %q", proto)
+		return fmt.Errorf("unsupported WebRTC audio transport %q: %w", proto, ErrNoCommonMedia)
 	}
 	if _, ok := webRTCAttribute(desc.Attributes, md.Attributes, "rtcp-mux"); !ok {
 		return fmt.Errorf("remote WebRTC SDP requires rtcp-mux")
@@ -486,7 +494,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.mu.Unlock()
 	common := commonWebRTCCodecs(remoteCodecs, localCodecs)
 	if len(common) == 0 {
-		return fmt.Errorf("remote has no supported audio codec, remote=%v local=%v", remoteCodecs, localCodecs)
+		return fmt.Errorf("remote has no supported audio codec, remote=%v local=%v: %w", remoteCodecs, localCodecs, ErrNoCommonCodec)
 	}
 
 	remoteCandidates := make([]ice.Candidate, 0, 4)
@@ -496,7 +504,8 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		}
 		candidate, candidateErr := ice.UnmarshalCandidate(attr.Value)
 		if candidateErr != nil {
-			return &ICEError{Phase: ICEPhaseConnection, Err: fmt.Errorf("parse remote candidate: %w", candidateErr)}
+			skipRemoteCandidate(attr.Value, candidateErr)
+			continue
 		}
 		if candidate.Component() == ice.ComponentRTP {
 			remoteCandidates = append(remoteCandidates, candidate)

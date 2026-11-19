@@ -8,12 +8,13 @@ import (
 	"fmt"
 )
 
-// Negotiation failures returned, wrapped, by [MediaSession.RemoteSDP]. Each one
-// means the remote SDP and our configuration have no overlap, which is a
-// property of the peer's SDP and not a fault in this process. They are exported
-// so a caller can tell the two apart with errors.Is: an offer we cannot meet
-// should be answered with 488 Not Acceptable Here, while an internal error
-// should not. The wrapping text carries the specifics.
+// Negotiation failures returned, wrapped, by [MediaSession.RemoteSDP] and
+// [MediaSessionWebrtc.RemoteSDP]. Each one means the remote SDP and our
+// configuration have no overlap, which is a property of the peer's SDP and not
+// a fault in this process. They are exported so a caller can tell the two apart
+// with errors.Is: an offer we cannot meet should be answered with 488 Not
+// Acceptable Here, while an internal error should not. The wrapping text
+// carries the specifics.
 var (
 	// ErrNoCommonCodec means the audio formats do not intersect: the peer
 	// offered no codec we support, or none that could be parsed.
@@ -22,7 +23,8 @@ var (
 	// ErrNoCommonCrypto means the media is negotiable but the keying is not.
 	// The peer asked for secure RTP and no SRTP context could be built from what
 	// it offered. Kept apart from ErrNoCommonCodec because a codec mismatch is a
-	// capability gap while this is a security policy gap.
+	// capability gap while this is a security policy gap. Only
+	// [MediaSession.RemoteSDP] returns it.
 	ErrNoCommonCrypto = errors.New("no common crypto")
 
 	// ErrNoCommonMedia means the m= line itself is unusable before codecs are
