@@ -7,11 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	mrand "math/rand/v2"
 	"net"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/diago/media/sdp"
@@ -479,46 +477,17 @@ func (d *DialogClientSession) ack(ctx context.Context, remoteTarget sip.Uri, bod
 	return nil
 }
 
-// ReInvite sends new invite based on current media session
+// ReInvite sends new invite based on current media session, and has the media
+// take the answer. It waits, bounded by ctx, for a re-INVITE in progress to
+// end, and sends its own again when it is answered 491, after the wait RFC
+// 3261 section 14.1 gives. A 2xx without Contact, which is not acknowledged,
+// and a 2xx without SDP are errors, and leave the media as it was.
 func (d *DialogClientSession) ReInvite(ctx context.Context) error {
 	mediaHanshaker := d.mediaHanshakerLocked()
 	if mediaHanshaker == nil {
 		return fmt.Errorf("dialog media is not initialized")
 	}
-	// One re-INVITE at a time: ours waits for one of the peer's to end, and
-	// one of the peer's arriving meanwhile is answered 491.
-	endUpdate, err := d.beginOwnMediaUpdate(ctx, &d.Dialog)
-	if err != nil {
-		return err
-	}
-	defer endUpdate()
-	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, "")
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			d.dialogCallbacks.abortMedia()
-		}
-	}()
-	contact := d.RemoteContact()
-
-	req := sip.NewRequest(sip.INVITE, contact.Address)
-	req.AppendHeader(d.InviteRequest.Contact())
-	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	req.SetBody(sdp)
-
-	res, err := d.reInviteDo(ctx, req)
-	if err != nil {
-		return err
-	}
-	if err := mediaHanshaker.onRemoteSDP(ctx, res.Body(), true); err != nil {
-		return err
-	}
-	d.setRemoteContact(res.Contact())
-	committed = true
-	return nil
+	return d.ownReInvite(mediaHanshaker, "").run(ctx)
 }
 
 func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) (*sip.Response, error) {
@@ -542,12 +511,11 @@ func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) 
 			//          of 10 ms.
 
 			if res.StatusCode == sip.StatusRequestPending {
-				select {
-				case <-time.After(time.Duration(2000+mrand.IntN(200)*10) * time.Millisecond):
-					continue
-				case <-ctx.Done():
-					return nil, ctx.Err()
+				// We generated the Call-ID.
+				if err := reInviteRetryWait(ctx, true); err != nil {
+					return nil, err
 				}
+				continue
 			}
 
 			return nil, sipgo.ErrDialogResponse{
@@ -556,7 +524,11 @@ func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) 
 		}
 
 		// Now do ACK on new Contact
-		if err := d.ack(ctx, res.Contact().Address, nil); err != nil {
+		cont := res.Contact()
+		if cont == nil {
+			return res, fmt.Errorf("reinvite: 2xx without Contact: %w", sipgo.ErrDialogInviteNoContact)
+		}
+		if err := d.ack(ctx, cont.Address, nil); err != nil {
 			return res, err
 		}
 
@@ -786,38 +758,5 @@ func (d *DialogClientSession) reInviteMode(
 	mediaHanshaker mediaHanshaker,
 	mode string,
 ) error {
-	// One re-INVITE at a time: ours waits for one of the peer's to end, and
-	// one of the peer's arriving meanwhile is answered 491.
-	endUpdate, err := d.beginOwnMediaUpdate(ctx, &d.Dialog)
-	if err != nil {
-		return err
-	}
-	defer endUpdate()
-	sdp, err := mediaHanshaker.onLocalSDP(ctx, false, mode)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			d.dialogCallbacks.abortMedia()
-		}
-	}()
-	contact := d.RemoteContact()
-
-	req := sip.NewRequest(sip.INVITE, contact.Address)
-	req.AppendHeader(d.InviteRequest.Contact())
-	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	req.SetBody(sdp)
-
-	res, err := d.reInviteDo(ctx, req)
-	if err != nil {
-		return err
-	}
-	if err := mediaHanshaker.onRemoteSDP(ctx, res.Body(), true); err != nil {
-		return err
-	}
-	d.setRemoteContact(res.Contact())
-	committed = true
-	return nil
+	return d.ownReInvite(mediaHanshaker, mode).run(ctx)
 }
