@@ -284,9 +284,15 @@ func (s *sessionState) terminatePeerReInviteLocked(ctx context.Context) error {
 // RFC 3261 section 15.1.2 recommends, and that is no failure to report: only
 // what sending the 487 returned is. Media that still waits for the keys of an
 // earlier update cannot take this one now: RFC 3261 section 14.2 lets such a
-// request be retried after a 491, which is no failure to report either. Any
-// other refusal is answered 400 and returned together with what sending it
-// returned.
+// request be retried after a 491, which is no failure to report either.
+//
+// A session description the media read and cannot take is answered 488 with a
+// Warning, see notAcceptableHere, and any other refusal, as of a body that is
+// no session description, 400: the request "could not be understood due to
+// malformed syntax" (RFC 3261 section 21.4.1). Both are returned together
+// with what sending the response returned. Whatever the answer, the session
+// stays as it was: RFC 3264 section 4 has a rejected offer leave it in "the
+// state prior to the offer".
 func (s *sessionState) refusePeerReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, mediaErr error) error {
 	if errors.Is(mediaErr, errMediaClosed) {
 		_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated", nil))
@@ -295,6 +301,10 @@ func (s *sessionState) refusePeerReInvite(ctx context.Context, req *sip.Request,
 	if errors.Is(mediaErr, errMediaUpdateInProgress) {
 		_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 		return err
+	}
+	if res, ok := notAcceptableHere(req, mediaErr); ok {
+		_, err := s.respondPeerReInvite(ctx, tx, res)
+		return errors.Join(mediaErr, err)
 	}
 	_, err := s.respondPeerReInvite(ctx, tx, sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
 	return errors.Join(mediaErr, err)
