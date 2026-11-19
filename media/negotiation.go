@@ -47,12 +47,17 @@ const (
 // checkRTPPort refuses an audio port that cannot carry media, so that it is
 // never latched as the remote address.
 //
-// Port 0 is not a parse accident, it has a meaning: the stream is rejected
-// (RFC 3264 section 6). It also absorbs every unparseable port, because
-// MediaDescription discards strconv's error and leaves the zero value. Both
-// readings agree there is no audio to carry. Accepting it built a session
-// pointed at nothing, which fails silently on first write, so the call answered
-// and then sat mute.
+// Port 0 is not a parse accident, it has a meaning, and RFC 3264 gives it one
+// in each direction. In an offer the stream "is offered but MUST NOT be used"
+// (section 5.1), which is also how a stream is removed (section 8.2), and it
+// "MUST be marked with port zero in the answer". In an answer the stream is
+// rejected and neither side may generate media or RTCP for it (section 6).
+// Port 0 also absorbs every unparseable port, because MediaDescription discards
+// strconv's error and leaves the zero value. All readings agree there is no
+// audio to carry, and this session carries nothing else, so the description is
+// refused as a whole. Accepting it built a session pointed at nothing: an offer
+// was answered with a live port, RTP was addressed to port 0 and RTCP to port
+// 1, so the call answered and then sat mute.
 func checkRTPPort(port int) error {
 	if port <= 0 || port > 65535 {
 		return fmt.Errorf("%w: audio media port is not usable port=%d", ErrNoCommonMedia, port)
