@@ -25,6 +25,11 @@ type bundledAudio struct {
 	// mid is the RTP header extension the offer maps to the tag of a grouped
 	// audio stream: see midExtension. Its zero value is no extension.
 	mid midExtension
+
+	// muxOnly is set when the audio section of the offer, listed in a BUNDLE
+	// group, carries a=rtcp-mux-only. The answer to that offer repeats the
+	// line: see rtcpMuxOnlyAttribute.
+	muxOnly bool
 }
 
 // groupAttribute is the name of the session-level attribute that groups media
@@ -95,7 +100,11 @@ func webRTCBundledAudio(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.Med
 	if webRTCBundleGroup(desc, tag) == nil {
 		return bundledAudio{}
 	}
-	return bundledAudio{grouped: true, mid: webRTCMIDExtension(desc.Attributes, audio.Attributes, tag)}
+	return bundledAudio{
+		grouped: true,
+		mid:     webRTCMIDExtension(desc.Attributes, audio.Attributes, tag),
+		muxOnly: webRTCRTCPMuxOnly(audio),
+	}
 }
 
 // ownAudioTag is the identification-tag our own first offer gives its audio
@@ -150,7 +159,9 @@ func (o offeredStreams) bundleGroupLines() []string {
 
 // bundledAudioLines returns the lines that identify the audio section of an
 // SDP of ours written around the stream list: its a=mid line, and the
-// a=extmap line of the tag's header extension when the offer mapped one.
+// a=extmap line of the tag's header extension when the offer mapped one. The
+// a=rtcp-mux-only line of an answer to a bundled offer that had it follows
+// them: see rtcpMuxOnlyLines.
 //
 // The a=mid line is the offer's (RFC 5888 section 9.1), and an audio stream
 // the offer gave no tag has none: RFC 8829 section 5.3.1 has each m= section
@@ -162,7 +173,7 @@ func (o offeredStreams) bundledAudioLines() []string {
 	if tag := o.audioTag(); tag != "" {
 		lines = append(lines, midLine(tag))
 	}
-	return append(lines, o.bundle.mid.extmapLines()...)
+	return slices.Concat(lines, o.bundle.mid.extmapLines(), o.rtcpMuxOnlyLines())
 }
 
 // hasCandidate reports whether attrs, the attributes of one media section,

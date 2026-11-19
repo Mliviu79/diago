@@ -353,6 +353,11 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // any of its streams without an a=mid line, which groups none (RFC 5888
 // section 6). Before any offer of the peer the audio stream has the tag 0 in
 // a group of its own, or neither line when Config.OfferWithoutBundle is set.
+//
+// The answer to an offer whose audio stream is in a BUNDLE group and carries
+// a=rtcp-mux-only repeats that line (RFC 8843 section 9.3.1.2). No other body
+// has it: not the answer to a stream offered outside a group (RFC 8858 section
+// 4.3), and not an offer of ours.
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

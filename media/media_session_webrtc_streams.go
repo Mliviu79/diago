@@ -154,7 +154,8 @@ func (o offeredStreams) ofAnOffer() bool {
 // localStreams returns the stream list the body LocalSDP builds is written
 // around, where answered says the body answers the offer RemoteSDP accepted:
 // that offer's list, which is a staged one on a negotiated session. An offer
-// of ours is written around the list the session has committed to.
+// of ours is written around the list the session has committed to, as an
+// offer has it: see offeredStreams.inOwnOffer.
 //
 // A session that has committed to no offer of the peer writes around the list
 // of our own first offer, in the form Config.OfferWithoutBundle chooses. The
@@ -168,7 +169,20 @@ func (m *MediaSessionWebrtc) localStreams(answered bool) offeredStreams {
 	if !m.streams.current.ofAnOffer() {
 		return ownOfferStreams(m.Config.OfferWithoutBundle)
 	}
-	return m.streams.current
+	if answered {
+		return m.streams.current
+	}
+	return m.streams.current.inOwnOffer()
+}
+
+// inOwnOffer returns the list of an offer of the peer as an offer of ours is
+// written around it: with the streams and the identification of that offer,
+// and without what only the answer to it repeats, which is its
+// a=rtcp-mux-only line (see rtcpMuxOnlyAttribute). The list itself is left as
+// it is.
+func (o offeredStreams) inOwnOffer() offeredStreams {
+	o.bundle.muxOnly = false
+	return o
 }
 
 // forkedStreams returns the stream list of this session, for Fork to hand to
