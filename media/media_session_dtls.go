@@ -57,9 +57,7 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	if setup == "" {
 		return fmt.Errorf("Empty a=setup value attribute for dtls")
 	}
-	switch strings.ToLower(setup) {
-	case dtlsSetupActive, dtlsSetupPassive, dtlsSetupActPass:
-	default:
+	if !knownDTLSSetup(setup) {
 		return fmt.Errorf("unknown setup value %q", setup)
 	}
 	// The peer's value is recorded and not acted on directly. Our own role

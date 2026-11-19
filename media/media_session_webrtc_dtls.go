@@ -16,6 +16,11 @@ type webrtcSessionState struct {
 	// DTLS association of this ICE generation was negotiated with, as
 	// fingerprintSet renders it.
 	remoteFingerprints []string
+
+	// offeredProto is the m= transport of the last offer RemoteSDP accepted,
+	// as the peer wrote it, empty before any. The answer to that offer
+	// repeats it.
+	offeredProto string
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is

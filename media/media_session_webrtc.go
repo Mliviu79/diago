@@ -307,15 +307,16 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 }
 
 // LocalSDP returns a complete, non-trickle WebRTC SDP. answered controls the
-// DTLS setup attribute: an offer is actpass; an answer uses the role selected
-// while parsing the remote offer.
+// DTLS setup attribute: an offer is actpass, unless Config.DTLS.SDPSetupRole
+// chooses another value; an answer uses the role selected while parsing the
+// remote offer. An answer also repeats the m= transport of that offer.
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.agent == nil || len(m.localCandidates) == 0 {
 		return nil, fmt.Errorf("webrtc media session is not initialized")
 	}
-	setup := "actpass"
+	setup := m.localDTLSSetup(answered)
 	if answered {
 		if m.localSetup == "" {
 			return nil, fmt.Errorf("remote WebRTC offer must be parsed before creating an answer")
@@ -335,10 +336,10 @@ func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte,
 		mode = m.pendingMode
 		rtcpReducedSize = m.pendingRTCPReducedSize
 	}
-	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode)
+	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode, m.localRTPProfile(answered))
 }
 
-func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string) ([]byte, error) {
+func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string, profile string) ([]byte, error) {
 	fingerprints, err := m.localFingerprintLines()
 	if err != nil {
 		return nil, fmt.Errorf("DTLS certificate fingerprint: %w", err)
@@ -375,7 +376,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		formats = append(formats, strconv.Itoa(int(codec.PayloadType)))
 	}
 	lines = append(lines,
-		fmt.Sprintf("m=audio %d UDP/TLS/RTP/SAVPF %s", candidate.Port(), strings.Join(formats, " ")),
+		fmt.Sprintf("m=audio %d %s %s", candidate.Port(), profile, strings.Join(formats, " ")),
 		fmt.Sprintf("c=IN %s %s", addressType, connectionIP),
 		"a=mid:0",
 		"a=rtcp-mux",
@@ -424,14 +425,15 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		return fmt.Errorf("remote WebRTC SDP has no audio media description")
 	}
 	proto := strings.Join(md.MediaName.Protos, "/")
-	if !strings.EqualFold(proto, "UDP/TLS/RTP/SAVPF") && !strings.EqualFold(proto, "UDP/TLS/RTP/SAVP") {
+	prof, ok := parseRTPProfile(proto)
+	if !ok {
 		return fmt.Errorf("unsupported WebRTC audio transport %q", proto)
 	}
 	if _, ok := webRTCAttribute(desc.Attributes, md.Attributes, "rtcp-mux"); !ok {
 		return fmt.Errorf("remote WebRTC SDP requires rtcp-mux")
 	}
 	_, remoteRTCPReducedSize := webRTCAttribute(desc.Attributes, md.Attributes, "rtcp-rsize")
-	remoteRTCPReducedSize = remoteRTCPReducedSize && strings.EqualFold(proto, "UDP/TLS/RTP/SAVPF")
+	remoteRTCPReducedSize = remoteRTCPReducedSize && prof.feedback
 	remoteUfrag, ok := webRTCAttribute(desc.Attributes, md.Attributes, "ice-ufrag")
 	if !ok || remoteUfrag == "" {
 		return fmt.Errorf("remote WebRTC SDP has no ICE username fragment")
@@ -489,25 +491,11 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		}
 	}
 	remoteSetup := strings.ToLower(setup)
-	localDTLSClient := false
-	localSetup := ""
-	if offered {
-		switch remoteSetup {
-		case "passive":
-			localDTLSClient = true
-			localSetup = "active"
-		case "active":
-			localSetup = "passive"
-		default:
-			return fmt.Errorf("invalid DTLS setup role %q in answer", setup)
-		}
-	} else {
-		if remoteSetup != "actpass" && remoteSetup != "passive" {
-			return fmt.Errorf("invalid DTLS setup role %q in offer", setup)
-		}
-		localDTLSClient = true
-		localSetup = "active"
+	localSetup, err := m.dtlsSetupAgainst(setup, offered)
+	if err != nil {
+		return err
 	}
+	localDTLSClient := localSetup == dtlsSetupActive
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -542,6 +530,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		}
 		m.pendingMode = negotiateMediaDirection(remoteMode, localPreference)
 		m.pendingRTCPReducedSize = remoteRTCPReducedSize
+		m.offerAccepted(proto, offered)
 		return nil
 	}
 	for _, candidate := range remoteCandidates {
@@ -555,6 +544,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.remoteFingerprint = fingerprints[0].Value
 	m.remoteFingerprints = fingerprintSet(fingerprints)
 	m.rtcpReducedSize = remoteRTCPReducedSize
+	m.offerAccepted(proto, offered)
 	m.filterCodecs = common
 	m.Codecs = slices.Clone(common)
 	m.codec, _ = CodecAudioFromList(common)
