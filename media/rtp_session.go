@@ -68,6 +68,9 @@ type RTPSession struct {
 	sourceLock        bool
 	sourceLockPackets int
 	sourceLockAddr    *net.UDPAddr
+	// sourceLockSeq is the sequence number of the last packet counted while
+	// the source is learned in sequence.
+	sourceLockSeq uint16
 }
 
 // Some of fields here are exported (as readonly) intentionally
@@ -165,6 +168,7 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 	fork.sourceLock = s.sourceLock
 	if udpAddrEqual(s.Sess.Laddr, sess.Laddr) && udpAddrEqual(s.Sess.Raddr, sess.Raddr) {
 		fork.sourceLockPackets = s.sourceLockPackets
+		fork.sourceLockSeq = s.sourceLockSeq
 		if s.sourceLockAddr != nil {
 			addr := *s.sourceLockAddr
 			fork.sourceLockAddr = &addr
@@ -394,6 +398,14 @@ func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
 
 	if s.sourceLockAddr != nil {
 		return s.sourceLockAddr.IP.Equal(fromAddr.IP) && s.sourceLockAddr.Port == fromAddr.Port && s.sourceLockAddr.Zone == fromAddr.Zone
+	}
+
+	// The check below compares with the last packet read. In a session that
+	// has read before, a fork toward another peer, that is the previous
+	// peer's last packet, so its source is learned from packets in sequence
+	// with each other.
+	if s.learnsSourceInSequence() {
+		return s.learnSourceInSequence(pkt, fromAddr)
 	}
 
 	if s.readStats.lastSeq.seqNum+1 != pkt.SequenceNumber {
