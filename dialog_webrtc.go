@@ -136,6 +136,9 @@ func (d *DialogWebrtc) registerDialogCallbacks(c *dialogCallbacks) {
 }
 
 func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode string) ([]byte, error) {
+	if sess, ok := d.firstExchangeSession(); ok {
+		return firstLocalSDP(ctx, sess, answered, mode)
+	}
 	d.mu.Lock()
 	current := d.mediaSession
 	pending := d.pendingMediaSession
@@ -182,6 +185,9 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 }
 
 func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
+	if sess, ok := d.firstExchangeSession(); ok {
+		return firstRemoteSDP(ctx, sess, remoteSDP, offered)
+	}
 	if remoteSDP == nil {
 		d.noteOfferRequest(offered)
 		return nil
@@ -240,6 +246,9 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 }
 
 func (d *DialogWebrtc) onFinalize(ctx context.Context) error {
+	if sess, ok := d.firstExchangeSession(); ok {
+		return d.finalizeFirstExchange(ctx, sess)
+	}
 	d.mu.Lock()
 	pending := d.pendingMediaSession
 	current := d.mediaSession
@@ -291,6 +300,11 @@ func (d *DialogWebrtc) abortPendingMediaSession() {
 	d.pendingMediaSession = nil
 	d.offerRequested = false
 	d.mu.Unlock()
+	if pending == nil {
+		// No exchange is in progress, or the transport of the media's first
+		// exchange was closed with it: there is no transport to roll back.
+		return
+	}
 	if pending == current {
 		current.Rollback()
 	} else if pending != nil {

@@ -464,21 +464,32 @@ func TestDialogServerAnswerContextEnded(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		late   bool
-		answer func(ctx context.Context, d *DialogServerSession) (*DialogMedia, error)
+		webrtc bool
+		answer func(ctx context.Context, d *DialogServerSession) (MediaHandle, error)
 	}{
-		{name: "AnswerContext", answer: func(ctx context.Context, d *DialogServerSession) (*DialogMedia, error) {
+		{name: "AnswerContext", answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
 			return d.AnswerContext(ctx)
 		}},
-		{name: "AnswerOptions", answer: func(ctx context.Context, d *DialogServerSession) (*DialogMedia, error) {
+		{name: "AnswerOptions", answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
 			return d.AnswerOptions(ctx, AnswerOptions{})
 		}},
-		{name: "AnswerLateContext", late: true, answer: func(ctx context.Context, d *DialogServerSession) (*DialogMedia, error) {
+		{name: "AnswerLateContext", late: true, answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
 			return d.AnswerLateContext(ctx)
+		}},
+		{name: "AnswerWebrtcContext", webrtc: true, answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
+			return d.AnswerWebrtcContext(ctx, webrtcAnswerOptions())
+		}},
+		{name: "AnswerWebrtcLateContext", late: true, webrtc: true, answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
+			return d.AnswerWebrtcLateContext(ctx, webrtcAnswerOptions())
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var offer []byte
-			if !tc.late {
+			switch {
+			case tc.late:
+			case tc.webrtc:
+				_, offer = newWebrtcPeerOffer(t)
+			default:
 				offer = newMediaSessionForTest(t).LocalSDP(false)
 			}
 			inviteTx := &firstResponseTx{byeServerTx: newByeServerTx(), first: make(chan *sip.Response, 1)}
@@ -502,21 +513,36 @@ func TestDialogServerAnswerContextEnded(t *testing.T) {
 	}
 }
 
-// TestDialogServerAnswerContextWithoutOffer pins that AnswerContext refuses to
-// answer an INVITE that carried no offer, and sends nothing: such an INVITE
-// is answered with AnswerLateContext, whose 2xx carries our offer.
+// TestDialogServerAnswerContextWithoutOffer pins that AnswerContext and
+// AnswerWebrtcContext refuse to answer an INVITE that carried no offer, and
+// send nothing: such an INVITE is answered with AnswerLateContext or
+// AnswerWebrtcLateContext, whose 2xx carries our offer.
 func TestDialogServerAnswerContextWithoutOffer(t *testing.T) {
-	d, inviteTx, _ := newLateOfferDialog(t, MediaConfig{
-		Codecs: []media.Codec{media.CodecAudioUlaw},
-		bindIP: net.IPv4(127, 0, 0, 1),
-	})
-	med, err := d.AnswerContext(t.Context())
-	require.ErrorIs(t, err, errNoOfferInInvite)
-	assert.Nil(t, med)
-	select {
-	case res := <-inviteTx.first:
-		t.Errorf("a %d was sent", res.StatusCode)
-	default:
+	for _, tc := range []struct {
+		name   string
+		answer func(ctx context.Context, d *DialogServerSession) (MediaHandle, error)
+	}{
+		{name: "AnswerContext", answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
+			return d.AnswerContext(ctx)
+		}},
+		{name: "AnswerWebrtcContext", answer: func(ctx context.Context, d *DialogServerSession) (MediaHandle, error) {
+			return d.AnswerWebrtcContext(ctx, webrtcAnswerOptions())
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, inviteTx, _ := newLateOfferDialog(t, MediaConfig{
+				Codecs: []media.Codec{media.CodecAudioUlaw},
+				bindIP: net.IPv4(127, 0, 0, 1),
+			})
+			med, err := tc.answer(t.Context(), d)
+			require.ErrorIs(t, err, errNoOfferInInvite)
+			assert.Nil(t, med)
+			select {
+			case res := <-inviteTx.first:
+				t.Errorf("a %d was sent", res.StatusCode)
+			default:
+			}
+		})
 	}
 }
 
