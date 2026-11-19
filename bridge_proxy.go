@@ -25,12 +25,21 @@ func bridgeCodecErr(c1, c2 media.Codec) error {
 	return nil
 }
 
-// bridgeMediaSource is what a Bridge keeps of the DialogMedia a
-// BridgeAudioMedia was taken from by AddDialogMedia. It is zero for audio
-// added any other way.
+// bridgeDialog is the media of a call a BridgeAudioMedia was taken from:
+// a DialogMedia or a DialogWebrtc.
+type bridgeDialog interface {
+	// NegotiatedProps returns the codec of the media session in use.
+	NegotiatedProps() (MediaProps, error)
+	// addMediaUpdateHook has f called after every media update installed.
+	addMediaUpdateHook(f func()) (remove func())
+}
+
+// bridgeMediaSource is what a Bridge keeps of the call media a
+// BridgeAudioMedia was taken from by AddDialogMedia or AddDialogWebrtc. It is
+// zero for audio added any other way.
 type bridgeMediaSource struct {
-	// dialogMedia is told of media updates, and holds the codec in use.
-	dialogMedia *DialogMedia
+	// dialog is told of media updates, and holds the codec in use.
+	dialog bridgeDialog
 	// dtmfReader and dtmfWriter are the DTMF interceptors of a bridge that
 	// passes DTMF. They read and write the dialog's audio and are not set on
 	// the dialog.
@@ -58,6 +67,26 @@ func bridgeDTMFWriter(w *DTMFWriter) AudioWriterOption {
 	}
 }
 
+// bridgeWebrtcDTMFReader sets r up as WithAudioReaderWebrtcDTMF does, over
+// the dialog's audio reader, and leaves the dialog that reader.
+func bridgeWebrtcDTMFReader(r *DTMFReader) AudioReaderWebrtcOption {
+	return func(d *DialogWebrtc) error {
+		reader := d.audioReader
+		defer func() { d.audioReader = reader }()
+		return WithAudioReaderWebrtcDTMF(r)(d)
+	}
+}
+
+// bridgeWebrtcDTMFWriter sets w up as WithAudioWriterWebrtcDTMF does, over
+// the dialog's audio writer, and leaves the dialog that writer.
+func bridgeWebrtcDTMFWriter(w *DTMFWriter) AudioWriterWebrtcOption {
+	return func(d *DialogWebrtc) error {
+		writer := d.audioWriter
+		defer func() { d.audioWriter = writer }()
+		return WithAudioWriterWebrtcDTMF(w)(d)
+	}
+}
+
 // passDTMF has the keys read on from sent to the DTMF writer of to, for the
 // proxy about to start between them. A party without a DTMF writer of the
 // bridge's is sent none.
@@ -78,12 +107,15 @@ func passDTMF(from, to *BridgeAudioMedia) {
 // media session, which a media update replaces, and for audio added any other
 // way the one it joined with.
 func (m *BridgeAudioMedia) codec() media.Codec {
-	dm := m.source.dialogMedia
-	if dm == nil {
+	dialog := m.source.dialog
+	if dialog == nil {
 		return m.ReaderProps.Codec
 	}
-	p := MediaProps{}
-	dm.audioReaderProps(&p)
+	p, err := dialog.NegotiatedProps()
+	if err != nil {
+		// No media session: no codec to proxy in.
+		return media.Codec{}
+	}
 	return p.Codec
 }
 
@@ -104,8 +136,8 @@ func watchBridgeCodecs(m1, m2 *BridgeAudioMedia) (mismatch <-chan error, unwatch
 	}
 	var removes []func()
 	for _, m := range []*BridgeAudioMedia{m1, m2} {
-		if dm := m.source.dialogMedia; dm != nil {
-			removes = append(removes, dm.addMediaUpdateHook(check))
+		if dialog := m.source.dialog; dialog != nil {
+			removes = append(removes, dialog.addMediaUpdateHook(check))
 		}
 	}
 	check()

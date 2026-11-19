@@ -229,7 +229,11 @@ func (d *bridgeTestDialog) reInviteAlaw(t *testing.T, peer *net.UDPConn) {
 func bridgedMedias(b *Bridge) []*DialogMedia {
 	var medias []*DialogMedia
 	for _, m := range b.GetDialogs() {
-		medias = append(medias, m.source.dialogMedia)
+		var dm *DialogMedia
+		if d, ok := m.source.dialog.(*DialogMedia); ok {
+			dm = d
+		}
+		medias = append(medias, dm)
 	}
 	return medias
 }

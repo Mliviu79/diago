@@ -24,7 +24,8 @@ type BridgeAudioMedia struct {
 	StopRTP     func() error
 	StartRTP    func() error
 
-	// source is set for audio taken from a DialogMedia by AddDialogMedia.
+	// source is set for audio taken from a call's media by AddDialogMedia
+	// or AddDialogWebrtc.
 	source bridgeMediaSource
 }
 
@@ -109,7 +110,7 @@ func (b *Bridge) AddDialogMedia(m *DialogMedia) error {
 		med.Reader, med.Writer = &dtmfReader, &dtmfWriter
 		med.source.dtmfReader, med.source.dtmfWriter = &dtmfReader, &dtmfWriter
 	}
-	med.source.dialogMedia = m
+	med.source.dialog = m
 	med.StopRTP = func() error {
 		return m.StopRTP(0, 0)
 	}
@@ -145,28 +146,35 @@ func (b *Bridge) AddDialogWebrtc(m *DialogWebrtc) error {
 	}
 
 	if b.DTMFpass {
+		// As for a DialogMedia party: the interceptors are the proxy's own,
+		// not set on the dialog, and the proxy passes the keys read on one
+		// party to the writer of the other, see passDTMF.
 		dtmfReader := DTMFReader{}
-		med.Reader, err = m.AudioReader(WithAudioReaderWebrtcProps(&med.ReaderProps), WithAudioReaderWebrtcDTMF(&dtmfReader))
-		if err != nil {
+		if _, err := m.AudioReader(WithAudioReaderWebrtcProps(&med.ReaderProps), bridgeWebrtcDTMFReader(&dtmfReader)); err != nil {
 			return err
 		}
+		// Until a proxy passes them on, the keys read have nowhere to go.
+		dtmfReader.OnDTMF(func(rune) error { return nil })
 		dtmfWriter := DTMFWriter{}
-		med.Writer, err = m.AudioWriter(WithAudioWriterWebrtcProps(&med.WriterProps), WithAudioWriterWebrtcDTMF(&dtmfWriter))
-		if err != nil {
+		if _, err := m.AudioWriter(WithAudioWriterWebrtcProps(&med.WriterProps), bridgeWebrtcDTMFWriter(&dtmfWriter)); err != nil {
 			return err
 		}
-
-		dtmfReader.OnDTMF(func(dtmf rune) error {
-			return dtmfWriter.WriteDTMF(dtmf)
-		})
+		med.Reader, med.Writer = &dtmfReader, &dtmfWriter
+		med.source.dtmfReader, med.source.dtmfWriter = &dtmfReader, &dtmfWriter
 	}
+	med.source.dialog = m
 
+	// The dialog's own StopRTP sets the deadline on the transport in use,
+	// which ends a read waiting on a silent peer. Reads only, as the
+	// transport's StopRTP stops them: a write deadline is that of the
+	// candidate pair ICE selected, and would also stop its consent checks
+	// and the RTCP of the call.
 	med.StopRTP = func() error {
-		return m.mediaSession.StopRTP(0, 0)
+		return m.StopRTP(1, 0)
 	}
 
 	med.StartRTP = func() error {
-		return m.mediaSession.StartRTP(0)
+		return m.StartRTP(1, 0)
 	}
 
 	return b.AddAudioMedia(&med)

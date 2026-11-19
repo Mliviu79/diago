@@ -66,8 +66,15 @@ func finalizeWebrtcBoth(t *testing.T, a, b func(context.Context) error) {
 // DialogWebrtc the way an answer does. Both end with the test.
 func newWebrtcHandleCall(t *testing.T, peerCodecs []media.Codec) (*DialogWebrtc, *webrtcHandlePeer) {
 	t.Helper()
+	return newWebrtcHandleCallWith(t, []media.Codec{media.CodecAudioUlaw, media.CodecTelephoneEvent8000}, peerCodecs)
+}
+
+// newWebrtcHandleCallWith is newWebrtcHandleCall with the dialog's media
+// configured with localCodecs.
+func newWebrtcHandleCallWith(t *testing.T, localCodecs, peerCodecs []media.Codec) (*DialogWebrtc, *webrtcHandlePeer) {
+	t.Helper()
 	ctx := t.Context()
-	local := newLoopbackWebrtcSession(t, []media.Codec{media.CodecAudioUlaw, media.CodecTelephoneEvent8000})
+	local := newLoopbackWebrtcSession(t, localCodecs)
 	peer := &webrtcHandlePeer{sess: newLoopbackWebrtcSession(t, peerCodecs)}
 
 	offer, err := peer.sess.LocalSDP(ctx, false)
