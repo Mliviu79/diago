@@ -241,6 +241,15 @@ func (s *MediaSession) Init() error {
 		}
 	}
 
+	// A session that already holds a connection and is initialized again is
+	// rebinding: this is Fork followed by a new Laddr, which starts a new
+	// listener below. ExternalIP is the address the OLD socket was reachable on,
+	// so it cannot describe the new one and must be set again by the caller if it
+	// still applies.
+	if s.rtpConn != nil {
+		s.ExternalIP = nil
+	}
+
 	// Try to listen on this ports
 	if err := s.createListeners(&s.Laddr); err != nil {
 		return err
