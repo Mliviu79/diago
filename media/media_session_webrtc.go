@@ -132,6 +132,7 @@ func (m *MediaSessionWebrtc) Fork(ctx context.Context) (*MediaSessionWebrtc, err
 	m.mu.Unlock()
 
 	fork := &MediaSessionWebrtc{Codecs: codecs, Mode: mode, modePreference: modePreference}
+	fork.origin = m.sharedOrigin()
 	if err := fork.Init(ctx, conf, onICEStateChange); err != nil {
 		return nil, err
 	}
@@ -336,10 +337,10 @@ func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte,
 		mode = m.pendingMode
 		rtcpReducedSize = m.pendingRTCPReducedSize
 	}
-	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode, m.localRTPProfile(answered))
+	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode, m.localRTPProfile(answered), m.localTLSIDFor(answered))
 }
 
-func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string, profile string) ([]byte, error) {
+func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string, profile string, tlsID string) ([]byte, error) {
 	fingerprints, err := m.localFingerprintLines()
 	if err != nil {
 		return nil, fmt.Errorf("DTLS certificate fingerprint: %w", err)
@@ -364,9 +365,10 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 	}
 
 	formats := make([]string, 0, len(codecs))
+	originID, originVersion := m.originLocked().next()
 	lines := []string{
 		"v=0",
-		fmt.Sprintf("o=diago %d %d IN %s %s", time.Now().UnixNano(), time.Now().UnixNano(), addressType, connectionIP),
+		fmt.Sprintf("o=diago %d %d IN %s %s", originID, originVersion, addressType, connectionIP),
 		"s=diago",
 		"t=0 0",
 		"a=group:BUNDLE 0",
@@ -390,7 +392,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		"a=ice-pwd:"+m.localPwd,
 	)
 	lines = append(lines, fingerprints...)
-	lines = append(lines, "a=setup:"+setup)
+	lines = append(lines, dtlsAssociationLines(setup, tlsID)...)
 	for _, codec := range codecs {
 		channels := ""
 		if codec.NumChannels > 1 {
@@ -415,6 +417,10 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // RemoteSDP parses an answer when offered is true, otherwise it parses an
 // offer. Starting ICE here is non-blocking so a SIP answer can be sent before
 // the browser is required to complete connectivity checks.
+//
+// A description that keeps the ICE credentials of the generation in use and
+// asks for a new DTLS association is refused with an error that wraps
+// ErrWebRTCICERestartRequired, and leaves the session as it was.
 func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered bool) error {
 	var desc webrtcsdp.SessionDescription
 	if err := desc.Unmarshal(body); err != nil {
@@ -450,6 +456,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	if err != nil {
 		return err
 	}
+	tlsID := webRTCTLSID(desc.Attributes, md.Attributes)
 
 	remoteCodecs, err := webRTCAudioCodecs(&desc, md)
 	if err != nil {
@@ -512,13 +519,16 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 			return ErrWebRTCICERestart
 		}
 		if !m.continuesRemoteFingerprints(fingerprints) {
-			return fmt.Errorf("remote DTLS fingerprint changed without an ICE restart")
+			return fmt.Errorf("remote DTLS fingerprint changed without an ICE restart: %w", ErrWebRTCICERestartRequired)
 		}
 		if !offered && remoteSetup == "actpass" {
 			localSetup = m.localSetup
 		}
 		if localSetup != m.localSetup {
-			return fmt.Errorf("remote DTLS role changed without an ICE restart")
+			return fmt.Errorf("remote DTLS role changed without an ICE restart: %w", ErrWebRTCICERestartRequired)
+		}
+		if err = m.continueDTLSAssociation(tlsID); err != nil {
+			return err
 		}
 		// A subsequent offer/answer with unchanged ICE credentials continues the
 		// current ICE and DTLS transports. Stage only media-level state so a SIP
@@ -542,7 +552,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.remotePwd = remotePwd
 	m.remoteFingerprintAlgorithm = fingerprints[0].Algorithm
 	m.remoteFingerprint = fingerprints[0].Value
-	m.remoteFingerprints = fingerprintSet(fingerprints)
+	m.recordDTLSAssociation(localSetup, fingerprints, tlsID, offered)
 	m.rtcpReducedSize = remoteRTCPReducedSize
 	m.offerAccepted(proto, offered)
 	m.filterCodecs = common
@@ -609,6 +619,7 @@ func (m *MediaSessionWebrtc) negotiate(ctx context.Context, capped bool) error {
 			m.pendingCodecs = nil
 			m.pendingMode = ""
 			m.pendingRTCPReducedSize = false
+			m.keepModePreference()
 		}
 		m.mu.Unlock()
 		return nil
@@ -696,6 +707,7 @@ func (m *MediaSessionWebrtc) Rollback() {
 	m.pendingCodecs = nil
 	m.pendingMode = ""
 	m.pendingRTCPReducedSize = false
+	m.restoreModePreference()
 	m.mu.Unlock()
 }
 

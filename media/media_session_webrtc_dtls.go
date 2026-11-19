@@ -17,10 +17,19 @@ type webrtcSessionState struct {
 	// keying material is exported.
 	dtlsTr *dtlsKeyExchangeConn
 
-	// remoteFingerprints is the fingerprint set of the remote description the
-	// DTLS association of this ICE generation was negotiated with, as
-	// fingerprintSet renders it.
-	remoteFingerprints []string
+	// dtlsAssociationState is the DTLS association of this ICE generation,
+	// which the session negotiates once and every later description has to
+	// continue, and the a=tls-id values that identify it: see
+	// recordDTLSAssociation.
+	dtlsAssociationState
+
+	// origin gives the o= line of the session's SDPs: see sdpOrigin. It is
+	// nil until the first SDP is built or a fork is handed it, and guards
+	// itself.
+	origin *sdpOrigin
+
+	// reOffer is what ReOffer staged: see stagedModePreference.
+	reOffer stagedModePreference
 
 	// offeredProto is the m= transport of the last offer RemoteSDP accepted,
 	// as the peer wrote it, empty before any. The answer to that offer

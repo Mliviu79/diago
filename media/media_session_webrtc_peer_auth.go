@@ -56,7 +56,7 @@ func webRTCFingerprints(session, media []webrtcsdp.Attribute) ([]DTLSFingerprint
 // description of the same generation has to carry the same set. The caller
 // holds m.mu.
 func (m *MediaSessionWebrtc) continuesRemoteFingerprints(fingerprints []DTLSFingerprint) bool {
-	return slices.Equal(fingerprintSet(fingerprints), m.remoteFingerprints)
+	return m.dtlsAssoc != nil && slices.Equal(fingerprintSet(fingerprints), m.dtlsAssoc.remoteFingerprints)
 }
 
 // localFingerprintLines returns the a=fingerprint lines of our SDP, one for

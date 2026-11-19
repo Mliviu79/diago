@@ -11,22 +11,31 @@ import (
 	"strings"
 )
 
-// dtlsAssociationState is what a MediaSession keeps about the DTLS association
-// its media is keyed from, across the offer/answer exchanges of a call. Like
-// the fields the session negotiates with it is not safe for concurrent use.
+// dtlsAssociationState is what a media session keeps about the DTLS
+// association its media is keyed from, across the offer/answer exchanges of a
+// call: a MediaSession and a MediaSessionWebrtc both embed it. It is guarded
+// as the fields the session negotiates with are: on a MediaSession it is not
+// safe for concurrent use, on a MediaSessionWebrtc the session's lock guards
+// it.
 type dtlsAssociationState struct {
-	// dtlsAssoc describes the DTLS association the handshake completed: the
-	// role, fingerprints, tls-id and transport it was built with. The
-	// handshake sets it once SRTP is keyed, and Fork shares it together with
-	// the SRTP contexts, so that a renegotiating fork can tell whether the
-	// peer continues the association or asks for a new one (RFC 8842 section
-	// 3.1). The record itself is never written after it is set, which is what
-	// makes sharing one pointer between a session and its forks safe.
+	// dtlsAssoc describes the DTLS association of the session: the role,
+	// fingerprints, tls-id and transport it was built with, which tell
+	// whether a later offer or answer continues the association or asks for a
+	// new one (RFC 8842 section 3.1). The record itself is never written
+	// after it is set.
+	//
+	// On a MediaSession the handshake sets it once SRTP is keyed, and Fork
+	// shares it together with the SRTP contexts with the renegotiating fork;
+	// one pointer can be shared between a session and its forks because the
+	// record is never written. On a MediaSessionWebrtc RemoteSDP sets it when
+	// it negotiates the association of the session's ICE generation, the only
+	// one that session has.
 	dtlsAssoc *dtlsAssociation
 
 	// localTLSID is our a=tls-id value for the association this session
 	// continues or is negotiating, "" while none was drawn and for an
-	// association whose offer carried none. Fork carries it.
+	// association whose offer carried none. Fork of a MediaSession carries
+	// it.
 	localTLSID string
 
 	// dtlsRemoteTLSID is the peer's a=tls-id value as RemoteSDP last read it,
@@ -51,7 +60,8 @@ type dtlsAssociation struct {
 	remoteTLSID string
 	localTLSID  string
 	// laddr and raddr are the transport addresses the association was
-	// signalled over.
+	// signalled over. Under ICE the candidates carry the transport, and they
+	// stay zero.
 	laddr net.UDPAddr
 	raddr net.UDPAddr
 }
@@ -75,7 +85,7 @@ func (a *dtlsAssociation) changedBy(s *MediaSession, setup string, fingerprints 
 	if !slices.Equal(fingerprintSet(s.localDTLSFingerprints()), a.localFingerprints) {
 		return "a change of our fingerprints"
 	}
-	if tlsID != "" && tlsID != a.remoteTLSID {
+	if a.tlsIDChanged(tlsID) {
 		return "a new tls-id"
 	}
 	if !sameUDPAddr(s.Laddr, a.laddr) {
@@ -85,6 +95,14 @@ func (a *dtlsAssociation) changedBy(s *MediaSession, setup string, fingerprints 
 		return "a change of the peer's transport"
 	}
 	return ""
+}
+
+// tlsIDChanged reports whether tlsID, the a=tls-id value of a peer's offer or
+// answer, "" when it carried none, asks for a new DTLS association: a peer
+// asks for one by changing the value (RFC 8842 section 4). A peer that sends
+// none changes nothing by it.
+func (a *dtlsAssociation) tlsIDChanged(tlsID string) bool {
+	return tlsID != "" && tlsID != a.remoteTLSID
 }
 
 // localChangedBy reports whether s no longer presents our side of the
@@ -232,41 +250,57 @@ func (s *MediaSession) negotiateDTLSAssociation(setup string, fingerprints []DTL
 }
 
 // newAnswerTLSID gives a session answering an offer with a new DTLS
-// association our tls-id for it: a new value when the offer carries a tls-id,
-// which the answer then carries, and none when it does not (RFC 8842 section
-// 5.3). A session applying an answer keeps the value its offer carried.
+// association our tls-id for it: see dtlsAssociationState.answerTLSID.
 func (s *MediaSession) newAnswerTLSID(remoteTLSID string) {
-	if s.remoteSDPIsAnswer {
+	s.answerTLSID(s.remoteSDPIsAnswer, remoteTLSID)
+}
+
+// localSDPTLSID returns the a=tls-id value LocalSDP writes, or "" for none;
+// answered is the argument of LocalSDP. See dtlsAssociationState.tlsIDFor: our
+// side of the association has changed when the session offers from other
+// sockets or with other certificates than the association was built with.
+func (s *MediaSession) localSDPTLSID(answered bool) string {
+	return s.tlsIDFor(answered, s.dtlsAssoc != nil && s.dtlsAssoc.localChangedBy(s))
+}
+
+// answerTLSID gives a session answering an offer with a new DTLS association
+// our tls-id for it: a new value when the offer carries a tls-id, remoteTLSID,
+// which the answer then carries, and none when it does not (RFC 8842 section
+// 5.3). answersOurOffer says the body being applied answers an offer of ours
+// instead: the session then keeps the value its offer carried.
+func (st *dtlsAssociationState) answerTLSID(answersOurOffer bool, remoteTLSID string) {
+	if answersOurOffer {
 		return
 	}
-	s.localTLSID = ""
+	st.localTLSID = ""
 	if remoteTLSID != "" {
-		s.localTLSID = newTLSID()
+		st.localTLSID = newTLSID()
 	}
 }
 
-// localSDPTLSID returns the a=tls-id value LocalSDP writes, or "" for none
-// (RFC 8842 section 5); answered is the argument of LocalSDP. An answer
-// carries the value RemoteSDP settled on, and only when the offer carried a
-// tls-id. An offer carries the value of the association the session
-// continues, or a new one when it has no association or asks for a new one
-// from other sockets or with other certificates.
-func (s *MediaSession) localSDPTLSID(answered bool) string {
+// tlsIDFor returns the a=tls-id value of the body a session builds, or "" for
+// none (RFC 8842 section 5); answered says the body answers the offer the
+// session last read. An answer carries the value the session settled on when
+// it read that offer, and only when the offer carried a tls-id. An offer
+// carries the value of the association the session continues, or a new one
+// when it has no association, or asks for a new one because our side of the
+// association has changed, which localChanged says.
+func (st *dtlsAssociationState) tlsIDFor(answered bool, localChanged bool) string {
 	if answered {
-		if s.dtlsRemoteTLSID == "" {
+		if st.dtlsRemoteTLSID == "" {
 			return ""
 		}
-		return s.localTLSID
+		return st.localTLSID
 	}
 
-	assoc := s.dtlsAssoc
+	assoc := st.dtlsAssoc
 	switch {
-	case assoc != nil && !assoc.localChangedBy(s):
-		s.localTLSID = assoc.localTLSID
-	case assoc != nil && s.localTLSID == assoc.localTLSID, assoc == nil && s.localTLSID == "":
-		s.localTLSID = newTLSID()
+	case assoc != nil && !localChanged:
+		st.localTLSID = assoc.localTLSID
+	case assoc != nil && st.localTLSID == assoc.localTLSID, assoc == nil && st.localTLSID == "":
+		st.localTLSID = newTLSID()
 	}
-	return s.localTLSID
+	return st.localTLSID
 }
 
 // newTLSID draws a tls-id value: 26 characters of the base32 alphabet, which
