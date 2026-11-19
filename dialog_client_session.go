@@ -566,7 +566,7 @@ func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) 
 
 		// A 2xx without Contact is acknowledged at the remote target in
 		// place, see reInviteAck.
-		return res, reInviteAck(ctx, res, d.ack, d.RemoteContact)
+		return res, reInviteAck(ctx, res, d.ack, d.remoteTargetOK)
 	}
 }
 
@@ -576,9 +576,7 @@ func (d *DialogClientSession) reInviteKeepAlive(ctx context.Context) error {
 	if d.mediaHanshakerLocked() == nil {
 		return fmt.Errorf("dialog media is not initialized")
 	}
-	contact := d.RemoteContact()
-
-	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req := sip.NewRequest(sip.INVITE, d.remoteTarget())
 	req.AppendHeader(d.InviteRequest.Contact())
 
 	res, err := d.reInviteDo(ctx, req)
@@ -615,13 +613,14 @@ type ReferClientOptions struct {
 }
 
 func (d *DialogClientSession) ReferOptions(ctx context.Context, referTo sip.Uri, opts ReferClientOptions) error {
-	cont := d.RemoteContact()
 	d.dialogCallbacks.mu.Lock()
 	if opts.OnNotify != nil {
 		d.onReferNotify = opts.OnNotify
 	}
 	d.dialogCallbacks.mu.Unlock()
-	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.Headers...)
+	// Referred-By carries the Contact of the answer to the INVITE, or the
+	// INVITE's Request-URI when that answer had none, as its ACK does.
+	return dialogRefer(ctx, d, d.remoteTarget(), referTo, d.ackTarget(), opts.Headers...)
 }
 
 func (d *DialogClientSession) handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {

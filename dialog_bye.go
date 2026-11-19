@@ -168,11 +168,7 @@ func (d *DialogServerSession) Bye(ctx context.Context) error {
 // INVITE's transport (RFC 3261 section 12.2.1.1). It needs the INVITE's
 // answer. WriteBye fills in the dialog's headers.
 func (d *DialogClientSession) NewByeRequest() *sip.Request {
-	target := d.InviteRequest.Recipient
-	if contact := d.RemoteContact(); contact != nil {
-		target = contact.Address
-	}
-	bye := sip.NewRequest(sip.BYE, *target.Clone())
+	bye := sip.NewRequest(sip.BYE, d.remoteTarget())
 	bye.SetTransport(d.InviteRequest.Transport())
 	return bye
 }

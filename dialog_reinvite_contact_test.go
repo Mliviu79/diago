@@ -300,7 +300,7 @@ func TestReInviteAckWithoutRemoteTarget(t *testing.T) {
 	acks := 0
 	err := reInviteAck(t.Context(), res,
 		func(context.Context, sip.Uri, []byte) error { acks++; return nil },
-		func() *sip.ContactHeader { return nil },
+		func() (sip.Uri, bool) { return sip.Uri{}, false },
 	)
 	require.ErrorIs(t, err, sipgo.ErrDialogInviteNoContact)
 	require.Zero(t, acks, "ACKs sent")

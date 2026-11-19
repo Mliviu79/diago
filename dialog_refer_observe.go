@@ -408,8 +408,8 @@ func referAccepted(status int) bool {
 // Unlike Refer it never ends the dialog, so what follows the outcome is the
 // caller's decision, and it installs no callback on the dialog.
 func (d *DialogClientSession) ReferAndWait(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
-	cont := d.RemoteContact()
-	return dialogReferWait(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, headers...)
+	// Referred-By carries the URI ReferOptions puts there.
+	return dialogReferWait(ctx, d, d.remoteTarget(), referTo, d.ackTarget(), headers...)
 }
 
 // ReferAndWait sends a blind REFER for referTo, as Refer does, and blocks until
@@ -436,15 +436,11 @@ func (d *DialogServerSession) ReferAndWait(ctx context.Context, referTo sip.Uri,
 // installs no callback on the dialog, so it does not change what a later Refer or
 // ReferOptions call reports.
 func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {
-	recipient := d.RemoteContact()
 	ourContact := d.InviteRequest.Contact()
-	if recipient == nil {
-		return ReferObservation{}, fmt.Errorf("refer: dialog has no remote contact")
-	}
 	if ourContact == nil {
 		return ReferObservation{}, fmt.Errorf("refer: dialog has no local contact")
 	}
-	obs, _, err := dialogReferObserve(ctx, d, recipient.Address, referTo, ourContact.Address, opts)
+	obs, _, err := dialogReferObserve(ctx, d, d.remoteTarget(), referTo, ourContact.Address, opts)
 	return obs, err
 }
 

@@ -190,7 +190,7 @@ func reInviteSendOnce(
 	req *sip.Request,
 	do func(context.Context, *sip.Request) (*sip.Response, error),
 	ack func(ctx context.Context, remoteTarget sip.Uri, body []byte) error,
-	remoteTarget func() *sip.ContactHeader,
+	remoteTarget func() (sip.Uri, bool),
 ) (*sip.Response, error) {
 	res, err := do(ctx, req)
 	if err != nil {
@@ -220,22 +220,23 @@ func reInviteSendOnce(
 // non-2xx final response only.
 //
 // It returns errReInviteNoRemoteTarget, without acknowledging, when the dialog
-// has no remote target either.
+// has no remote target either, which remoteTarget reports with false. An
+// outbound call always has one, see DialogClientSession.remoteTarget.
 func reInviteAck(
 	ctx context.Context,
 	res *sip.Response,
 	ack func(ctx context.Context, remoteTarget sip.Uri, body []byte) error,
-	remoteTarget func() *sip.ContactHeader,
+	remoteTarget func() (sip.Uri, bool),
 ) error {
 	// Now do ACK on new Contact
 	if cont := res.Contact(); cont != nil {
 		return ack(ctx, cont.Address, nil)
 	}
-	target := remoteTarget()
-	if target == nil {
+	target, ok := remoteTarget()
+	if !ok {
 		return errReInviteNoRemoteTarget
 	}
-	return ack(ctx, target.Address, nil)
+	return ack(ctx, target, nil)
 }
 
 // errReInviteNoRemoteTarget is why a 2xx to a re-INVITE of ours was not
@@ -246,7 +247,13 @@ var errReInviteNoRemoteTarget = fmt.Errorf("reinvite: 2xx without Contact on a d
 // reInviteSend sends req, a re-INVITE, once, and acknowledges its 2xx, as
 // reInviteSendOnce describes.
 func (d *DialogServerSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	return reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact)
+	return reInviteSendOnce(ctx, req, d.Do, d.ack, func() (sip.Uri, bool) {
+		contact := d.RemoteContact()
+		if contact == nil {
+			return sip.Uri{}, false
+		}
+		return contact.Address, true
+	})
 }
 
 // ownReInvite returns the re-INVITE this side of an inbound call sends for
@@ -278,7 +285,13 @@ func (d *DialogServerSession) ownReInvite(handshaker mediaHanshaker, mode string
 // reInviteSend sends req, a re-INVITE, once, and acknowledges its 2xx, as
 // reInviteSendOnce describes.
 func (d *DialogClientSession) reInviteSend(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	return reInviteSendOnce(ctx, req, d.Do, d.ack, d.RemoteContact)
+	return reInviteSendOnce(ctx, req, d.Do, d.ack, d.remoteTargetOK)
+}
+
+// remoteTargetOK is remoteTarget for reInviteAck: an outbound call always has
+// one.
+func (d *DialogClientSession) remoteTargetOK() (sip.Uri, bool) {
+	return d.remoteTarget(), true
 }
 
 // ownReInvite returns the re-INVITE this side of an outbound call sends for
@@ -296,7 +309,7 @@ func (d *DialogClientSession) ownReInvite(handshaker mediaHanshaker, mode string
 		hangup:      d.hangupNoMedia,
 		send: func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error) {
 			// NOTE: we do not change original invite request
-			req := sip.NewRequest(sip.INVITE, d.RemoteContact().Address)
+			req := sip.NewRequest(sip.INVITE, d.remoteTarget())
 			req.AppendHeader(d.InviteRequest.Contact())
 			req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 			for _, h := range headers {
