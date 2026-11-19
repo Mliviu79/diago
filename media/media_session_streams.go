@@ -71,11 +71,21 @@ func (o offeredStreams) around(body []byte) []byte {
 	return out.Bytes()
 }
 
+// carriesAudio reports whether md is a stream that can carry the call: an audio
+// stream on a transport this media stack carries and on a port other than 0,
+// since an offered stream on port 0 "MUST NOT be used" (RFC 3264 section 5.1).
+func carriesAudio(md sdp.MediaDescription) bool {
+	if md.MediaType != "audio" || md.Port <= 0 {
+		return false
+	}
+	_, ok := parseRTPProfile(md.Proto)
+	return ok
+}
+
 // audioStream returns the index of the media section that carries the call:
-// the first audio stream on a transport this media stack carries and on a port
-// other than 0, since an offered stream on port 0 "MUST NOT be used" (RFC 3264
-// section 5.1). With no such stream it is the first audio stream, whose use
-// then fails as the unusable stream it is, and with no audio stream at all -1.
+// the first one that can, see carriesAudio. With no such stream it is the
+// first audio stream, whose use then fails as the unusable stream it is, and
+// with no audio stream at all -1.
 func audioStream(sections []sdp.MediaSection) int {
 	first := -1
 	for i, sec := range sections {
@@ -85,7 +95,7 @@ func audioStream(sections []sdp.MediaSection) int {
 		if first < 0 {
 			first = i
 		}
-		if _, ok := parseRTPProfile(sec.Media.Proto); ok && sec.Media.Port > 0 {
+		if carriesAudio(sec.Media) {
 			return i
 		}
 	}

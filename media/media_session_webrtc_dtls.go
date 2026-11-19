@@ -36,6 +36,10 @@ type webrtcSessionState struct {
 	// repeats it.
 	offeredProto string
 
+	// streams is the stream list the SDPs of the session are written around:
+	// see webrtcStreams.
+	streams webrtcStreams
+
 	// remoteICELite is set when the peer's description of this ICE generation
 	// carries a=ice-lite: it runs a lite agent, which decides the ICE roles
 	// (RFC 8445 section 6.1.1).

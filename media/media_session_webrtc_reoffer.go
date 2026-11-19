@@ -60,7 +60,7 @@ func (m *MediaSessionWebrtc) ReOffer(mode string) ([]byte, error) {
 	if len(m.filterCodecs) > 0 {
 		codecs = m.filterCodecs
 	}
-	offer, err := m.localSDPLocked(codecs, m.localDTLSSetup(false), true, preference, m.localRTPProfile(false), m.localTLSIDFor(false))
+	offer, err := m.localSDPLocked(codecs, m.localDTLSSetup(false), true, preference, m.localRTPProfile(false), m.localTLSIDFor(false), m.localStreams(false))
 	if err != nil {
 		m.restoreModePreference()
 		return nil, err

@@ -136,6 +136,7 @@ func (m *MediaSessionWebrtc) Fork(ctx context.Context) (*MediaSessionWebrtc, err
 
 	fork := &MediaSessionWebrtc{Codecs: codecs, Mode: mode, modePreference: modePreference}
 	fork.origin = m.sharedOrigin()
+	fork.streams.current = m.forkedStreams()
 	if err := fork.Init(ctx, conf, onICEStateChange); err != nil {
 		return nil, err
 	}
@@ -318,6 +319,11 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // DTLS setup attribute: an offer is actpass, unless Config.DTLS.SDPSetupRole
 // chooses another value; an answer uses the role selected while parsing the
 // remote offer. An answer also repeats the m= transport of that offer.
+//
+// The body has one m= line for each stream of the offer it answers, or of the
+// last offer of the peer the session committed to when the body is an offer
+// of ours, in that offer's order: the audio stream, and every other stream
+// rejected with port 0 (RFC 3264 sections 6 and 8).
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -344,10 +350,10 @@ func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte,
 		mode = m.pendingMode
 		rtcpReducedSize = m.pendingRTCPReducedSize
 	}
-	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode, m.localRTPProfile(answered), m.localTLSIDFor(answered))
+	return m.localSDPLocked(codecs, setup, !answered || rtcpReducedSize, mode, m.localRTPProfile(answered), m.localTLSIDFor(answered), m.localStreams(answered))
 }
 
-func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string, profile string, tlsID string) ([]byte, error) {
+func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includeRTCPReducedSize bool, mode string, profile string, tlsID string, streams offeredStreams) ([]byte, error) {
 	fingerprints, err := m.localFingerprintLines()
 	if err != nil {
 		return nil, fmt.Errorf("DTLS certificate fingerprint: %w", err)
@@ -419,7 +425,7 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 		lines = append(lines, "a=candidate:"+c.Marshal())
 	}
 	lines = append(lines, "a=end-of-candidates", "a=msid:diago audio", "")
-	return []byte(strings.Join(lines, "\r\n")), nil
+	return streams.around([]byte(strings.Join(lines, "\r\n"))), nil
 }
 
 // RemoteSDP parses an answer when offered is true, otherwise it parses an
@@ -439,7 +445,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	if err := desc.Unmarshal(body); err != nil {
 		return fmt.Errorf("parse remote WebRTC SDP: %w", err)
 	}
-	md := findWebRTCAudio(&desc)
+	md := webRTCAudioStream(&desc)
 	if md == nil {
 		return fmt.Errorf("remote WebRTC SDP has no audio media description")
 	}
@@ -554,6 +560,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		m.pendingMode = negotiateMediaDirection(remoteMode, localPreference)
 		m.pendingRTCPReducedSize = remoteRTCPReducedSize
 		m.offerAccepted(proto, offered)
+		m.stageOfferedStreams(webRTCOfferedStreams(&desc, md), offered)
 		return nil
 	}
 	for _, candidate := range remoteCandidates {
@@ -569,6 +576,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.recordDTLSAssociation(localSetup, fingerprints, tlsID, offered)
 	m.rtcpReducedSize = remoteRTCPReducedSize
 	m.offerAccepted(proto, offered)
+	m.keepOfferedStreams(webRTCOfferedStreams(&desc, md), offered)
 	m.filterCodecs = common
 	m.Codecs = slices.Clone(common)
 	m.codec, _ = CodecAudioFromList(common)
@@ -634,6 +642,7 @@ func (m *MediaSessionWebrtc) negotiate(ctx context.Context, capped bool) error {
 			m.pendingMode = ""
 			m.pendingRTCPReducedSize = false
 			m.keepModePreference()
+			m.commitOfferedStreams()
 		}
 		m.mu.Unlock()
 		return nil
@@ -722,6 +731,7 @@ func (m *MediaSessionWebrtc) Rollback() {
 	m.pendingMode = ""
 	m.pendingRTCPReducedSize = false
 	m.restoreModePreference()
+	m.dropStagedStreams()
 	m.mu.Unlock()
 }
 
