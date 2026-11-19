@@ -44,6 +44,14 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 		}
 	}
 
+	// RFC 5763 section 5 makes a=fingerprint mandatory: the certificates are
+	// self signed, and the fingerprint is the only thing the peer's one can
+	// be checked against. Without one we could check, any certificate would
+	// complete the handshake, so the media is refused here instead.
+	if !hasCheckableDTLSFingerprint(fingerprints) {
+		return fmt.Errorf("sdp: dtls media has no a=fingerprint with a supported hash function fingerprints=%d", len(fingerprints))
+	}
+
 	if setup == "" {
 		return fmt.Errorf("Empty a=setup value attribute for dtls")
 	}

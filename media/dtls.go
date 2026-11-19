@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"strings"
 
 	"github.com/pion/dtls/v3"
@@ -22,7 +21,14 @@ var (
 )
 
 const (
-	ServerClientAuthNoCert      = int(dtls.NoClientCert)
+	// ServerClientAuthNoCert is pion's NoClientCert: the DTLS server sends no
+	// CertificateRequest. It is the DTLSConfig.ServerClientAuth default, which
+	// DTLSConfig raises to requiring a certificate.
+	ServerClientAuthNoCert = int(dtls.NoClientCert)
+	// ServerClientAuthRequireCert is pion's RequestClientCert: the DTLS server
+	// asks the client for a certificate but lets it leave one out, so it
+	// requests a certificate and does not require one. DTLSConfig raises it to
+	// requiring one, as DTLSConfig.ServerClientAuth says.
 	ServerClientAuthRequireCert = int(dtls.RequestClientCert)
 
 	EllipticCurveP256   uint16 = uint16(elliptic.P256)
@@ -35,9 +41,13 @@ type DTLSConfig struct {
 	// If used as client this would verify server certificate
 	ServerName string
 
-	// ServerClientAuth determines the server's policy for
-	// TLS Client Authentication. The default is ServerClientAuthNoCert.
-	// Check ServerClientAuth
+	// ServerClientAuth is the client certificate policy when this endpoint is
+	// the DTLS server. The server always requires the client's certificate,
+	// because it checks it against the peer's a=fingerprint (RFC 5763 section
+	// 5), so a policy that lets the client leave it out is raised to requiring
+	// one. That covers ServerClientAuthNoCert, the default, and
+	// ServerClientAuthRequireCert, which requests a certificate without
+	// requiring it. A stricter policy is kept.
 	ServerClientAuth int
 
 	// SRTPProfiles to use in exchange. Check constant vars with media.SRTPProfile...
@@ -63,13 +73,10 @@ type DTLSFingerprint struct {
 }
 
 func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
-	clientAuth := dtls.ClientAuthType(conf.ServerClientAuth)
-	// WebRTC authenticates the peer with the certificate fingerprint carried
-	// in SDP. A DTLS server must request the browser's certificate, otherwise
+	// The peer is authenticated with the certificate fingerprint carried in
+	// SDP. A DTLS server must require the client's certificate, otherwise
 	// VerifyConnection has nothing to compare.
-	if len(fingerprints) > 0 && clientAuth == dtls.NoClientCert {
-		clientAuth = dtls.RequestClientCert
-	}
+	clientAuth := conf.clientAuth()
 
 	config := &dtls.Config{
 		// Use appropriate certificate or generate self-signed
@@ -91,7 +98,6 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
 
 		// If you're acting as the server
 		// We are verifying Connection fingerprints so we require client cert
-		// use dtls.NoClientCert without verfication
 		ClientAuth:           clientAuth,
 		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
 
@@ -99,10 +105,9 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
 		ServerName:         conf.ServerName,       // If insecure is false
 
 		// IT IS STILL UNCLEAR WHY WE CAN NOT READ CERTIFICATE HERE
+		// The peer is checked against its SDP fingerprints, and with none there
+		// is nothing it can match, so the handshake fails.
 		VerifyConnection: func(state *dtls.State) error {
-			if len(fingerprints) == 0 {
-				return nil
-			}
 			return dtlsVerifyConnection(state, fingerprints)
 		},
 	}
@@ -130,22 +135,12 @@ func (conf *DTLSConfig) ToLibConf(fingerprints []DTLSFingerprint) *dtls.Config {
 	return config
 }
 
-func dtlsServer(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate) (*dtls.Conn, error) {
-	conf := DTLSConfig{
-		Certificates: certificates,
-	}
-	return dtls.Server(conn, raddr, conf.ToLibConf([]DTLSFingerprint{}))
-}
-
-func dtlsClient(conn net.PacketConn, raddr net.Addr, certificates []tls.Certificate, serverName string) (*dtls.Conn, error) {
-	// Client DTLS config
-	conf := DTLSConfig{
-		Certificates: certificates,
-		ServerName:   serverName,
-	}
-	return dtls.Client(conn, raddr, conf.ToLibConf([]DTLSFingerprint{}))
-}
-
+// dtlsVerifyConnection accepts the peer only when its certificate matches one
+// of the a=fingerprint values from its SDP (RFC 5763 section 5). The
+// certificates are self signed, so that match is the only thing binding the
+// DTLS peer to the signalling, and a certificate matching none of them is
+// rejected. The grammar asks for upper case hex; lower case is accepted as
+// well. A fingerprint whose hash function is not supported is skipped.
 func dtlsVerifyConnection(state *dtls.State, fingerprints []DTLSFingerprint) error {
 	if len(state.PeerCertificates) == 0 {
 		return fmt.Errorf("no certificate found in dtls")
@@ -153,16 +148,15 @@ func dtlsVerifyConnection(state *dtls.State, fingerprints []DTLSFingerprint) err
 
 	remoteCert := state.PeerCertificates[0]
 	for _, fp := range fingerprints {
-		var remoteFP string
-		if strings.EqualFold(fp.Algorithm, "sha-256") {
-			var err error
-			remoteFP, err = dtlsSHA256CertificateFingerprint(remoteCert)
-			if err != nil {
-				return err
-			}
-		} else {
+		newHash, ok := dtlsFingerprintHash(fp.Algorithm)
+		if !ok {
 			DefaultLogger().Debug("Skiping fingerprint due to unsuported alg", "alg", fp.Algorithm)
 			continue
+		}
+
+		remoteFP, err := dtlsCertificateFingerprint(remoteCert, newHash)
+		if err != nil {
+			return err
 		}
 
 		DefaultLogger().Debug("Comparing fingerprint", "alg", fp.Algorithm, "fp", fp.Value, "rfp", remoteFP)

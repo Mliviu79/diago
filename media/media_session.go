@@ -229,6 +229,12 @@ func (s *MediaSession) Init() error {
 		s.SRTPAlg = uint16(srtp.ProtectionProfileAes128CmHmacSha1_80)
 	}
 
+	if s.SecureRTP == SecureRTPModeDTLS {
+		if err := s.DTLSConf.checkCertificates(); err != nil {
+			return fmt.Errorf("media session: %w", err)
+		}
+	}
+
 	// Try to listen on this ports
 	if err := s.createListeners(&s.Laddr); err != nil {
 		return err
