@@ -40,6 +40,11 @@ type dialogWebrtcState struct {
 	// and not changed after.
 	offerNegotiatedCodecs bool
 
+	// offerRequested says the session asked for the offer of the transport
+	// in place, see noteOfferRequest. It is good for the next description
+	// only.
+	offerRequested bool
+
 	// beforePendingStore, when set, is called by setPendingMediaSession with
 	// the transport it is about to store, before it checks for Close. Tests
 	// close the media there; it is nil otherwise.

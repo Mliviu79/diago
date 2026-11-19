@@ -74,11 +74,11 @@ func headerValues(res *sip.Response, name string) []string {
 }
 
 // TestDialogWebrtcReInviteOfferCodecs pins the codecs of a re-INVITE of ours
-// on a DialogWebrtc, which moves the call to a new ICE generation: every
-// configured codec, as DialogMedia offers, and with
-// MediaConfig.ReInviteNegotiatedCodecs only those the call runs on, except for
-// an offer that changes the direction, which offers every configured codec
-// either way.
+// on a DialogWebrtc. A plain one moves the call to a new ICE generation and
+// offers every configured codec, as DialogMedia offers, and with
+// MediaConfig.ReInviteNegotiatedCodecs only those the call runs on. An offer
+// that changes the direction is made on the transport in place, which runs on
+// the negotiated codecs, and offers those either way.
 func TestDialogWebrtcReInviteOfferCodecs(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -88,7 +88,8 @@ func TestDialogWebrtcReInviteOfferCodecs(t *testing.T) {
 	}{
 		{name: "configured", wantPCMA: true},
 		{name: "negotiated", negotiated: true},
-		{name: "negotiated_hold", negotiated: true, mode: "sendonly", wantPCMA: true},
+		{name: "hold", mode: "sendonly"},
+		{name: "negotiated_hold", negotiated: true, mode: "sendonly"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, _ := newWebrtcHandleCallWith(t,

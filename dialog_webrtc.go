@@ -140,6 +140,7 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 	current := d.mediaSession
 	pending := d.pendingMediaSession
 	closed := d.closed
+	inPlace := d.offersInPlaceUnsafe(mode)
 	d.mu.Unlock()
 	if closed {
 		// Nothing is described, and for an offer of ours nothing forked, on
@@ -154,6 +155,9 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 			return nil, fmt.Errorf("dialog WebRTC re-INVITE has no pending offer")
 		}
 		return pending.LocalSDP(ctx, true)
+	}
+	if inPlace {
+		return d.offerInPlace(current, mode)
 	}
 
 	fork, err := current.Fork(ctx)
@@ -179,6 +183,7 @@ func (d *DialogWebrtc) onLocalSDP(ctx context.Context, answered bool, mode strin
 
 func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered bool) error {
 	if remoteSDP == nil {
+		d.noteOfferRequest(offered)
 		return nil
 	}
 
@@ -284,6 +289,7 @@ func (d *DialogWebrtc) abortPendingMediaSession() {
 	pending := d.pendingMediaSession
 	current := d.mediaSession
 	d.pendingMediaSession = nil
+	d.offerRequested = false
 	d.mu.Unlock()
 	if pending == current {
 		current.Rollback()
