@@ -171,6 +171,16 @@ type MediaConfig struct {
 	// is the previous behaviour.
 	RTPPortAllocator RTPPortAllocator
 
+	// ReInviteNegotiatedCodecs makes the offer of ReInvite, which asks for no
+	// change of direction, carry only the codecs the call runs on, with the
+	// payload types they were negotiated with, so that it renegotiates
+	// nothing: the peer is not asked to move the call to another codec. The
+	// media keeps every configured codec for the answer and for later offers.
+	//
+	// False offers every configured codec, among which the peer chooses
+	// again. Hold and Unhold offer every configured codec either way.
+	ReInviteNegotiatedCodecs bool
+
 	// Used internally
 	secureRTP  int // 0 - none, 1 - sdes
 	bindIP     net.IP

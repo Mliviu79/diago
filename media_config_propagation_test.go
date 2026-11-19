@@ -59,6 +59,16 @@ func TestMediaConfigPropagation(t *testing.T) {
 		}
 	})
 
+	t.Run("ReInviteNegotiatedCodecs_reaches_the_dialog", func(t *testing.T) {
+		dg := &Diago{mediaConf: MediaConfig{ReInviteNegotiatedCodecs: true}}
+
+		conf := dg.mediaConfForTransport(&Transport{})
+
+		if !conf.ReInviteNegotiatedCodecs {
+			t.Fatal("per dialog config dropped ReInviteNegotiatedCodecs: ReInvite offers every configured codec whatever the caller set")
+		}
+	})
+
 	t.Run("Codecs reach the dialog", func(t *testing.T) {
 		dg := &Diago{mediaConf: MediaConfig{Codecs: []media.Codec{media.CodecAudioAlaw}}}
 

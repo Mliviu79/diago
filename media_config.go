@@ -31,6 +31,9 @@ func (dg *Diago) mediaConfForTransport(tran *Transport) MediaConfig {
 	return MediaConfig{
 		Codecs:       dg.mediaConf.Codecs,
 		SecureRTPAlg: dg.mediaConf.SecureRTPAlg,
+		// The media reads it when it makes an offer of ours, so it has to
+		// reach the config each dialog's media is built from.
+		ReInviteNegotiatedCodecs: dg.mediaConf.ReInviteNegotiatedCodecs,
 		// A dialog binds through the allocator the caller installed on Diago.
 		// Whoever builds the dialog's media reads it from the per dialog
 		// config, so a config that does not carry it leaves every dialog on

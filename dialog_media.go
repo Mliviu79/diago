@@ -81,6 +81,11 @@ type DialogMedia struct {
 	// noteOfferRequest.
 	offerRequested bool
 
+	// offerNegotiatedCodecs is MediaConfig.ReInviteNegotiatedCodecs of the
+	// config the media was built from. Set before the media is handed out
+	// and not changed after.
+	offerNegotiatedCodecs bool
+
 	// releaseRTPPort returns this dialog RTP port to the allocator that handed
 	// it out. Nil when no allocator is installed, as the OS takes the port back
 	// when the socket closes. Set next to mediaSession and consumed by Close.
@@ -173,6 +178,7 @@ func (d *DialogMedia) initRTPSessionUnsafe(m *media.MediaSession, rtpSess *media
 }
 
 func (d *DialogMedia) initMediaSessionFromConf(ctx context.Context, conf MediaConfig) error {
+	d.offerNegotiatedCodecs = conf.ReInviteNegotiatedCodecs
 	if d.mediaSession != nil {
 		// To allow testing or customizing current underhood session, this may be
 		// precreated, so we want to return if already initialized.
@@ -434,6 +440,11 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 	d.pendingMediaSession = ms
 	if requested {
 		// The peer asked for this offer: it renegotiates nothing.
+		return negotiatedOffer(ms, d.mediaSession), nil
+	}
+	if mode == "" && d.offerNegotiatedCodecs {
+		// An offer of ours for the session as it is, configured to
+		// renegotiate nothing.
 		return negotiatedOffer(ms, d.mediaSession), nil
 	}
 	return ms.LocalSDP(false), nil
