@@ -2,6 +2,8 @@
 
 package media
 
+import "context"
+
 // DTLSEndpointRole is the offer/answer role of this endpoint in an SDP
 // exchange. It decides the default a=setup value of a DTLS-SRTP session and
 // what DTLSConfig.SDPSetupRole is told. DTLSEndpointRoleUnknown lets
@@ -52,6 +54,11 @@ type mediaSessionState struct {
 	// the role is advertised in LocalSDP and played from RemoteSDP on, and
 	// both follow from this one value.
 	dtlsRemoteSetup string
+
+	// onFinalize runs the negotiation RemoteSDP armed, the DTLS handshake,
+	// under the ctx FinalizeContext was given. It is nil when there is none
+	// to run.
+	onFinalize func(ctx context.Context) error
 }
 
 // answeringOffer reports whether the last body RemoteSDP applied was an offer,

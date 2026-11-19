@@ -4,6 +4,7 @@
 package media
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -191,8 +192,6 @@ type MediaSession struct {
 	// dtlsTr is the transport dtlsConn was built on. It is held so the handshake
 	// can hand the socket back once the keying material is exported.
 	dtlsTr *dtlsKeyExchangeConn
-
-	onFinalize func() error
 
 	// deadlines records the RTP deadlines StopRTP and StartRTP last asked
 	// for. CarryRTPDeadlines hands them to a session replacing this one.
@@ -675,12 +674,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte, offered bool) error {
 // Finalize finalizes negotiation and does verification
 // Should be called only after exchage of SDP is done
 func (s *MediaSession) Finalize() error {
-	if s.onFinalize != nil {
-		err := s.onFinalize()
-		s.onFinalize = nil
-		return err
-	}
-	return nil
+	return s.FinalizeContext(context.Background())
 }
 
 func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {

@@ -3,12 +3,21 @@
 package media
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pion/dtls/v3"
 	"github.com/pion/srtp/v3"
 )
+
+// DTLSHandshakeTimeout caps how long the DTLS handshake Finalize and
+// FinalizeContext run may wait for the peer. The DTLS stack retransmits its
+// flights for as long as its context lives, so without a cap a peer that never
+// completes the handshake would hold it, the caller of Finalize and the socket
+// forever.
+var DTLSHandshakeTimeout = 30 * time.Second
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose
 // attributes are attrs: it takes the peer's a=setup and a=fingerprint values,
@@ -83,14 +92,16 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 	}
 	s.dtlsTr = tr
 
-	s.onFinalize = func() error {
+	s.onFinalize = func(ctx context.Context) error {
 		DefaultLogger().Debug("Starting dtls handshake",
 			"setup", setup,
 			"role", role,
 			"laddr", s.dtlsConn.LocalAddr().String(),
 			"raddr", s.dtlsConn.RemoteAddr().String(),
 		)
-		if err := s.dtlsConn.Handshake(); err != nil {
+		hctx, cancel := context.WithTimeout(ctx, DTLSHandshakeTimeout)
+		defer cancel()
+		if err := s.dtlsConn.HandshakeContext(hctx); err != nil {
 			return fmt.Errorf("dtls conn handshake: %w", err)
 		}
 
@@ -155,6 +166,26 @@ func (s *MediaSession) negotiateDTLS(attrs []string) error {
 		return nil
 	}
 	return nil
+}
+
+// FinalizeContext is Finalize bounded by ctx. The DTLS handshake it runs waits
+// for the peer, and ends with an error when ctx is done first, or at the
+// latest after DTLSHandshakeTimeout. A handshake is run once: after it, failed
+// or not, FinalizeContext has nothing left to run and returns nil.
+func (s *MediaSession) FinalizeContext(ctx context.Context) error {
+	if s.onFinalize != nil {
+		err := s.onFinalize(ctx)
+		s.onFinalize = nil
+		return err
+	}
+	return nil
+}
+
+// FinalizePending reports whether FinalizeContext has negotiation left to run:
+// the DTLS handshake RemoteSDP armed. A session that needs none, and one whose
+// handshake has been run, has nothing pending.
+func (s *MediaSession) FinalizePending() bool {
+	return s.onFinalize != nil
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is
