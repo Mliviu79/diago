@@ -313,6 +313,10 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 			return err
 		}
 
+		if err := rejectInviteRequiringUnsupportedExtension(ctx, req, tx, dg.sessionTimers); err != nil {
+			return err
+		}
+
 		tran, _ := dg.getTransport(req.Transport())
 
 		// Proceed as new call
