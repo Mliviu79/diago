@@ -49,10 +49,17 @@ func webRTCBundleGroup(desc *webrtcsdp.SessionDescription, tag string) []string 
 	return nil
 }
 
+// webRTCIdentificationTag returns the identification-tag of md, or "" when md
+// has no a=mid line or one whose value is no tag: see offeredTag.
+func webRTCIdentificationTag(md *webrtcsdp.MediaDescription) string {
+	tag, _ := md.Attribute(midAttribute)
+	return offeredTag(tag)
+}
+
 // webRTCBundledAudio returns what desc says of the BUNDLE group of audio, one
 // of its media sections.
 func webRTCBundledAudio(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.MediaDescription) bundledAudio {
-	tag, _ := audio.Attribute(midAttribute)
+	tag := webRTCIdentificationTag(audio)
 	if webRTCBundleGroup(desc, tag) == nil {
 		return bundledAudio{}
 	}
@@ -126,8 +133,7 @@ func webRTCCandidateAttributes(desc *webrtcsdp.SessionDescription, audio *webrtc
 	if hasCandidate(audio.Attributes) {
 		return audio.Attributes
 	}
-	tag, _ := audio.Attribute(midAttribute)
-	group := webRTCBundleGroup(desc, tag)
+	group := webRTCBundleGroup(desc, webRTCIdentificationTag(audio))
 	if group == nil {
 		return audio.Attributes
 	}
@@ -139,7 +145,7 @@ func webRTCCandidateAttributes(desc *webrtcsdp.SessionDescription, audio *webrtc
 		if md == audio {
 			continue
 		}
-		if mid, _ := md.Attribute(midAttribute); !slices.Contains(group, mid) {
+		if !slices.Contains(group, webRTCIdentificationTag(md)) {
 			continue
 		}
 		sectionUfrag, _ := webRTCAttribute(desc.Attributes, md.Attributes, "ice-ufrag")

@@ -153,6 +153,23 @@ func TestMediaSessionWebrtcAnswerKeepsTheOfferedTags(t *testing.T) {
 			wantGroup: []string{"a=group:BUNDLE 0"},
 			wantTags:  []string{"0"},
 		},
+		{
+			// RFC 5888 section 4: a tag is a token. A value that is not one
+			// is not written back, and the stream counts as not identified.
+			name:      "an_audio_tag_that_is_no_token",
+			group:     "a=group:BUNDLE a b",
+			audioTag:  "a b",
+			wantGroup: []string{"a=group:BUNDLE 0"},
+			wantTags:  []string{"0"},
+		},
+		{
+			name:      "a_rejected_stream_whose_tag_is_no_token",
+			group:     "a=group:BUNDLE a v",
+			audioTag:  "a",
+			after:     []string{webrtcTaggedSection("video", "v w")},
+			wantGroup: []string{"a=group:BUNDLE a"},
+			wantTags:  []string{"a", ""},
+		},
 	}
 
 	for _, r := range rows {

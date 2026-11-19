@@ -30,14 +30,47 @@ func midLine(tag string) string {
 }
 
 // identificationTag returns the identification-tag among attrs, the values of
-// the a= lines of one media section, or "" when the section has no a=mid line.
+// the a= lines of one media section, or "" when the section has no a=mid line
+// or one whose value is no tag: see offeredTag.
 func identificationTag(attrs []string) string {
 	for _, attr := range attrs {
 		if tag, ok := strings.CutPrefix(attr, midAttribute+":"); ok {
-			return tag
+			return offeredTag(tag)
 		}
 	}
 	return ""
+}
+
+// offeredTag returns tag, the value of an a=mid line of the peer, when it is
+// an identification-tag, and "" otherwise.
+//
+// RFC 5888 section 4 defines "identification-tag = token", the token of RFC
+// 4566 section 9. A tag is written back into our own SDPs, so a value outside
+// that grammar is not taken as one: a carriage return or a space in it would
+// become a line or a field of ours that the peer chose. The stream is then
+// described as one the offer did not identify.
+func offeredTag(tag string) string {
+	if tag == "" || strings.ContainsFunc(tag, notTokenChar) {
+		return ""
+	}
+	return tag
+}
+
+// notTokenChar reports whether r is outside the token-char of RFC 4566
+// section 9: "%x21 / %x23-27 / %x2A-2B / %x2D-2E / %x30-39 / %x41-5A /
+// %x5E-7E".
+func notTokenChar(r rune) bool {
+	switch {
+	case r == 0x21,
+		r >= 0x23 && r <= 0x27,
+		r >= 0x2A && r <= 0x2B,
+		r >= 0x2D && r <= 0x2E,
+		r >= 0x30 && r <= 0x39,
+		r >= 0x41 && r <= 0x5A,
+		r >= 0x5E && r <= 0x7E:
+		return false
+	}
+	return true
 }
 
 // streamTags returns tags, the identification-tag of each stream of an offer

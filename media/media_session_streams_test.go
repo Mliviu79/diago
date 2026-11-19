@@ -351,6 +351,20 @@ func TestMediaSessionAnswerKeepsTheOfferedTags(t *testing.T) {
 			wantAfter: []string{"m=video 0 RTP/AVP 96 97"},
 			wantTags:  []string{"", ""},
 		},
+		{
+			// A carriage return inside the value would be a line of the
+			// peer's choosing in our answer.
+			name:      "an_audio_tag_holding_a_line_of_its_own",
+			offer:     streamsOffer(tagged(streamsAudio, "a\ra=inactive"), tagged(streamsVideo, "v")),
+			wantAfter: []string{"m=video 0 RTP/AVP 96 97", "a=mid:v"},
+			wantTags:  []string{"", "v"},
+		},
+		{
+			name:      "a_rejected_stream_whose_tag_is_no_token",
+			offer:     streamsOffer(tagged(streamsAudio, "a"), tagged(streamsVideo, "v w")),
+			wantAfter: []string{"a=mid:a", "m=video 0 RTP/AVP 96 97"},
+			wantTags:  []string{"a", ""},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, answer := answerTo(t, tc.offer)

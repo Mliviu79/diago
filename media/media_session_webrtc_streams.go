@@ -74,7 +74,7 @@ func webRTCOfferedStreams(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.M
 	tags := make([]string, len(desc.MediaDescriptions))
 	for i, md := range desc.MediaDescriptions {
 		streams.media[i] = webRTCMediaLine(md)
-		tags[i], _ = md.Attribute(midAttribute)
+		tags[i] = webRTCIdentificationTag(md)
 		if md == audio {
 			streams.audio = i
 		}
