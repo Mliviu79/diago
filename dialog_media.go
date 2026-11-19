@@ -317,6 +317,13 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 	}
 
 	d.mu.Lock()
+	if offered && d.awaitsFirstAnswerUnsafe() {
+		// Nothing is replaced and nothing was running, so this is no media
+		// update.
+		err := d.mediaSession.RemoteSDP(remoteSDP, true)
+		d.mu.Unlock()
+		return err
+	}
 	var err error
 	if offered && d.pendingMediaSession != nil {
 		err = d.pendingMediaSession.RemoteSDP(remoteSDP, true)

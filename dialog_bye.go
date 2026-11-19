@@ -37,6 +37,12 @@ func (d *DialogClientSession) TerminatingBye() *sip.Request {
 // but for the answer the embedded session leaves to its caller when it refuses
 // a BYE, described below.
 //
+// A BYE that arrives before our answer is complete is read once it is. The
+// wait is for the media: an answer that starts its media after the ACK would
+// otherwise have that media closed under it by the BYE's handler. It also has
+// the answer see the ACK the peer sent ahead of the BYE, rather than the dialog
+// ending before any ACK, which the answer would report as a missing ACK.
+//
 // The stash must precede the delegation, because the delegate is what ends the
 // dialog: storing afterwards would let an observer woken by Context() read nil.
 // A rejected BYE is therefore rolled back rather than pre-filtered, which keeps
@@ -51,6 +57,8 @@ func (d *DialogClientSession) TerminatingBye() *sip.Request {
 // 500 itself or leaves the answer to its caller; readByeOnce answers it only
 // when the delegate did not, and the error is returned: the dialog goes on.
 func (d *DialogServerSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	// The BYE is read whether or not the answer completed in time.
+	d.awaitAnswer(ctx, tx)
 	return d.readPeerBye(ctx, req, tx, &d.Dialog, d.DialogServerSession.ReadBye)
 }
 

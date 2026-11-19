@@ -55,6 +55,25 @@ type sessionState struct {
 	// onReferNotifyUnmatched is told of a refer NOTIFY no open attempt holds.
 	// Set by OnReferNotifyUnmatched.
 	onReferNotifyUnmatched func(ReferNotify)
+
+	// answeringMu guards answering, ackAnswerErr and ackCarriesAnswer, which
+	// the answer to an inbound call and the reading of its ACK share. It is a
+	// lock of the session's own and is never held across a call.
+	answeringMu sync.Mutex
+	// answering is set by an answer before it sends its 2xx, and closed when
+	// that answer returns: after the ACK is read and, for an answer that sets
+	// up its media after the ACK, after that too. awaitAnswer waits on it.
+	answering chan struct{}
+	// ackAnswerErr is why the media of the call could not be completed with
+	// the ACK to our 2xx: the answer the ACK carried to the offer in the 2xx
+	// could not be applied or keyed, or was missing. ReadAck sets it before
+	// the ACK confirms the dialog, for the answer waiting on that ACK to
+	// report.
+	ackAnswerErr error
+	// ackCarriesAnswer is set by AnswerLate before its 2xx, which carries our
+	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
+	// section 13.2.1).
+	ackCarriesAnswer bool
 }
 
 // leaveCache removes the dialog from the dialog cache it was stored in, if

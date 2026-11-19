@@ -155,9 +155,26 @@ func (d *DialogServerSession) RemoteContact() *sip.ContactHeader {
 // RespondSDP answers the INVITE 200 with body on ctx, and waits for the ACK
 // within it. Answer, AnswerEarlyMedia, AnswerLate and AnswerWebrtc take no ctx
 // and answer on the dialog's, so their wait for the ACK ends with the dialog.
+//
+// An in-dialog request that arrives meanwhile is handled once RespondSDP has
+// returned, see awaitAnswer. When the ACK leaves the call without usable
+// media, RespondSDP ends the call with a BYE and returns why, see ReadAck.
 func (d *DialogServerSession) RespondSDP(ctx context.Context, body []byte) error {
+	answering := d.markAnswering()
+	defer close(answering)
+
+	return d.respondSDP(ctx, body)
+}
+
+// respondSDP is RespondSDP for an answer that has marked itself in progress,
+// because it sets up media after the ACK and must keep in-dialog requests
+// waiting until that is done too.
+func (d *DialogServerSession) respondSDP(ctx context.Context, body []byte) error {
 	headers := []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
-	return d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...)
+	if err := d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...); err != nil {
+		return err
+	}
+	return d.endOnAckAnswerError()
 }
 
 // Answer creates media session and answers
@@ -251,9 +268,14 @@ func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTP
 	med.initRTPSessionUnsafe(sess, rtpSess)
 	med.mu.Unlock()
 
+	// The media is started after the ACK, and in-dialog requests wait for
+	// that too, see awaitAnswer.
+	answering := d.markAnswering()
+	defer close(answering)
+
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
-	if err := d.RespondSDP(d.Context(), sess.LocalSDP(true)); err != nil {
+	if err := d.respondSDP(d.Context(), sess.LocalSDP(true)); err != nil {
 		return err
 	}
 
@@ -261,7 +283,11 @@ func (d *DialogServerSession) answerSession(med *DialogMedia, rtpSess *media.RTP
 	return rtpSess.MonitorBackground()
 }
 
-// AnswerLate does answer with Late offer.
+// AnswerLate answers an INVITE that carried no offer: its 2xx carries our
+// offer, and the ACK the answer (RFC 3261 section 13.2.1), which ReadAck hands
+// to the media. An ACK that brings no answer ends the call with a BYE, and
+// AnswerLate returns errAckCarriesNoAnswer; so does, with its own error, an
+// answer that cannot be applied or keyed.
 func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 	m := &DialogMedia{}
 	if err := m.initMediaSessionFromConf(d.mediaConf); err != nil {
@@ -276,19 +302,36 @@ func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 	m.mu.Unlock()
 	m.registerDialogCallbacks(&d.dialogCallbacks)
 
+	// The media is started after the ACK, and in-dialog requests wait for
+	// that too, see awaitAnswer.
+	answering := d.markAnswering()
+	defer close(answering)
+	d.expectAnswerInAck()
+
 	// This will now block until ACK received with 64*T1 as max.
 	// How to let caller to cancel this?
-	if err := d.RespondSDP(d.Context(), localSDP); err != nil {
+	if err := d.respondSDP(d.Context(), localSDP); err != nil {
 		return nil, err
 	}
 	// Must be called after media and reader writer is setup
 	return m, rtpSess.MonitorBackground()
 }
 
+// ReadAck reads an ACK to a 2xx of ours. The ACK to the 2xx that answered the
+// INVITE is read by readInviteAck. The ACK to the 2xx to a re-INVITE of the
+// peer's hands the media the answer it carries, if any, and has it commit the
+// update.
+//
+// An ACK cannot be refused, so media that the ACK leaves unusable ends the
+// call with a BYE, sent once the ACK is read.
 func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	d.dialogCallbacks.mu.Lock()
 	mediaHanshaker := d.mediaHanshaker
 	d.dialogCallbacks.mu.Unlock()
+
+	if d.acksInvite(req) {
+		return d.readInviteAck(req, tx, mediaHanshaker)
+	}
 
 	var err error
 	if mediaHanshaker != nil {
@@ -304,8 +347,7 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		// answered call waits for the ACK to its 2xx (RFC 3261 section 15),
 		// which is the one this handler holds.
 		ackErr := d.DialogServerSession.ReadAck(req, tx)
-		e := d.Hangup(d.Context())
-		return errors.Join(err, ackErr, e)
+		return errors.Join(err, ackErr, d.hangupNoMedia())
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
@@ -532,10 +574,13 @@ func (d *DialogServerSession) handleRefer(ctx context.Context, dg *Diago, req *s
 }
 
 func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
-	// Check is current pending dialog
-	if state := d.LoadState(); state == sip.DialogStateEstablished {
-		// RFC 3261 §14.2 — UAS Behavior
-		// If a UAS receives an INVITE request for an existing dialog while another INVITE transaction is in progress, it MUST return a 491 (Request Pending) response to the new INVITE.”
+	// A re-INVITE that arrives after our 2xx but before its ACK is handled once
+	// the answer is complete, as RFC 5407 section 3.1.4 recommends. It cannot be
+	// read ahead of the ACK: ReadRequest below moves the remote CSeq past the
+	// ACK's, and the ACK would then never confirm the dialog. Nor can its media
+	// update run before the answer's media is started. When the answer does not
+	// complete in time, RFC 5407 permits 491, which asks the peer to retry.
+	if !d.awaitAnswer(ctx, tx) {
 		return tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
 	}
 

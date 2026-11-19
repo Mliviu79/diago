@@ -406,6 +406,63 @@ func newAnsweredTestServerCallOverUA(t *testing.T, ua *sipgo.DialogUA) (*DialogS
 	return d, med
 }
 
+// newRecordingServerDialog builds an inbound dialog over the fake transaction
+// inviteTx, whose INVITE carries body, and whose media config is conf.
+// Requests the dialog sends, such as a BYE, are answered 200 and handed to the
+// returned channel.
+func newRecordingServerDialog(t *testing.T, inviteTx sip.ServerTransaction, body []byte, conf MediaConfig) (*DialogServerSession, <-chan *sip.Request) {
+	t.Helper()
+
+	sent := make(chan *sip.Request, 4)
+	ua, err := sipgo.NewUA()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ua.Close() })
+	client, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	client.TxRequester = &clientTxRequester{onRequest: func(req *sip.Request) *sip.Response {
+		sent <- req
+		return sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+	}}
+
+	recipient := sip.Uri{User: "alice", Host: "127.0.0.1", Port: 5060}
+	caller := sip.Uri{User: "bob", Host: "127.0.0.2", Port: 5060}
+	invite := sip.NewRequest(sip.INVITE, recipient)
+	invite.AppendHeader(&sip.ContactHeader{Address: caller})
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", "caller-tag")
+	invite.AppendHeader(&sip.FromHeader{Address: caller, Params: fromParams})
+	invite.AppendHeader(&sip.ToHeader{Address: recipient, Params: sip.NewParams()})
+	invite.AppendHeader(sip.NewHeader("Call-ID", "recording-dialog-test-call-id"))
+	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 100, MethodName: sip.INVITE})
+	if body != nil {
+		invite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		invite.SetBody(body)
+	}
+
+	dialogUA := &sipgo.DialogUA{Client: client, ContactHDR: sip.ContactHeader{Address: recipient}}
+	sess, err := dialogUA.ReadInvite(invite, inviteTx)
+	require.NoError(t, err)
+
+	d := &DialogServerSession{DialogServerSession: sess, mediaConf: conf}
+	// The media a test's answer makes is closed with the session it
+	// registered with.
+	t.Cleanup(func() { _ = d.Close() })
+	return d, sent
+}
+
+// newTestDialogMedia gives d media of its own, as an answer does: a media
+// session with no remote description yet, registered with d.
+func newTestDialogMedia(t *testing.T, d *DialogServerSession) *DialogMedia {
+	t.Helper()
+	sess, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	med := &DialogMedia{}
+	med.InitMediaSession(sess, nil, nil)
+	med.registerDialogCallbacks(&d.dialogCallbacks)
+	t.Cleanup(func() { _ = med.Close() })
+	return med
+}
+
 // newInDialogReInvite builds a body-less re-INVITE inside the dialog.
 func newInDialogReInvite(t *testing.T, d *DialogServerSession, seq uint32) *sip.Request {
 	t.Helper()
