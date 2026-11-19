@@ -39,9 +39,9 @@ func withRTCPMuxOnly(t *testing.T, body []byte) []byte {
 // RFC 8858 section 4.3: "The answerer MUST NOT associate an SDP
 // 'rtcp-mux-only' attribute with an SDP media description ("m=" line) in the
 // answer." So an audio stream offered outside a BUNDLE group is answered
-// without it, and so is one whose group is not performed (RFC 5888 section
-// 6). A stream the session rejects carries neither line, and the line of
-// such a stream says nothing of the audio one.
+// without it, and so is one whose group is not performed or whose a=group
+// line is ignored (RFC 5888 section 6). A stream the session rejects carries
+// neither line, and the line of such a stream says nothing of the audio one.
 //
 // An offer of ours has none: RFC 8843 section 9.3.1.1 has the offerer "MAY
 // include" it.
@@ -87,6 +87,13 @@ func TestMediaSessionWebrtcAnswerRepeatsRTCPMuxOnly(t *testing.T) {
 			group:        bundled,
 			audioMuxOnly: true,
 			after:        []string{videoWith("")},
+		},
+		{
+			// RFC 5888 section 6: a line that lists a tag of no m= line is
+			// ignored, so the audio stream is not a bundled one.
+			name:         "a_group_that_lists_a_tag_of_no_stream",
+			group:        "a=group:BUNDLE audio v",
+			audioMuxOnly: true,
 		},
 		{name: "written_at_the_session_level", group: bundled, session: true},
 	} {

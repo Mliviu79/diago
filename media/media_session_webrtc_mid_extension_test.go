@@ -43,7 +43,9 @@ func webrtcOfferWithExtmap(t *testing.T, offer []byte, session, media []string) 
 // in every offer and answer", and RFC 8285 section 7 lets an answer enable
 // only what the offer mapped, under the offer's identifier. So an answer
 // enables it for an audio stream offered in a BUNDLE group with the extension
-// mapped, and for no other.
+// mapped, and for no other. An audio stream whose a=group line lists a tag of
+// no m= line of the offer is in no group, since RFC 5888 section 6 has that
+// line ignored.
 //
 // An offer of ours enables it whenever its audio stream is in a BUNDLE group:
 // under the identifier the peer's offer gave the extension, also in a mapping
@@ -156,6 +158,7 @@ func TestMediaSessionWebrtcEnablesTheOfferedMIDExtension(t *testing.T) {
 		},
 		{name: "an_audio_stream_in_no_group", media: []string{"a=extmap:3 " + testMIDExtmap}},
 		{name: "an_audio_stream_outside_the_group", group: "a=group:BUNDLE other", media: []string{"a=extmap:3 " + testMIDExtmap}},
+		{name: "a_group_that_lists_a_tag_of_no_stream", group: "a=group:BUNDLE audio other", media: []string{"a=extmap:3 " + testMIDExtmap}},
 	}
 
 	for _, r := range rows {

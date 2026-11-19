@@ -38,8 +38,24 @@ type bundledAudio struct {
 // streams by their identification-tags (RFC 5888 section 5).
 const groupAttribute = "group"
 
-// webRTCStreamsAllIdentified reports whether every media section of desc has
-// an identification-tag. A description that leaves one of its streams without
+// webRTCDescriptionTags returns the identification-tag of each m= line of a
+// description, "" for a line that has none: those of the media sections of
+// desc and those of unread, the streams of the description its SDP parser was
+// not given, whose m= lines are lines of the description like the others.
+func webRTCDescriptionTags(desc *webrtcsdp.SessionDescription, unread unreadStreams) []string {
+	tags := make([]string, 0, len(desc.MediaDescriptions)+len(unread))
+	for _, md := range desc.MediaDescriptions {
+		tags = append(tags, webRTCIdentificationTag(md))
+	}
+	for _, stream := range unread {
+		tags = append(tags, stream.tag)
+	}
+	return tags
+}
+
+// webRTCStreamsAllIdentified reports whether every m= line of a description
+// has an identification-tag, where tags holds the tag of each: see
+// webRTCDescriptionTags. A description that leaves one of its streams without
 // a tag has no group, whatever its a=group lines list.
 //
 // RFC 5888 section 6: "All of the "m" lines of a session description that uses
@@ -50,27 +66,48 @@ const groupAttribute = "group"
 //
 // A section whose a=mid value is no tag counts as one without the line: see
 // offeredTag.
-func webRTCStreamsAllIdentified(desc *webrtcsdp.SessionDescription) bool {
-	return !slices.ContainsFunc(desc.MediaDescriptions, func(md *webrtcsdp.MediaDescription) bool {
-		return webRTCIdentificationTag(md) == ""
-	})
+func webRTCStreamsAllIdentified(tags []string) bool {
+	return !slices.Contains(tags, "")
 }
 
-// webRTCWithoutGroups returns attrs, the session-level attributes of a
-// description, without its a=group lines: the description as one that groups
-// no stream. It is what becomes of a description parsed without one of its
-// media sections when that section has no identification-tag, which
-// webRTCStreamsAllIdentified cannot see there.
-func webRTCWithoutGroups(attrs []webrtcsdp.Attribute) []webrtcsdp.Attribute {
-	return slices.DeleteFunc(slices.Clone(attrs), func(attr webrtcsdp.Attribute) bool { return attr.Key == groupAttribute })
+// webRTCGroupListsStreamsAlone reports whether every identification-tag of
+// list, the list of one a=group line, is that of an m= line of the
+// description, where tags holds the tag of each: see webRTCDescriptionTags. A
+// line that lists any other tag is no group of the description.
+//
+// RFC 5888 section 6: ""a=group" lines that contain identification-tags that
+// do not correspond to any "m" line within the session description MUST be
+// ignored. The application acts as if the "a=group" line did not exist."
+//
+// The sentence is about the one line, so the other a=group lines of the
+// description stand. A listed value that is no tag is the tag of no m= line.
+func webRTCGroupListsStreamsAlone(list, tags []string) bool {
+	return !slices.ContainsFunc(list, func(listed string) bool { return !slices.Contains(tags, listed) })
 }
 
-// webRTCBundleGroup returns the identification-tags of the BUNDLE group of
-// desc that lists tag, or nil when no group does. A stream without a tag is in
-// no group, and a description in which any stream is without one has no group
-// at all: see webRTCStreamsAllIdentified.
-func webRTCBundleGroup(desc *webrtcsdp.SessionDescription, tag string) []string {
-	if tag == "" || !webRTCStreamsAllIdentified(desc) {
+// webRTCBundleGroup returns the identification-tags of the BUNDLE group that
+// lists tag in a description, or nil when it has none. The description is
+// desc with unread, the streams of it the SDP parser was not given.
+//
+// This is where RFC 5888 section 6 is applied, and what depends on the audio
+// stream being bundled reads the group here: a stream without a tag is in no
+// group, a description in which any stream is without one has no group at all
+// (see webRTCStreamsAllIdentified), and an a=group line that lists a tag of
+// none of the description's m= lines is passed over as if it were not there
+// (see webRTCGroupListsStreamsAlone).
+//
+// The group is the first that stands and lists the tag. RFC 8843 section 5
+// has whoever writes a description put a stream in one BUNDLE group alone,
+// "Any given bundled "m=" section MUST NOT be associated with more than one
+// BUNDLE group at any given time", and no sentence says what the reader of a
+// description that lists the tag in two does: the stream is in one group for
+// us, the first, and our SDPs name it in one.
+func webRTCBundleGroup(desc *webrtcsdp.SessionDescription, unread unreadStreams, tag string) []string {
+	if tag == "" {
+		return nil
+	}
+	tags := webRTCDescriptionTags(desc, unread)
+	if !webRTCStreamsAllIdentified(tags) {
 		return nil
 	}
 	for _, attr := range desc.Attributes {
@@ -81,8 +118,12 @@ func webRTCBundleGroup(desc *webrtcsdp.SessionDescription, tag string) []string 
 		if len(fields) < 2 || fields[0] != bundleSemantics {
 			continue
 		}
-		if slices.Contains(fields[1:], tag) {
-			return fields[1:]
+		list := fields[1:]
+		if !webRTCGroupListsStreamsAlone(list, tags) {
+			continue
+		}
+		if slices.Contains(list, tag) {
+			return list
 		}
 	}
 	return nil
@@ -95,11 +136,12 @@ func webRTCIdentificationTag(md *webrtcsdp.MediaDescription) string {
 	return offeredTag(tag)
 }
 
-// webRTCBundledAudio returns what desc says of the BUNDLE group of audio, one
-// of its media sections.
-func webRTCBundledAudio(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.MediaDescription) bundledAudio {
+// webRTCBundledAudio returns what a description says of the BUNDLE group of
+// audio, one of the media sections of desc. The description is desc with
+// unread, the streams of it the SDP parser was not given.
+func webRTCBundledAudio(desc *webrtcsdp.SessionDescription, unread unreadStreams, audio *webrtcsdp.MediaDescription) bundledAudio {
 	tag := webRTCIdentificationTag(audio)
-	if webRTCBundleGroup(desc, tag) == nil {
+	if webRTCBundleGroup(desc, unread, tag) == nil {
 		return bundledAudio{}
 	}
 	return bundledAudio{
@@ -152,6 +194,12 @@ func ownOfferStreams(withoutBundle bool) offeredStreams {
 // for it: see webRTCStreamsAllIdentified. An SDP of ours that has the line
 // therefore identifies every one of its streams, which the same section asks
 // of "a session description that uses "group"".
+//
+// So is an offer whose a=group line lists, beside the tag of the audio
+// stream, a tag of none of its m= lines. The same section has that line
+// ignored (see webRTCGroupListsStreamsAlone), and an offer read without it
+// did not request the group, which section 7.3 of RFC 8843 then keeps out of
+// the answer.
 //
 // The list before any offer of the peer has the group of our own offer: see
 // ownOfferStreams.
@@ -206,13 +254,15 @@ func hasCandidate(attrs []webrtcsdp.Attribute) bool {
 // stream's credentials would not reach, so it gives none.
 //
 // A description that leaves any of its streams without an a=mid line has no
-// group to take candidates from (RFC 5888 section 6, see
-// webRTCStreamsAllIdentified): its audio section has its own alone.
-func webRTCCandidateAttributes(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.MediaDescription) []webrtcsdp.Attribute {
+// group to take candidates from, and neither has one whose a=group line lists
+// a tag of none of its m= lines (RFC 5888 section 6, see webRTCBundleGroup):
+// its audio section has its own alone. unread are the streams of the
+// description that desc was parsed without.
+func webRTCCandidateAttributes(desc *webrtcsdp.SessionDescription, unread unreadStreams, audio *webrtcsdp.MediaDescription) []webrtcsdp.Attribute {
 	if hasCandidate(audio.Attributes) {
 		return audio.Attributes
 	}
-	group := webRTCBundleGroup(desc, webRTCIdentificationTag(audio))
+	group := webRTCBundleGroup(desc, unread, webRTCIdentificationTag(audio))
 	if group == nil {
 		return audio.Attributes
 	}

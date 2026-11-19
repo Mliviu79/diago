@@ -351,9 +351,11 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // extension the offer mapped to its tag (RFC 8843 section 9.1). A stream the
 // offer gave no tag has no a=mid line, and a body whose offer listed the audio
 // stream in no BUNDLE group has no a=group line. Nor has one whose offer left
-// any of its streams without an a=mid line, which groups none (RFC 5888
-// section 6). Before any offer of the peer the audio stream has the tag 0 in
-// a group of its own, or neither line when Config.OfferWithoutBundle is set.
+// any of its streams without an a=mid line, which groups none, or listed the
+// audio stream in a group beside a tag of none of its streams, which is no
+// group (RFC 5888 section 6). Before any offer of the peer the audio stream
+// has the tag 0 in a group of its own, or neither line when
+// Config.OfferWithoutBundle is set.
 //
 // An offer of ours maps the header extension of the tag whenever its audio
 // stream is in a BUNDLE group (RFC 8843 section 9.1), whether or not an offer
@@ -489,7 +491,8 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // with no candidate is refused with an *ICEError that matches
 // ErrICEConnection. The candidates are those of the audio section, or, when
 // it lists none, of the sections bundled with it under its ICE credentials; a
-// description that leaves a stream without an a=mid line bundles none.
+// description that leaves a stream without an a=mid line bundles none, and an
+// a=group line that lists a tag of none of its streams bundles none either.
 //
 // A stream beside the audio one whose m= line the SDP parser does not read, a
 // media type or a transport outside those it knows, does not make the
@@ -545,7 +548,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	}
 
 	remoteCandidates := make([]ice.Candidate, 0, 4)
-	for _, attr := range webRTCCandidateAttributes(&desc, md) {
+	for _, attr := range webRTCCandidateAttributes(&desc, unread, md) {
 		if attr.Key != "candidate" {
 			continue
 		}
@@ -616,7 +619,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 		m.pendingMode = negotiateMediaDirection(remoteMode, localPreference)
 		m.pendingRTCPReducedSize = remoteRTCPReducedSize
 		m.offerAccepted(proto, offered)
-		m.stageOfferedStreams(unread.among(webRTCOfferedStreams(&desc, md)), offered)
+		m.stageOfferedStreams(webRTCOfferedStreams(&desc, unread, md), offered)
 		return nil
 	}
 	for _, candidate := range remoteCandidates {
@@ -632,7 +635,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 	m.recordDTLSAssociation(localSetup, fingerprints, tlsID, offered)
 	m.rtcpReducedSize = remoteRTCPReducedSize
 	m.offerAccepted(proto, offered)
-	m.keepOfferedStreams(unread.among(webRTCOfferedStreams(&desc, md)), offered)
+	m.keepOfferedStreams(webRTCOfferedStreams(&desc, unread, md), offered)
 	m.filterCodecs = common
 	m.Codecs = slices.Clone(common)
 	m.codec, _ = CodecAudioFromList(common)

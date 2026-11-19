@@ -67,6 +67,11 @@ func webrtcTaggedOffer(t *testing.T, alone []byte, group, audioTag string, befor
 // line that has no "mid" identification, the application MUST NOT perform any
 // grouping of media lines." An offer with such a line is answered without an
 // a=group line, whatever its own lists, and each stream keeps the tag it has.
+// The same section: ""a=group" lines that contain identification-tags that do
+// not correspond to any "m" line within the session description MUST be
+// ignored." An offer whose BUNDLE group lists such a tag beside that of the
+// audio stream did not request a group we may answer with one (RFC 8843
+// section 7.3), so it is answered without the line too.
 //
 // An offer that identifies no stream and asks for no group is answered with
 // neither line. RFC 8829 section 5.3.1 has each m= section of an answer
@@ -214,6 +219,59 @@ func TestMediaSessionWebrtcAnswerKeepsTheOfferedTags(t *testing.T) {
 			wantGroup: []string{"a=group:BUNDLE a"},
 			wantTags:  []string{"a", "fax"},
 		},
+		{
+			// RFC 5888 section 6: an a=group line that lists a tag of no
+			// m= line is ignored. This is the offer of two bundled streams
+			// that reaches us without the section of the second.
+			name:     "a_group_that_lists_a_tag_of_no_stream",
+			group:    "a=group:BUNDLE a v",
+			audioTag: "a",
+			wantTags: []string{"a"},
+		},
+		{
+			name:     "a_group_that_lists_a_tag_of_no_stream_beside_those_of_two",
+			group:    "a=group:BUNDLE v a d",
+			audioTag: "a",
+			before:   []string{webrtcTaggedSection("video", "v")},
+			wantTags: []string{"v", "a"},
+		},
+		{
+			// The tag of a stream the SDP parser of the session does not
+			// read is the tag of an m= line of the offer.
+			name:      "a_group_that_lists_an_identified_T.38_stream",
+			group:     "a=group:BUNDLE a fax",
+			audioTag:  "a",
+			after:     []string{"m=image 30004 udptl t38\r\na=mid:fax"},
+			wantGroup: []string{"a=group:BUNDLE a"},
+			wantTags:  []string{"a", "fax"},
+		},
+		{
+			name:     "a_group_that_lists_a_tag_of_no_stream_beside_a_T.38_stream",
+			group:    "a=group:BUNDLE a fax v",
+			audioTag: "a",
+			after:    []string{"m=image 30004 udptl t38\r\na=mid:fax"},
+			wantTags: []string{"a", "fax"},
+		},
+		{
+			// The line that lists a tag of no stream is ignored alone: the
+			// group of the next line is the one the answer keeps.
+			name:      "a_group_behind_a_line_that_lists_a_tag_of_no_stream",
+			group:     "a=group:BUNDLE a x\r\na=group:BUNDLE a v",
+			audioTag:  "a",
+			after:     []string{webrtcTaggedSection("video", "v")},
+			wantGroup: []string{"a=group:BUNDLE a"},
+			wantTags:  []string{"a", "v"},
+		},
+		{
+			// RFC 8843 section 5 keeps a stream in one BUNDLE group, so an
+			// SDP of ours names the audio stream in one line alone.
+			name:      "two_groups_that_list_the_audio_stream",
+			group:     "a=group:BUNDLE a v\r\na=group:BUNDLE a t",
+			audioTag:  "a",
+			after:     []string{webrtcTaggedSection("video", "v"), webrtcTaggedSection("text", "t")},
+			wantGroup: []string{"a=group:BUNDLE a"},
+			wantTags:  []string{"a", "v", "t"},
+		},
 	}
 
 	for _, r := range rows {
@@ -351,12 +409,152 @@ func TestWebRTCBundleGroupNeedsEveryStreamIdentified(t *testing.T) {
 			audio := webRTCAudioStream(&desc)
 			require.NotNil(t, audio)
 
-			assert.Equal(t, tc.want, webRTCBundleGroup(&desc, "1"), "the group of the audio stream")
-			streams := unread.among(webRTCOfferedStreams(&desc, audio))
+			assert.Equal(t, tc.want, webRTCBundleGroup(&desc, unread, "1"), "the group of the audio stream")
+			streams := webRTCOfferedStreams(&desc, unread, audio)
 			assert.Equal(t, tc.want != nil, streams.bundle.grouped, "the audio stream is listed in a group")
 			if tc.want == nil {
 				assert.Empty(t, streams.bundleGroupLines(), "the a=group lines of our answer")
 			}
+		})
+	}
+}
+
+// TestWebRTCBundleGroupListsStreamsOfTheDescriptionAlone pins which a=group
+// lines of a description are groups of it. RFC 5888 section 6: ""a=group"
+// lines that contain identification-tags that do not correspond to any "m"
+// line within the session description MUST be ignored. The application acts
+// as if the "a=group" line did not exist." So a line that lists the audio
+// stream's tag beside a tag of no m= line groups nothing, the other a=group
+// lines of the description stand, and the tag of a stream the SDP parser is
+// not given is the tag of an m= line like the others.
+//
+// A line that stands is read as it is written. No sentence has a tag listed
+// twice in it change the line, and of two BUNDLE groups that list the audio
+// stream, which RFC 8843 section 5 keeps a description from having, the first
+// is the group of the stream: our SDPs name it in one group alone.
+func TestWebRTCBundleGroupListsStreamsOfTheDescriptionAlone(t *testing.T) {
+	const (
+		session = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+		audio   = "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n"
+		video   = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+		image   = "m=image 30004 udptl t38\r\n"
+	)
+	groups := func(lists ...string) string {
+		var lines string
+		for _, list := range lists {
+			lines += "a=group:" + list + "\r\n"
+		}
+		return lines
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "every_listed_tag_that_of_a_stream",
+			body: session + groups("BUNDLE 1 2") + audio + video + "a=mid:2\r\n",
+			want: []string{"1", "2"},
+		},
+		{
+			name: "a_tag_of_no_stream_beside_the_audio_tag",
+			body: session + groups("BUNDLE 1 2") + audio,
+		},
+		{
+			name: "a_tag_of_no_stream_behind_those_of_two_streams",
+			body: session + groups("BUNDLE 1 2 3") + audio + video + "a=mid:2\r\n",
+		},
+		{
+			name: "a_tag_of_no_stream_ahead_of_the_audio_tag",
+			body: session + groups("BUNDLE 0 1") + audio,
+		},
+		{
+			// A tag is compared as it is written: RFC 8866 section 5 has a
+			// value "case-significant unless a specific field defines
+			// otherwise", and RFC 5888 defines nothing else for a tag.
+			name: "a_tag_in_another_case_than_the_stream_has_it",
+			body: session + groups("BUNDLE 1 V") + audio + video + "a=mid:v\r\n",
+		},
+		{
+			// The value of that a=mid line is no token, so the stream has no
+			// tag and the description no group at all.
+			name: "a_listed_value_that_is_no_tag_of_its_stream",
+			body: session + groups("BUNDLE 1 2") + audio + video + "a=mid:2 3\r\n",
+		},
+		{
+			name: "a_stream_refused_with_port_0_is_a_stream",
+			body: session + groups("BUNDLE 1 2") + audio + "m=video 0 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n",
+			want: []string{"1", "2"},
+		},
+		{
+			name: "the_tag_of_an_unread_stream",
+			body: session + groups("BUNDLE 1 fax") + audio + image + "a=mid:fax\r\n",
+			want: []string{"1", "fax"},
+		},
+		{
+			name: "the_tag_of_an_unread_stream_ahead_of_the_audio_one",
+			body: session + groups("BUNDLE fax 1") + image + "a=mid:fax\r\n" + audio,
+			want: []string{"fax", "1"},
+		},
+		{
+			name: "a_tag_of_no_stream_beside_that_of_an_unread_stream",
+			body: session + groups("BUNDLE 1 fax 2") + audio + image + "a=mid:fax\r\n",
+		},
+		{
+			name: "an_unread_stream_outside_a_group_that_lists_no_stream",
+			body: session + groups("BUNDLE 1 2") + audio + image + "a=mid:fax\r\n",
+		},
+		{
+			// The sentence is about the one line: the next stands.
+			name: "a_group_behind_a_line_that_lists_no_stream",
+			body: session + groups("BUNDLE 1 9", "BUNDLE 1 2") + audio + video + "a=mid:2\r\n",
+			want: []string{"1", "2"},
+		},
+		{
+			name: "a_group_ahead_of_a_line_that_lists_no_stream",
+			body: session + groups("BUNDLE 1 2", "BUNDLE 1 9") + audio + video + "a=mid:2\r\n",
+			want: []string{"1", "2"},
+		},
+		{
+			name: "a_line_of_other_semantics_that_lists_no_stream",
+			body: session + groups("LS 1 9", "BUNDLE 1 2") + audio + video + "a=mid:2\r\n",
+			want: []string{"1", "2"},
+		},
+		{
+			name: "the_line_of_another_group_that_lists_no_stream",
+			body: session + groups("BUNDLE 2 9", "BUNDLE 1") + audio + video + "a=mid:2\r\n",
+			want: []string{"1"},
+		},
+		{
+			name: "every_line_listing_a_tag_of_no_stream",
+			body: session + groups("BUNDLE 1 8", "BUNDLE 1 9") + audio,
+		},
+		{
+			name: "a_tag_listed_twice",
+			body: session + groups("BUNDLE 1 1") + audio,
+			want: []string{"1", "1"},
+		},
+		{
+			name: "two_BUNDLE_groups_that_list_the_audio_stream",
+			body: session + groups("BUNDLE 1 2", "BUNDLE 1 3") + audio + video + "a=mid:2\r\n" + video + "a=mid:3\r\n",
+			want: []string{"1", "2"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desc, unread, err := unmarshalWebRTCDescription([]byte(tc.body))
+			require.NoError(t, err)
+			audio := webRTCAudioStream(&desc)
+			require.NotNil(t, audio)
+
+			assert.Equal(t, tc.want, webRTCBundleGroup(&desc, unread, "1"), "the group of the audio stream")
+			streams := webRTCOfferedStreams(&desc, unread, audio)
+			assert.Equal(t, tc.want != nil, streams.bundle.grouped, "the audio stream is listed in a group")
+			var wantLines []string
+			if tc.want != nil {
+				wantLines = []string{"a=group:BUNDLE 1"}
+			}
+			assert.Equal(t, wantLines, streams.bundleGroupLines(), "the a=group lines of our answer")
+			assert.Equal(t, wantLines, streams.inOwnOffer().bundleGroupLines(), "the a=group lines of our offer afterwards")
 		})
 	}
 }
@@ -386,12 +584,12 @@ func iceCredentialLines(t *testing.T, body []byte) []string {
 // candidates of the audio stream of body from.
 func candidateLinesRead(t *testing.T, body []byte) []string {
 	t.Helper()
-	desc, _, err := unmarshalWebRTCDescription(body)
+	desc, unread, err := unmarshalWebRTCDescription(body)
 	require.NoError(t, err)
 	audio := webRTCAudioStream(&desc)
 	require.NotNil(t, audio, "the SDP has no audio stream\n%s", body)
 	var lines []string
-	for _, attr := range webRTCCandidateAttributes(&desc, audio) {
+	for _, attr := range webRTCCandidateAttributes(&desc, unread, audio) {
 		if attr.Key == "candidate" {
 			lines = append(lines, "a=candidate:"+attr.Value)
 		}
@@ -408,8 +606,9 @@ func candidateLinesRead(t *testing.T, body []byte) []string {
 // ahead of it. A section of another group, or with other credentials, is
 // another transport and gives none: the offer is then refused for having no
 // candidate, as an offer without any is. So is the offer whose group stands
-// beside a stream without an a=mid line, which groups nothing (RFC 5888
-// section 6).
+// beside a stream without an a=mid line, which groups nothing, and the one
+// whose group lists a tag of no m= line, which is ignored (RFC 5888 section
+// 6).
 func TestMediaSessionWebrtcTakesTheCandidatesOfItsBundle(t *testing.T) {
 	t.Run("listed_in_the_first_bundled_section", func(t *testing.T) {
 		offerer, answerer, offer, answer := newEstablishedWebrtcPair(t, func(offer string) string {
@@ -444,6 +643,21 @@ func TestMediaSessionWebrtcTakesTheCandidatesOfItsBundle(t *testing.T) {
 
 		assert.Equal(t, sdpLines(alone, "a=candidate:"), candidateLinesRead(t, offer), "the candidates read from the offer\n%s", offer)
 		require.NoError(t, answerer.RemoteSDP(t.Context(), offer, false), "the offer\n%s", offer)
+	})
+
+	t.Run("of_a_group_that_lists_an_identified_T.38_stream", func(t *testing.T) {
+		alone, answerer := newPair(t)
+		// The tag of the stream the SDP parser does not read is that of an
+		// m= line of the offer, so the group that lists it stands.
+		offer := webrtcBundledOffer(t, alone, "a=group:BUNDLE 0 1 fax", iceCredentialLines(t, alone))
+		offer = slices.Concat(offer, []byte("m=image 30004 udptl t38\r\na=mid:fax\r\n"))
+
+		assert.Equal(t, sdpLines(alone, "a=candidate:"), candidateLinesRead(t, offer), "the candidates read from the offer\n%s", offer)
+		require.NoError(t, answerer.RemoteSDP(t.Context(), offer, false), "the offer\n%s", offer)
+		answer, err := answerer.LocalSDP(t.Context(), true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a=group:BUNDLE 1"}, sdpLines(answer, "a=group:"), "the answer\n%s", answer)
+		assert.Equal(t, []string{"0", "1", "fax"}, streamTagsOf(answer), "the answer\n%s", answer)
 	})
 
 	t.Run("its_own_candidates_alone_when_it_has_some", func(t *testing.T) {
@@ -495,6 +709,18 @@ func TestMediaSessionWebrtcTakesTheCandidatesOfItsBundle(t *testing.T) {
 			group:  "a=group:BUNDLE 0 1",
 			behind: "m=image 30004 udptl t38",
 		},
+		{
+			// RFC 5888 section 6: an a=group line that lists a tag of no
+			// m= line is ignored, so the two sections it also lists are
+			// not bundled.
+			name:  "not_of_a_group_that_lists_a_tag_of_no_stream",
+			group: "a=group:BUNDLE 0 1 2",
+		},
+		{
+			name:   "not_of_a_group_that_lists_a_tag_of_no_stream_beside_a_T.38_stream",
+			group:  "a=group:BUNDLE 0 1 2",
+			behind: "m=image 30004 udptl t38\r\na=mid:fax",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			alone, answerer := newPair(t)
@@ -514,6 +740,51 @@ func TestMediaSessionWebrtcTakesTheCandidatesOfItsBundle(t *testing.T) {
 			require.Error(t, err, "an answer to the refused offer")
 		})
 	}
+}
+
+// TestMediaSessionWebrtcCarriesACallWhoseGroupListsNoStream negotiates two
+// sessions on an offer whose BUNDLE group lists the audio stream beside a tag
+// of no m= line, as an offer of two bundled streams arrives when the section
+// of the second was taken out of it on the way. RFC 5888 section 6 has that
+// a=group line ignored, so the audio stream is offered in no group: the answer
+// keeps its tag, has no a=group line and does not repeat the mapping of the
+// MID header extension, which is enabled in a bundled section alone (RFC 8843
+// section 9.1). The call is carried on the audio stream's own candidates, its
+// packets are sent as they are, and an offer of ours afterwards describes the
+// stream the same way.
+func TestMediaSessionWebrtcCarriesACallWhoseGroupListsNoStream(t *testing.T) {
+	offerer, answerer, offer, answer := newEstablishedWebrtcPair(t, func(offer string) string {
+		return string(webrtcTaggedOffer(t, []byte(offer), "a=group:BUNDLE audio video", "audio", nil, nil))
+	})
+	require.Equal(t, []string{"a=extmap:1 " + testMIDExtmap}, sdpLines(offer, "a=extmap:"), "the offer maps the extension\n%s", offer)
+	assert.Empty(t, sdpLines(answer, "a=group:"), "the answer\n%s", answer)
+	assert.Equal(t, []string{"audio"}, streamTagsOf(answer), "the answer\n%s", answer)
+	assert.Empty(t, sdpLines(answer, "a=extmap:"), "the answer\n%s", answer)
+
+	read := func(t *testing.T, from, to *MediaSessionWebrtc, seq uint16) {
+		t.Helper()
+		require.NoError(t, from.WriteRTP(dtlsTestPacket(seq)))
+		require.NoError(t, to.StopRTP(1, 5*time.Second))
+		got := rtp.Packet{}
+		_, err := to.ReadRTP(make([]byte, RTPBufSize), &got)
+		require.NoError(t, err, "the media did not arrive and decrypt")
+		require.NoError(t, to.StartRTP(1))
+		require.Equal(t, seq, got.SequenceNumber)
+		assert.False(t, got.Header.Extension, "a stream in no group is sent without its tag")
+	}
+	read(t, answerer, offerer, 1)
+	read(t, offerer, answerer, 2)
+
+	reoffer, err := answerer.ReOffer("")
+	require.NoError(t, err)
+	assert.Empty(t, sdpLines(reoffer, "a=group:"), "our re-offer\n%s", reoffer)
+	assert.Equal(t, []string{"audio"}, streamTagsOf(reoffer), "our re-offer\n%s", reoffer)
+	assert.Empty(t, sdpLines(reoffer, "a=extmap:"), "our re-offer\n%s", reoffer)
+	reanswer := exchangeWebrtcReOffer(t, answerer, offerer, reoffer)
+	assert.Empty(t, sdpLines(reanswer, "a=group:"), "the answer to our re-offer\n%s", reanswer)
+	assert.Equal(t, []string{"audio"}, streamTagsOf(reanswer), "the answer to our re-offer\n%s", reanswer)
+	read(t, answerer, offerer, 3)
+	read(t, offerer, answerer, 4)
 }
 
 // newPionPeer returns a Pion PeerConnection on the loopback interface, as a
@@ -637,6 +908,7 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 		"m=video 9 RTP/AVP/FOO 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 bad name/1\r\n"))
 	f.Add([]byte(session + audio + "m=video 9 UDP/TLS/RTP/SAVPF 96 0\r\na=rtpmap:96 VP8/90000/\r\na=rtpmap:96 H264/90000\r\na=rtpmap:98 VP9/90000\r\n"))
 	f.Add([]byte(session + "a=group:BUNDLE 1 2\r\n" + audio + "a=mid:1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\nm=image 30004 udptl t38\r\n"))
+	f.Add([]byte(session + "a=group:BUNDLE 1 9\r\na=group:BUNDLE 1 fax\r\n" + audio + "a=mid:1\r\nm=image 30004 udptl t38\r\na=mid:fax\r\n"))
 
 	f.Fuzz(func(t *testing.T, body []byte) {
 		desc, unread, err := unmarshalWebRTCDescription(body)
@@ -647,8 +919,8 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 		if md == nil {
 			return
 		}
-		streams := unread.among(webRTCOfferedStreams(&desc, md))
-		webRTCCandidateAttributes(&desc, md)
+		streams := webRTCOfferedStreams(&desc, unread, md)
+		webRTCCandidateAttributes(&desc, unread, md)
 		require.Len(t, streams.media, len(desc.MediaDescriptions)+len(unread), "one stream for each m= line")
 		require.Len(t, streams.formatLines, len(streams.media))
 		require.Equal(t, webRTCMediaLine(md), streams.media[streams.audio], "the stream that carries the call")
@@ -662,6 +934,9 @@ func FuzzWebRTCStreamIdentification(f *testing.F) {
 			require.Equal(t, []string{"a=group:BUNDLE " + streams.audioTag()}, group)
 			require.Len(t, streams.tags, len(streams.media))
 			require.NotContains(t, streams.tags, "", "a group is written for a body that identifies every stream alone")
+			listed := webRTCBundleGroup(&desc, unread, streams.audioTag())
+			require.Contains(t, listed, streams.audioTag(), "a group is written for an audio stream a group of the body lists alone")
+			require.Subset(t, streams.tags, listed, "a group is written for a group of the body that lists its streams alone")
 		}
 		if streams.audioTag() == "" {
 			require.Empty(t, streams.bundledAudioLines(), "an audio stream the offer gave no tag is written with none")

@@ -92,11 +92,14 @@ func webRTCRTPMaps(md *webrtcsdp.MediaDescription) []string {
 	return values
 }
 
-// webRTCOfferedStreams returns the stream list of desc: its m= lines in order,
-// with audio, one of its media sections, as the one that carries the call, the
-// identification-tag of each stream, the a=rtpmap lines each keeps when it is
-// rejected and what desc says of the BUNDLE group of the audio one.
-func webRTCOfferedStreams(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.MediaDescription) offeredStreams {
+// webRTCOfferedStreams returns the stream list of a description: its m= lines
+// in order, with audio, one of the media sections of desc, as the one that
+// carries the call, the identification-tag of each stream, the a=rtpmap lines
+// each keeps when it is rejected and what the description says of the BUNDLE
+// group of the audio one. The description is desc with unread, the streams of
+// it the SDP parser was not given, which stand in the list at their place: see
+// unreadStreams.among.
+func webRTCOfferedStreams(desc *webrtcsdp.SessionDescription, unread unreadStreams, audio *webrtcsdp.MediaDescription) offeredStreams {
 	streams := offeredStreams{
 		media:       make([]sdp.MediaDescription, len(desc.MediaDescriptions)),
 		formatLines: make([][]string, len(desc.MediaDescriptions)),
@@ -112,9 +115,9 @@ func webRTCOfferedStreams(desc *webrtcsdp.SessionDescription, audio *webrtcsdp.M
 	}
 	streams.tags = streamTags(tags)
 	streams.audioSSRCs = webRTCDeclaredSSRCs(audio)
-	streams.bundle = webRTCBundledAudio(desc, audio)
+	streams.bundle = webRTCBundledAudio(desc, unread, audio)
 	streams.extensions = webRTCMappedExtensions(desc, audio)
-	return streams
+	return unread.among(streams)
 }
 
 // keepOfferedStreams records the stream list of the description RemoteSDP
