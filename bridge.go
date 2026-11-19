@@ -100,6 +100,8 @@ func (b *Bridge) AddDialogMedia(m *DialogMedia) error {
 		if _, err := m.AudioReader(WithAudioReaderMediaProps(&med.ReaderProps), bridgeDTMFReader(&dtmfReader)); err != nil {
 			return err
 		}
+		// Until a proxy passes them on, the keys read have nowhere to go.
+		dtmfReader.OnDTMF(func(rune) error { return nil })
 		dtmfWriter := DTMFWriter{}
 		if _, err := m.AudioWriter(WithAudioWriterMediaProps(&med.WriterProps), bridgeDTMFWriter(&dtmfWriter)); err != nil {
 			return err
