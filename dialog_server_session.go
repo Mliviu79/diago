@@ -36,11 +36,17 @@ func (d *DialogServerSession) Id() string {
 	return d.ID
 }
 
+// Close releases the dialog's media and the dialog. It first waits for an
+// answer still running from its final response on, which an answer whose
+// caller stopped waiting leaves (AnswerContext): that wait is bounded by the
+// ACK wait of 64*T1 and the BYE that ends such a call, bounded by its
+// transaction's Timer F.
 func (d *DialogServerSession) Close() error {
 	if !d.closed.CompareAndSwap(0, 1) {
 		return nil
 	}
 
+	d.answers.Wait()
 	e1 := d.closeCallbacks()
 	e2 := d.DialogServerSession.Close()
 	return errors.Join(e1, e2)

@@ -3,6 +3,7 @@
 package diago
 
 import (
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -74,6 +75,25 @@ type sessionState struct {
 	// offer, so the ACK confirming the dialog must carry the answer (RFC 3261
 	// section 13.2.1).
 	ackCarriesAnswer bool
+
+	// answers counts the answers still running from their final response on,
+	// each on a goroutine of the dialog's (answerWithin). Close waits for
+	// them.
+	answers sync.WaitGroup
+
+	// log is the logger of the Diago that made this dialog, nil for a dialog
+	// no Diago made. Set before the dialog is handed out and not changed
+	// after; read it through logger.
+	log *slog.Logger
+}
+
+// logger returns the logger the dialog reports with: its Diago's, or the
+// default one for a dialog no Diago made.
+func (s *sessionState) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return sip.DefaultLogger()
 }
 
 // leaveCache removes the dialog from the dialog cache it was stored in, if

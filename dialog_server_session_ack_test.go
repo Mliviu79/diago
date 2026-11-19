@@ -267,6 +267,18 @@ func TestDialogServerAnswerWithByeBehindAck(t *testing.T) {
 			}
 			return err
 		}},
+		// The answers whose wait ends with a ctx run from their 2xx on on a
+		// goroutine of the dialog's, which reads the ACK.
+		{name: "AnswerContext", answer: func(d *DialogServerSession, _ *DialogMedia) error {
+			t.Cleanup(func() { _ = d.Close() })
+			_, err := d.AnswerContext(t.Context())
+			return err
+		}},
+		{name: "AnswerOptions", answer: func(d *DialogServerSession, _ *DialogMedia) error {
+			t.Cleanup(func() { _ = d.Close() })
+			_, err := d.AnswerOptions(t.Context(), AnswerOptions{})
+			return err
+		}},
 	}
 	for _, tc := range answers {
 		t.Run(tc.name, func(t *testing.T) {

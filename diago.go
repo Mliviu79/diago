@@ -312,6 +312,7 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 				externalIP: tran.MediaExternalIP,
 				dtlsConf:   tran.MediaDTLSConf,
 			},
+			sessionState: sessionState{log: dg.log},
 		}
 
 		defer closeAndLog(dWrap, "closing dialog server returned error")
