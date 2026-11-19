@@ -87,6 +87,9 @@ func webRTCParserReadsMediaLine(section []byte) bool {
 // the parser refuses is parsed again without the sections whose m= line it
 // does not read, when it has such sections, and those are returned as unread.
 // Whatever else the parser refuses stays an error, the parser's own.
+//
+// The description returned has no a=group line when one of the unread streams
+// has no identification-tag: see unreadStreams.allIdentified.
 func unmarshalWebRTCDescription(body []byte) (webrtcsdp.SessionDescription, unreadStreams, error) {
 	var desc webrtcsdp.SessionDescription
 	err := desc.Unmarshal(body)
@@ -135,7 +138,19 @@ func unmarshalWebRTCDescription(body []byte) (webrtcsdp.SessionDescription, unre
 	if reducedErr := reduced.Unmarshal(readable); reducedErr != nil {
 		return reduced, nil, reducedErr
 	}
+	if !unread.allIdentified() {
+		reduced.Attributes = webRTCWithoutGroups(reduced.Attributes)
+	}
 	return reduced, unread, nil
+}
+
+// allIdentified reports whether every unread stream has an
+// identification-tag. A description with a stream that has none groups no
+// stream (RFC 5888 section 6, see webRTCStreamsAllIdentified), and the
+// description parsed without that stream no longer shows it, so it is handed
+// on without its a=group lines.
+func (u unreadStreams) allIdentified() bool {
+	return !slices.ContainsFunc(u, func(stream unreadStream) bool { return stream.tag == "" })
 }
 
 // among returns streams, the stream list read from a description parsed

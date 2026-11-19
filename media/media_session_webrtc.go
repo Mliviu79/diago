@@ -349,9 +349,10 @@ func (m *MediaSessionWebrtc) CommonCodecs() []Codec {
 // the offer listed it in (RFC 8843 sections 7.3 and 7.3.3), with the header
 // extension the offer mapped to its tag (RFC 8843 section 9.1). A stream the
 // offer gave no tag has no a=mid line, and a body whose offer listed the audio
-// stream in no BUNDLE group has no a=group line. Before any offer of the peer
-// the audio stream has the tag 0 in a group of its own, or neither line when
-// Config.OfferWithoutBundle is set.
+// stream in no BUNDLE group has no a=group line. Nor has one whose offer left
+// any of its streams without an a=mid line, which groups none (RFC 5888
+// section 6). Before any offer of the peer the audio stream has the tag 0 in
+// a group of its own, or neither line when Config.OfferWithoutBundle is set.
 func (m *MediaSessionWebrtc) LocalSDP(_ context.Context, answered bool) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -476,7 +477,8 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // left out and the candidates of the other lines are used; a description left
 // with no candidate is refused with an *ICEError that matches
 // ErrICEConnection. The candidates are those of the audio section, or, when
-// it lists none, of the sections bundled with it under its ICE credentials.
+// it lists none, of the sections bundled with it under its ICE credentials; a
+// description that leaves a stream without an a=mid line bundles none.
 //
 // A stream beside the audio one whose m= line the SDP parser does not read, a
 // media type or a transport outside those it knows, does not make the

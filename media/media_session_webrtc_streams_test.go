@@ -83,6 +83,12 @@ func withoutOriginLine(lines []string) []string {
 	return slices.DeleteFunc(slices.Clone(lines), func(l string) bool { return strings.HasPrefix(l, "o=") })
 }
 
+// withoutGroupLines returns lines without their a=group lines, which an
+// answer has only for an offer that identifies every one of its streams.
+func withoutGroupLines(lines []string) []string {
+	return slices.DeleteFunc(slices.Clone(lines), func(l string) bool { return strings.HasPrefix(l, "a=group:") })
+}
+
 // webrtcAudioSectionAlone returns the lines of body, an SDP of a WebRTC
 // session written around more than one stream, as they describe the audio
 // stream alone: without the section of each rejected stream, which runs from
@@ -139,7 +145,9 @@ func webrtcReOfferMediaLines(t *testing.T, m *MediaSessionWebrtc) []string {
 // A stream rejected out of a BUNDLE group is written the same way, which is
 // what RFC 8843 section 7.3.3 asks: a zero port and no a=bundle-only. The
 // a=group:BUNDLE list of our SDP names the tag of its audio stream alone, and
-// each stream keeps the tag of the offer (RFC 5888 section 9.1).
+// each stream keeps the tag of the offer (RFC 5888 section 9.1). The rows
+// whose offer leaves a stream without an a=mid line are answered without the
+// a=group line (RFC 5888 section 6).
 func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 	type row struct {
 		name string
@@ -274,14 +282,20 @@ func TestMediaSessionWebrtcAnswersEveryOfferedStream(t *testing.T) {
 
 			want := slices.Concat(r.wantBefore, audio, r.wantAfter)
 			assert.Equal(t, want, mediaLines(answer), "the answer's m= lines\n%s", answer)
-			assert.Equal(t, withoutOriginLine(streamsSDPLines(aloneAnswer)), withoutOriginLine(webrtcAudioSectionAlone(t, answer)),
-				"the audio stream is answered as it is when offered alone, apart from the source it declares")
+			assert.Equal(t, withoutGroupLines(withoutOriginLine(streamsSDPLines(aloneAnswer))), withoutGroupLines(withoutOriginLine(webrtcAudioSectionAlone(t, answer))),
+				"the audio stream is answered as it is when offered alone, apart from the source it declares and the group")
 
 			// RFC 8843 section 7.3.3: a rejected stream has no
 			// a=bundle-only, and the group names the audio stream alone. RFC
 			// 5888 section 9.1: each stream answers under the offer's tag.
+			// Section 6: an offer that leaves a stream without an a=mid
+			// line groups none, so its answer has no a=group line.
+			wantGroup := []string{"a=group:BUNDLE 0"}
+			if slices.Contains(streamTagsOf(offer), "") {
+				wantGroup = nil
+			}
 			assert.Empty(t, sdpLines(answer, "a=bundle-only"), "the answer\n%s", answer)
-			assert.Equal(t, []string{"a=group:BUNDLE 0"}, sdpLines(answer, "a=group:"), "the answer's group\n%s", answer)
+			assert.Equal(t, wantGroup, sdpLines(answer, "a=group:"), "the answer's group\n%s", answer)
 			assert.Equal(t, streamTagsOf(offer), streamTagsOf(answer), "the answer's tags\n%s", answer)
 		})
 	}
