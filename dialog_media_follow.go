@@ -19,10 +19,15 @@ import (
 // replaced session, and that read is taken up again on msess with the read
 // deadline msess holds by then.
 //
-// The sockets of the session replaced are closed last, when msess runs on
-// its own, see closeReplacedSockets.
+// The sockets of the session replaced are closed when msess runs on its own,
+// see closeReplacedSockets.
 //
-// Must be called with d.mu held.
+// The media update hooks run last, once msess is in place and what it
+// replaced is closed. This is where every media update installs its session,
+// so the hooks see each update once, and a session staged for a handshake only
+// when it is installed.
+//
+// Must be called with d.mu held, which is released while the hooks run.
 func (d *DialogMedia) replaceMediaSessionUnsafe(msess *media.MediaSession) error {
 	old := d.mediaSession
 	if old != nil && old != msess {
@@ -33,5 +38,9 @@ func (d *DialogMedia) replaceMediaSessionUnsafe(msess *media.MediaSession) error
 	if err := d.replaceRTPSessionUnsafe(msess); err != nil {
 		return err
 	}
-	return closeReplacedSockets(old, msess)
+	if err := closeReplacedSockets(old, msess); err != nil {
+		return err
+	}
+	d.runMediaUpdateHooksUnsafe()
+	return nil
 }

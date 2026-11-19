@@ -81,6 +81,10 @@ type DialogMedia struct {
 	onClose       func() error
 	onMediaUpdate func(*DialogMedia)
 
+	// mediaUpdateHooks are told of every media update, as onMediaUpdate is,
+	// see addMediaUpdateHook.
+	mediaUpdateHooks []*mediaUpdateHook
+
 	// offerRequested is set while the peer's request has brought no session
 	// description and so asks for our offer, until that offer is made. See
 	// noteOfferRequest.
