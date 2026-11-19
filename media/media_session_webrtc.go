@@ -586,7 +586,18 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 // Finalize completes ICE first and DTLS second. This order is the central
 // WebRTC layering rule: ICE selects and maintains the network path; DTLS and
 // all encrypted media then travel only over that path.
+//
+// Each of the two waits for the peer and ends with an error when ctx is done
+// first, or at the latest after ICEConnectTimeout and DTLSHandshakeTimeout. A
+// negotiation FinalizeWithin left running is waited for in place of a new one.
 func (m *MediaSessionWebrtc) Finalize(ctx context.Context) error {
+	return m.finalize(ctx)
+}
+
+// negotiate is the negotiation Finalize runs. capped bounds its wait for the
+// connectivity checks by ICEConnectTimeout and its handshake by
+// DTLSHandshakeTimeout; without it only ctx ends them.
+func (m *MediaSessionWebrtc) negotiate(ctx context.Context, capped bool) error {
 	m.mu.Lock()
 	if m.ready {
 		if len(m.pendingCodecs) > 0 {
@@ -608,10 +619,10 @@ func (m *MediaSessionWebrtc) Finalize(ctx context.Context) error {
 	if agent == nil || dtlsConn == nil {
 		return fmt.Errorf("remote WebRTC SDP is not configured")
 	}
-	if err := agent.AwaitConnect(ctx); err != nil {
+	if err := negotiationStep(ctx, capped, ICEConnectTimeout, agent.AwaitConnect); err != nil {
 		return &ICEError{Phase: ICEPhaseConnection, Err: err}
 	}
-	if err := dtlsConn.HandshakeContext(ctx); err != nil {
+	if err := negotiationStep(ctx, capped, DTLSHandshakeTimeout, dtlsConn.HandshakeContext); err != nil {
 		return fmt.Errorf("DTLS handshake: %w", err)
 	}
 	if err := m.retireDTLS(dtlsConn); err != nil {
@@ -698,6 +709,9 @@ func (m *MediaSessionWebrtc) Close() error {
 	mux := m.mux
 	agent := m.agent
 	m.mu.Unlock()
+	// A negotiation left running reads and writes the mux and the agent
+	// closed below, so it ends first.
+	m.leftRunning.stop()
 	var muxErr, agentErr error
 	if mux != nil {
 		muxErr = mux.Close()
@@ -761,6 +775,9 @@ func (m *MediaSessionWebrtc) ReadRTPRaw(buf []byte) (int, error) {
 }
 
 func (m *MediaSessionWebrtc) WriteRTP(pkt *rtp.Packet) error {
+	if m.leftRunning.unkeyed.Load() {
+		return ErrDTLSNotKeyed
+	}
 	if !m.ready || m.mux == nil || m.localCtxSRTP == nil {
 		return fmt.Errorf("WebRTC media is not finalized")
 	}
@@ -805,6 +822,9 @@ func (m *MediaSessionWebrtc) ReadRTCP(buf []byte, pkts []rtcp.Packet) (int, erro
 }
 
 func (m *MediaSessionWebrtc) WriteRTCP(pkt rtcp.Packet) error {
+	if m.leftRunning.unkeyed.Load() {
+		return ErrDTLSNotKeyed
+	}
 	data, err := pkt.Marshal()
 	if err != nil {
 		return err

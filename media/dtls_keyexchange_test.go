@@ -435,3 +435,35 @@ func TestICEDTLSSRTPSession(t *testing.T) {
 		assert.Equal(t, payload, got.Payload, "%s: payload must survive the SRTP round trip", dir.name)
 	}
 }
+
+// TestIsClientHelloDatagram pins what may be resent as a ClientHello: one
+// DTLS handshake record in epoch 0 holding the whole message, and nothing
+// else.
+func TestIsClientHelloDatagram(t *testing.T) {
+	// record builds a datagram of one handshake record of msgType, whose
+	// message is msgLen bytes of which the record carries fragLen from
+	// fragOffset.
+	record := func(epoch uint16, msgType byte, msgLen, fragOffset, fragLen int) []byte {
+		h := []byte{msgType,
+			byte(msgLen >> 16), byte(msgLen >> 8), byte(msgLen),
+			0, 0,
+			byte(fragOffset >> 16), byte(fragOffset >> 8), byte(fragOffset),
+			byte(fragLen >> 16), byte(fragLen >> 8), byte(fragLen),
+		}
+		h = append(h, make([]byte, fragLen)...)
+		p := []byte{22, 0xfe, 0xfd, byte(epoch >> 8), byte(epoch), 0, 0, 0, 0, 0, 1, byte(len(h) >> 8), byte(len(h))}
+		return append(p, h...)
+	}
+
+	require.True(t, isClientHelloDatagram(record(0, 1, 122, 0, 122)))
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 0, 60)), "a fragment")
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 60, 62)), "a fragment")
+	require.False(t, isClientHelloDatagram(record(1, 1, 122, 0, 122)), "epoch 1")
+	require.False(t, isClientHelloDatagram(record(0, 11, 122, 0, 122)), "a Certificate")
+	two := append(record(0, 1, 122, 0, 122), record(0, 1, 122, 0, 122)...)
+	require.False(t, isClientHelloDatagram(two), "two records")
+	require.False(t, isClientHelloDatagram(record(0, 1, 122, 0, 122)[:40]), "cut short")
+	rtpLike := record(0, 1, 122, 0, 122)
+	rtpLike[0] = 0x80
+	require.False(t, isClientHelloDatagram(rtpLike), "RTP")
+}

@@ -13,10 +13,12 @@ import (
 )
 
 // DTLSHandshakeTimeout caps how long the DTLS handshake Finalize and
-// FinalizeContext run may wait for the peer. The DTLS stack retransmits its
-// flights for as long as its context lives, so without a cap a peer that never
-// completes the handshake would hold it, the caller of Finalize and the socket
-// forever.
+// FinalizeContext run may wait for the peer, on a MediaSession and on a
+// MediaSessionWebrtc. The DTLS stack retransmits its flights for as long as
+// its context lives, so without a cap a peer that never completes the
+// handshake would hold it, the caller of Finalize and the socket forever. A
+// handshake MediaSessionWebrtc.FinalizeWithin left running is capped from the
+// moment Finalize waits for it.
 var DTLSHandshakeTimeout = 30 * time.Second
 
 // negotiateDTLS applies the DTLS part of the SDP RemoteSDP is reading, whose

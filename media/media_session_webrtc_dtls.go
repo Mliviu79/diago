@@ -21,6 +21,10 @@ type webrtcSessionState struct {
 	// as the peer wrote it, empty before any. The answer to that offer
 	// repeats it.
 	offeredProto string
+
+	// leftRunning is the negotiation FinalizeWithin left running. It guards
+	// itself.
+	leftRunning negotiationLeftRunning
 }
 
 // dtlsTransport returns the packet conn the DTLS handshake runs over, which is
