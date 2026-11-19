@@ -16,16 +16,16 @@ func bridgeSameAudio(a, b media.Codec) bool {
 
 // hookUnsafe has the bridge told of the media updates of m, which has joined
 // it. Must be called with b.mu held.
-func (b *BridgeMix) hookUnsafe(m *DialogMedia) {
+func (b *BridgeMix) hookUnsafe(m bridgeMixMedia) {
 	if b.unhooks == nil {
-		b.unhooks = map[*DialogMedia]func(){}
+		b.unhooks = map[bridgeMixMedia]func(){}
 	}
 	b.unhooks[m] = m.addMediaUpdateHook(func() { b.mediaUpdated(m) })
 }
 
 // unhookUnsafe removes the media update hook of a media that has left the
 // bridge. Must be called with b.mu held.
-func (b *BridgeMix) unhookUnsafe(m *DialogMedia) {
+func (b *BridgeMix) unhookUnsafe(m bridgeMixMedia) {
 	if unhook, ok := b.unhooks[m]; ok {
 		unhook()
 		delete(b.unhooks, m)
@@ -37,7 +37,7 @@ func (b *BridgeMix) unhookUnsafe(m *DialogMedia) {
 // started, so once the media's codec has changed the mix is restarted, as a
 // join or leave restarts it: the media is mixed with its new codec, or taken
 // out of the bridge when its audio no longer matches the mix.
-func (b *BridgeMix) mediaUpdated(m *DialogMedia) {
+func (b *BridgeMix) mediaUpdated(m bridgeMixMedia) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	mixedWith, mixed := b.streamCodecs[m]
@@ -45,13 +45,12 @@ func (b *BridgeMix) mediaUpdated(m *DialogMedia) {
 		// No mix runs with this media. The next one reads its codec anew.
 		return
 	}
-	p := MediaProps{}
-	m.audioReaderProps(&p)
-	if p.Codec == mixedWith {
+	codec := bridgeMixCodec(m)
+	if codec == mixedWith {
 		return
 	}
 
-	b.log.Debug("Dialog codec changed, restarting mix", "codec", p.Codec.String())
+	b.log.Debug("Dialog codec changed, restarting mix", "codec", codec.String())
 	if err := b.mixStopWait(); err != nil {
 		// As at a leave, the mix restarts on every media regardless.
 		b.log.Warn("Stopping the mix for a media update failed", "error", err)

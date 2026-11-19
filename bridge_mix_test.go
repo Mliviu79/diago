@@ -176,7 +176,7 @@ func TestBridgeMixWaitsForStopInProgress(t *testing.T) {
 	// A mix is running. The test stands in for its goroutines, which keep
 	// reading until the test lets them stop.
 	b.mu.Lock()
-	b.medias = []*DialogMedia{a.media, c.media}
+	b.medias = []bridgeMixMedia{a.media, c.media}
 	b.mixWG.Add(1)
 	b.stateWriteUnsafe(1)
 	b.mu.Unlock()

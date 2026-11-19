@@ -47,7 +47,7 @@ func proxyMediaBackground(log *slog.Logger, reader io.Reader, writer io.Writer, 
 // Experimental: not fully tested yet
 type BridgeMix struct {
 	mu     sync.Mutex
-	medias []*DialogMedia
+	medias []bridgeMixMedia
 
 	mixWG    sync.WaitGroup
 	mixState int
@@ -58,9 +58,9 @@ type BridgeMix struct {
 	mixCodec media.Codec
 	// streamCodecs is the codec the running mix decodes and encodes each
 	// media with, and nil while no mix runs
-	streamCodecs map[*DialogMedia]media.Codec
+	streamCodecs map[bridgeMixMedia]media.Codec
 	// unhooks removes the media update hook of each media in the bridge
-	unhooks map[*DialogMedia]func()
+	unhooks map[bridgeMixMedia]func()
 
 	// WaitDialogsNum is just helper flag when to start proxy
 	WaitDialogsNum int
@@ -75,8 +75,16 @@ type BridgeMix struct {
 	// It stays there once the media has left the bridge, and every later mix
 	// reads through it.
 	RealtimeReaderPerMix bool
-	Poll                 bool
-	log                  *slog.Logger
+	// WriteDeadlineLosesFrame has a write to a media that fails on a write
+	// deadline, while the mix runs, lose that frame for that media alone:
+	// the media stays in the mix and is written the next frame.
+	//
+	// By default such a media is taken out of the running mix, and is
+	// written nothing more until the next join, leave or codec change
+	// restarts the mix.
+	WriteDeadlineLosesFrame bool
+	Poll                    bool
+	log                     *slog.Logger
 }
 
 var (
@@ -112,7 +120,7 @@ func (b *BridgeMix) String() string {
 	str := fmt.Sprintf("state: %d", b.mixState)
 	str += " medias:["
 	for _, m := range b.medias {
-		str += fmt.Sprintf(" %d", m.RTPPacketWriter.SSRC)
+		str += fmt.Sprintf(" %d", m.packetWriterSSRC())
 	}
 	str += "]"
 	return str
@@ -122,10 +130,10 @@ func (b *BridgeMix) String() string {
 // It is not safe to use media until it is removed from bridge.
 // A media that a re-INVITE moved to audio the bridge can not mix with the
 // others is taken out of the bridge at the next join, leave or codec change.
+//
+// The WebRTC medias in the bridge are listed by DialogWebrtcList.
 func (b *BridgeMix) DialogMediaList() []*DialogMedia {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Clone(b.medias)
+	return bridgeMixList[*DialogMedia](b)
 }
 
 // AddDialogMedia adds m to the bridge and mixes its audio with that of the
@@ -134,15 +142,20 @@ func (b *BridgeMix) DialogMediaList() []*DialogMedia {
 // ErrNoMediaSetup, one that is in the bridge already, and one whose audio
 // differs from the mix in sample rate or frame duration.
 func (b *BridgeMix) AddDialogMedia(m *DialogMedia) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if m == nil {
 		return fmt.Errorf("dialog media is nil")
 	}
+	return b.addMedia(m)
+}
+
+// addMedia is AddDialogMedia and AddDialogWebrtc for a media of either type.
+func (b *BridgeMix) addMedia(m bridgeMixMedia) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// The mix reads the media's codec from its media session
-	if m.MediaSession() == nil {
-		return fmt.Errorf("dialog media has no media session: %w", ErrNoMediaSetup)
+	if _, err := m.NegotiatedProps(); err != nil {
+		return fmt.Errorf("dialog media has no media session: %w", err)
 	}
 
 	// Stop any current mixing
@@ -176,10 +189,16 @@ func (b *BridgeMix) AddDialogMedia(m *DialogMedia) error {
 // mix has stopped reading m when it returns. m leaves even when stopping the
 // mix reports an error, which is then returned.
 func (b *BridgeMix) RemoveDialogMedia(m *DialogMedia) error {
+	return b.removeMedia(m)
+}
+
+// removeMedia is RemoveDialogMedia and RemoveDialogWebrtc for a media of
+// either type.
+func (b *BridgeMix) removeMedia(m bridgeMixMedia) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var media *DialogMedia
+	var media bridgeMixMedia
 	for _, bm := range b.medias {
 		if bm == m {
 			media = bm
@@ -273,7 +292,7 @@ func (b *BridgeMix) mixStop() error {
 // differs, or can not be mixed at all, is taken out of the bridge and the
 // others are mixed. mixStart returns why each media it took out could not be
 // mixed.
-func (b *BridgeMix) mixStart() (notMixed map[*DialogMedia]error) {
+func (b *BridgeMix) mixStart() (notMixed map[bridgeMixMedia]error) {
 	if b.mixState == 2 {
 		// A stop is in progress (another goroutine is in mixStopWait).
 		// Don't start a new mix to avoid WaitGroup Add/Wait race.
@@ -290,17 +309,15 @@ func (b *BridgeMix) mixStart() (notMixed map[*DialogMedia]error) {
 
 	codecs := make([]media.Codec, len(b.medias))
 	for i, m := range b.medias {
-		p := MediaProps{}
-		m.audioReaderProps(&p)
-		codecs[i] = p.Codec
+		codecs[i] = bridgeMixCodec(m)
 	}
 	mixCodec := b.mixCodec
 	if !slices.ContainsFunc(codecs, func(c media.Codec) bool { return bridgeSameAudio(c, mixCodec) }) {
 		mixCodec = codecs[0]
 	}
 
-	notMixed = map[*DialogMedia]error{}
-	streamCodecs := map[*DialogMedia]media.Codec{}
+	notMixed = map[bridgeMixMedia]error{}
+	streamCodecs := map[bridgeMixMedia]media.Codec{}
 	var rwStreams []*bridgePCMStream
 	for _, m := range b.medias {
 		stream := &bridgePCMStream{}
@@ -315,7 +332,7 @@ func (b *BridgeMix) mixStart() (notMixed map[*DialogMedia]error) {
 		b.log.Warn("Dialog can not be mixed, taking it out of the bridge", "error", err)
 		b.unhookUnsafe(m)
 	}
-	b.medias = slices.DeleteFunc(b.medias, func(m *DialogMedia) bool {
+	b.medias = slices.DeleteFunc(b.medias, func(m bridgeMixMedia) bool {
 		_, out := notMixed[m]
 		return out
 	})
@@ -449,6 +466,10 @@ func (b *BridgeMix) mixLoop(rwStreams []*bridgePCMStream, poll bool, frameDur ti
 					}
 
 					// Mixing has been stopped or network problem
+					if b.WriteDeadlineLosesFrame {
+						b.log.Debug("Writing stream failed", "stream.id", w.id, "error", err)
+						continue
+					}
 					w.markGone = true
 					continue
 
@@ -476,7 +497,7 @@ type bridgePCMStream struct {
 	codec media.Codec
 	// media is the dialog's media, whose current session a direct read sets its
 	// deadline on
-	media *DialogMedia
+	media bridgeMixMedia
 	// read buf
 	buf []byte
 	n   int
@@ -486,7 +507,7 @@ type bridgePCMStream struct {
 	markGone  bool
 }
 
-func (b *BridgeMix) addDialogStream(m *DialogMedia, stream *bridgePCMStream, mixCodec media.Codec) error {
+func (b *BridgeMix) addDialogStream(m bridgeMixMedia, stream *bridgePCMStream, mixCodec media.Codec) error {
 	// The reader, the writer and their codec are read together, so a re-INVITE
 	// can not give the stream's decoder and encoder different codecs.
 	p := MediaProps{}
@@ -508,7 +529,7 @@ func (b *BridgeMix) addDialogStream(m *DialogMedia, stream *bridgePCMStream, mix
 			return rtr
 		}
 
-		rtr := media.NewRTPRealTimeReader(r, m.RTPPacketReader, p.Codec)
+		rtr := media.NewRTPRealTimeReader(r, m.packetReader(), p.Codec)
 		if !b.RealtimeReaderPerMix {
 			m.SetAudioReader(rtr)
 		}
@@ -532,7 +553,7 @@ func (b *BridgeMix) addDialogStream(m *DialogMedia, stream *bridgePCMStream, mix
 		w:         &pcmWriter,
 		codec:     p.Codec,
 		media:     m,
-		id:        m.RTPPacketWriter.SSRC,
+		id:        m.packetWriterSSRC(),
 		buf:       make([]byte, media.RTPBufSize),
 		pipeRead:  make(chan int),
 		pipeWrite: make(chan []byte),
