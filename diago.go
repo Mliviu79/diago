@@ -199,6 +199,14 @@ type MediaConfig struct {
 	// carries every configured codec too unless this is set.
 	ReInviteNegotiatedCodecs bool
 
+	// WebrtcConfig is the WebRTC media configuration of every DialogWebrtc
+	// built from this config, so a call need not pass one. The configuration
+	// a call passes in its options wins field by field: a field it leaves at
+	// its zero value takes this config's value, and so a call cannot set a
+	// field back to its zero value, such as a bool to false, that this config
+	// sets.
+	WebrtcConfig media.MediaSessionWebrtcConfig
+
 	// Used internally
 	secureRTP  int // 0 - none, 1 - sdes
 	bindIP     net.IP

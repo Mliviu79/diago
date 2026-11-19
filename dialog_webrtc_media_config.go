@@ -14,18 +14,21 @@ import (
 
 // webrtcConfig returns the transport configuration of a DialogWebrtc built
 // from conf, for a call that passed call. What the call set is kept, field by
-// field, and conf supplies the rest, as the media of every other call on the
-// transport takes it:
+// field. A field the call left at its zero value takes the value of
+// conf.WebrtcConfig, and conf supplies the rest, as the media of every other
+// call on the transport takes it:
 //
 //   - The socket of each ICE generation is bound on the transport's media
 //     address, on the port conf.RTPPortAllocator hands out, which goes back
 //     to the allocator once the generation's socket is closed. Without an
 //     allocator the port is that of the media package port range, or one the
 //     system chooses. A call that gives its own ICE.Socket, or a PortMin or
-//     PortMax of its own, keeps that: its port choice is the call's.
+//     PortMax of its own, keeps that: its port choice is the call's. So does
+//     a call that takes one of them from conf.WebrtcConfig.
 //   - The c= line gives the transport's external media address, unless the
-//     call gives its own ICE.ExternalIP.
+//     call, or conf.WebrtcConfig, gives its own ICE.ExternalIP.
 func (conf MediaConfig) webrtcConfig(call media.MediaSessionWebrtcConfig) media.MediaSessionWebrtcConfig {
+	call = withDefaultWebrtcConfig(call, conf.WebrtcConfig)
 	if call.ICE.Socket == nil && call.PortMin == 0 && call.PortMax == 0 {
 		call.ICE.Socket = conf.iceSocket
 	}

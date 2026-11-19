@@ -45,6 +45,9 @@ func (dg *Diago) mediaConfForTransport(tran *Transport) MediaConfig {
 		// config, so a config that does not carry it leaves every dialog on
 		// the default port choice while the allocator sits unused.
 		RTPPortAllocator: dg.mediaConf.RTPPortAllocator,
+		// The WebRTC media of a dialog reads its defaults from the per dialog
+		// config, as it reads the allocator.
+		WebrtcConfig: dg.mediaConf.WebrtcConfig,
 		// Resolved here, so every media session a dialog on tran builds
 		// starts from the same DTLS config, the Diago wide one when set.
 		DTLSConfig: dg.dtlsConfForTransport(tran),
