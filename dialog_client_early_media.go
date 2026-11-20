@@ -143,13 +143,20 @@ func sessionDescription(res *sip.Response) []byte {
 // early dialog, keyer, the media of the INVITE, stops the media it took from
 // them before anything else is done with that response, the INVITE sent again
 // after a challenge included: see endEarlyMedia.
+//
+// Media that fails to stop ends the wait at that response, which is returned
+// as the *sipgo.ErrDialogResponse the wait returns for a non-2xx final,
+// joined with the media's error: the error of OnResponse replaces the one the
+// wait would have returned, and the caller still learns how the INVITE was
+// answered. A challenge is then not answered, as the INVITE sent again would
+// find the media of the ended dialogs still running.
 func (d *DialogClientSession) awaitInviteAnswer(ctx context.Context, keyer mediaEarlyKeyer, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
 	onResponse := opts.OnResponse
 	opts.OnResponse = func(res *sip.Response) error {
 		d.noteDialogAnswer(res)
 		if res.StatusCode >= 300 {
 			if err := d.endEarlyMedia(keyer); err != nil {
-				return err
+				return errors.Join(&sipgo.ErrDialogResponse{Res: res}, err)
 			}
 		}
 		if onResponse == nil {
