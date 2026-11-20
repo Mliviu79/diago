@@ -64,8 +64,8 @@ type sessionState struct {
 
 	// answeringMu guards answering, ackAnswerErr, ackCarriesAnswer and
 	// timerAnswer, which the answer to an inbound call and the reading of its
-	// ACK share, acking, and earlyAnswerSDP, earlyUnkeyed, earlyAnswerApplied
-	// and earlyAnswerTag. It is a lock of
+	// ACK share, acking, and earlyAnswerSDP, earlyUnkeyed, earlyAnswerApplied,
+	// earlyAnswerTag and earlyDialogAnswers. It is a lock of
 	// the session's own and is never held across a call.
 	answeringMu sync.Mutex
 	// answering is set by an answer before it sends its 2xx, and closed when
@@ -106,7 +106,14 @@ type sessionState struct {
 	// description is the answer (RFC 3261 section 13.2.1), so no later one in
 	// a response of that dialog to the INVITE is applied.
 	earlyAnswerApplied bool
-	earlyAnswerTag   string
+	earlyAnswerTag     string
+	// earlyDialogAnswers holds, on an outbound call, the first session
+	// description a provisional response to our INVITE carried for each
+	// early dialog, by the To tag that identifies it (RFC 3261 section
+	// 12.1): it is that dialog's answer to our offer (section 13.2.1), and
+	// the 2xx that confirms the dialog is answered by it. A non-2xx final
+	// response ends the early dialogs and empties it.
+	earlyDialogAnswers map[string][]byte
 	// timerAnswer is the RFC 4028 session timer the answer negotiated, which
 	// its 2xx carries and starts; nil until an answer negotiates one. Guarded
 	// by answeringMu.

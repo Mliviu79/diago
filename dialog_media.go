@@ -422,6 +422,13 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 		d.mu.Unlock()
 		return err
 	}
+	if offered && d.earlyKeysOwed {
+		// Another answer in place of the one whose handshake was left
+		// running: nothing carries media yet, see replaceEarlyAnswerUnsafe.
+		err := d.replaceEarlyAnswerUnsafe(remoteSDP)
+		d.mu.Unlock()
+		return err
+	}
 	if offered && d.awaitsFirstAnswerUnsafe() {
 		// Nothing is replaced and nothing was running, so this is no media
 		// update.

@@ -73,9 +73,17 @@ func firstLocalSDP(ctx context.Context, sess *media.MediaSessionWebrtc, answered
 // firstRemoteSDP is onRemoteSDP during the first exchange: the peer's offer,
 // or its answer to ours, applied to sess. A session asking for an offer of
 // ours brings nothing to apply: the first offer is ours either way.
+//
+// An answer after the one whose negotiation onFinalizeWithin left running is
+// the answer of another early dialog of our offer, whose 2xx confirms it (RFC
+// 3261 sections 12.1 and 13.2.1): that negotiation is ended before the answer
+// is applied, as nothing else may use sess while it runs.
 func firstRemoteSDP(ctx context.Context, sess *media.MediaSessionWebrtc, remoteSDP []byte, offered bool) error {
 	if remoteSDP == nil {
 		return nil
+	}
+	if offered {
+		sess.AbandonNegotiation()
 	}
 	return sess.RemoteSDP(ctx, remoteSDP, offered)
 }

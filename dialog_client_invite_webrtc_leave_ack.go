@@ -116,12 +116,13 @@ func (d *DialogClientSession) inviteWebrtcLeaveAck(ctx context.Context, med *Dia
 // pending when ctx ends first, and applies the answer of a 2xx to med. After
 // the answer of a 183 none is applied, as WaitAnswerWebrtc describes.
 func (d *DialogClientSession) waitAnswerWebrtcLeaveAck(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
-	if err := d.DialogClientSession.WaitAnswerLeavePending(ctx, opts); err != nil {
+	if err := d.awaitInviteAnswer(ctx, opts, d.DialogClientSession.WaitAnswerLeavePending); err != nil {
 		return err
 	}
-	// Without early media the 2xx carries the answer to the offer.
+	// Without early media the answer to the offer is that of the 2xx's
+	// dialog, which its provisional responses may have given.
 	err := errNoAnswerIn2xx
-	answer := d.InviteResponse.Body()
+	answer := d.dialogAnswer(d.InviteResponse)
 	switch {
 	case med.MediaSession() != nil || d.earlyKeyingLeft():
 		err = d.applyEarlyWebrtcFinalAnswer(ctx, med)

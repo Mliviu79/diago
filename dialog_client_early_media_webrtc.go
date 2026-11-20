@@ -22,11 +22,12 @@ import (
 // response, and a 183 after the one taken, brings nothing: the first session
 // description is the answer (RFC 3261 section 13.2.1).
 func (d *DialogClientSession) takeEarlyWebrtcAnswer(ctx context.Context, med *DialogWebrtc, res *sip.Response, wait time.Duration) error {
-	answer := earlySessionDescription(res)
-	if answer == nil || d.earlyAnswerTaken() {
+	if earlySessionDescription(res) == nil || d.earlyAnswerTaken() {
 		return nil
 	}
-	if err := med.onRemoteSDP(ctx, answer, true); err != nil {
+	// The answer of the early dialog the 183 belongs to, which a provisional
+	// response before it may have given.
+	if err := med.onRemoteSDP(ctx, d.dialogAnswer(res), true); err != nil {
 		return err
 	}
 	d.noteEarlyAnswerTaken(res)
@@ -56,13 +57,14 @@ func earlySessionDescription(res *sip.Response) []byte {
 // applied (RFC 6337 section 3.1.1): the call keeps the transport, the ICE
 // pair, the DTLS association and the codecs of the 183, and a negotiation of
 // the 183 left running is completed by the ACK. Only a 2xx of another early
-// dialog than that 183, one with another To tag, has its session description
-// applied to med, in place.
+// dialog than that 183, one with another To tag, has an answer applied to
+// med, in place: that dialog's own, see dialogAnswer, after med has ended the
+// negotiation of the 183 when it was left running.
 func (d *DialogClientSession) applyEarlyWebrtcFinalAnswer(ctx context.Context, med *DialogWebrtc) error {
 	if d.earlyAnswerStands(d.InviteResponse) {
 		return nil
 	}
-	answer := d.InviteResponse.Body()
+	answer := d.dialogAnswer(d.InviteResponse)
 	if answer == nil {
 		return nil
 	}

@@ -5,6 +5,7 @@ package diago
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/emiago/diago/media"
@@ -77,4 +78,30 @@ func (d *DialogMedia) setOnMediaUpdate(f func(*DialogMedia)) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.onMediaUpdate = f
+}
+
+// replaceEarlyAnswerUnsafe applies remoteSDP, an answer to our offer, in place
+// of the answer whose handshake onFinalizeWithin left running: the answer of
+// another early dialog of the offer, whose 2xx confirms it (RFC 3261 sections
+// 12.1 and 13.2.1). That handshake is ended first, as nothing else may use
+// the media session while it runs, and a fork of the session, on the sockets
+// the offer named, takes remoteSDP. The fork is put in the session's place at
+// once: nothing carries media meanwhile, and onFinalize keys it and sets it
+// up, as it does the session it replaces. A fork that refuses remoteSDP is
+// dropped and leaves the session with no handshake to complete. Must be
+// called with d.mu held.
+func (d *DialogMedia) replaceEarlyAnswerUnsafe(remoteSDP []byte) error {
+	replaced := d.mediaSession
+	if err := replaced.AbandonNegotiation(); err != nil {
+		return err
+	}
+	msess := replaced.Fork()
+	if err := msess.RemoteSDP(remoteSDP, true); err != nil {
+		return err
+	}
+	if err := msess.CarryRTPDeadlines(replaced); err != nil {
+		return fmt.Errorf("carrying RTP deadlines to the new media session: %w", err)
+	}
+	d.mediaSession = msess
+	return nil
 }

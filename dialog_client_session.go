@@ -360,7 +360,9 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 			return nil
 		}
 
-		if err := sess.RemoteSDP(remoteSDP, true); err != nil {
+		// The answer of the early dialog the 183 belongs to, which a
+		// provisional response before it may have given.
+		if err := sess.RemoteSDP(d.dialogAnswer(res), true); err != nil {
 			return err
 		}
 		d.noteEarlyAnswerTaken(res)
@@ -395,12 +397,14 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, 
 
 // waitAnswerWith is waitAnswer, waiting for the INVITE's answer with wait.
 func (d *DialogClientSession) waitAnswerWith(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
-	if err := wait(ctx, opts); err != nil {
+	if err := d.awaitInviteAnswer(ctx, opts, wait); err != nil {
 		return err
 	}
 
-	remoteSDP := d.InviteResponse.Body()
-	if remoteSDP == nil {
+	// The answer of the 2xx's dialog, which its provisional responses may
+	// have given: a 2xx after it needs none (RFC 3261 section 13.2.1).
+	remoteSDP := d.dialogAnswer(d.InviteResponse)
+	if remoteSDP == nil && !d.earlyAnswerStands(d.InviteResponse) {
 		return fmt.Errorf("no SDP in response")
 	}
 
@@ -423,6 +427,12 @@ func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte)
 	// the media sets up once Ack has had it keyed.
 	if d.earlyAnswerStands(d.InviteResponse) {
 		return nil
+	}
+	// The 2xx of another early dialog than the 183 whose handshake was left
+	// running: the media ends that handshake and takes this dialog's answer
+	// in its place, which Ack has keyed once the ACK is out.
+	if d.earlyKeyingLeft() {
+		return med.onRemoteSDP(d.Context(), remoteSDP, true)
 	}
 
 	// Apply SDP on existing (Early) media if it exists

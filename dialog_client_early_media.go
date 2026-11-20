@@ -3,10 +3,12 @@
 package diago
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"time"
 
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 )
 
@@ -32,22 +34,105 @@ func (s *sessionState) earlyAnswerTaken() bool {
 
 // earlyAnswerStands reports whether the answer a 183 gave the call's media
 // stands at final, the 2xx to our INVITE, so that a session description final
-// carries is not applied. The UAC "MUST ignore any session descriptions in
-// subsequent responses to the initial INVITE" (RFC 3261 section 13.2.1), and
-// one that differs from the first is taken as equal to it, the UAC not
-// switching to it (RFC 6337 section 3.1.1): the call keeps the codecs, the
-// remote address and the keys of the 183. A 2xx of another early dialog than
-// that 183, one with another To tag, is applied to the media as before.
-// While the handshake the 183 started was left running, the answer of the
-// 183 stands whatever the 2xx.
+// carries is not applied, and a final that carries none is answered. The UAC
+// "MUST ignore any session descriptions in subsequent responses to the
+// initial INVITE" (RFC 3261 section 13.2.1), and one that differs from the
+// first is taken as equal to it, the UAC not switching to it (RFC 6337
+// section 3.1.1): the call keeps the codecs, the remote address and the keys
+// of the 183, and the handshake the 183 started, when it was left running.
+//
+// That holds within one early dialog, and so when final has the To tag of
+// the 183 (RFC 3261 section 12.1). A 183 without one created no early dialog,
+// and the answer of a 2xx of another early dialog is that dialog's own, see
+// dialogAnswer.
 func (s *sessionState) earlyAnswerStands(final *sip.Response) bool {
 	tag := toTag(final)
+	if tag == "" {
+		return false
+	}
 	s.answeringMu.Lock()
 	defer s.answeringMu.Unlock()
-	if s.earlyUnkeyed {
-		return true
-	}
 	return s.earlyAnswerApplied && s.earlyAnswerTag == tag
+}
+
+// noteDialogAnswer records the session description res carries as the answer
+// of the early dialog res belongs to, when res is a provisional response to
+// our INVITE with a To tag and that dialog has none yet: the first session
+// description the UAC receives is the answer (RFC 3261 section 13.2.1), and
+// each early dialog, which a provisional response with a To tag creates
+// (section 12.1), has its own. A provisional response without a To tag
+// creates no dialog, and its description is no dialog's answer. A non-2xx
+// final response ends every early dialog of the INVITE (section 12.3), and
+// their answers with them.
+func (s *sessionState) noteDialogAnswer(res *sip.Response) {
+	if res.StatusCode >= 300 {
+		s.answeringMu.Lock()
+		s.earlyDialogAnswers = nil
+		s.answeringMu.Unlock()
+		return
+	}
+	if res.StatusCode <= sip.StatusTrying || res.StatusCode >= 200 {
+		return
+	}
+	body := sessionDescription(res)
+	tag := toTag(res)
+	if body == nil || tag == "" {
+		return
+	}
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	if _, ok := s.earlyDialogAnswers[tag]; ok {
+		return
+	}
+	if s.earlyDialogAnswers == nil {
+		s.earlyDialogAnswers = make(map[string][]byte)
+	}
+	s.earlyDialogAnswers[tag] = bytes.Clone(body)
+}
+
+// dialogAnswer returns the answer to our offer of the dialog res, a response
+// to our INVITE, belongs to: the first session description a provisional
+// response of that early dialog carried, see noteDialogAnswer, and otherwise
+// the body of res. A 2xx of an early dialog that has an answer is answered by
+// it, whatever the 2xx carries (RFC 3261 section 13.2.1).
+func (s *sessionState) dialogAnswer(res *sip.Response) []byte {
+	if tag := toTag(res); tag != "" {
+		s.answeringMu.Lock()
+		answer, ok := s.earlyDialogAnswers[tag]
+		s.answeringMu.Unlock()
+		if ok {
+			return answer
+		}
+	}
+	return res.Body()
+}
+
+// sessionDescription returns the session description res carries, and nil
+// when it carries none.
+func sessionDescription(res *sip.Response) []byte {
+	contentType := res.ContentType()
+	if contentType == nil || contentType.Value() != "application/sdp" {
+		return nil
+	}
+	if len(res.Body()) == 0 {
+		return nil
+	}
+	return res.Body()
+}
+
+// awaitInviteAnswer waits for the final response to our INVITE with wait, as
+// opts asks, and records the answer each early dialog gives our offer on the
+// way, see noteDialogAnswer.
+func (d *DialogClientSession) awaitInviteAnswer(ctx context.Context, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
+	onResponse := opts.OnResponse
+	opts.OnResponse = func(res *sip.Response) error {
+		d.noteDialogAnswer(res)
+		if onResponse == nil {
+			return nil
+		}
+		return onResponse(res)
+	}
+	return wait(ctx, opts)
 }
 
 // toTag returns the tag of res's To header, empty when it has none.

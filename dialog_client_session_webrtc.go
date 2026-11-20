@@ -54,7 +54,13 @@ type InviteWebrtcOptions struct {
 // 2xx, the answer of the 183 stands and no later session description is
 // applied (RFC 3261 section 13.2.1), and once the ACK is sent it completes the
 // negotiation of the 183, bounded by ctx, media.ICEConnectTimeout and
-// media.DTLSHandshakeTimeout.
+// media.DTLSHandshakeTimeout. A 2xx of another early dialog than the 183, one
+// with another To tag, ends that negotiation and has the media take its own
+// dialog's answer instead, as WaitAnswerWebrtc describes.
+//
+// Without EarlyMediaDetect the answer is likewise the first session
+// description of the 2xx's dialog: one a provisional response with the 2xx's
+// To tag carried, when one did, and the 2xx's otherwise.
 func (d *DialogClientSession) InviteWebrtc(ctx context.Context, opts InviteWebrtcOptions) (*DialogWebrtc, error) {
 	return d.inviteWebrtcWith(ctx, opts, d.DialogClientSession.WaitAnswer)
 }
@@ -117,11 +123,11 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 				return d.takeEarlyWebrtcAnswer(ctx, med, res, opts.EarlyMediaKeyTimeout)
 			}
 		}
-		if err = wait(ctx, answerOpts); err != nil {
+		if err = d.awaitInviteAnswer(ctx, answerOpts, wait); err != nil {
 			return err
 		}
 		answered = true
-		if d.earlyKeyingLeft() {
+		if d.earlyAnswerStands(d.InviteResponse) {
 			// The answer of the 183 stands (RFC 3261 section 13.2.1), and the
 			// negotiation it started is completed once the ACK is out.
 			if err = d.Ack(ctx); err != nil {
@@ -130,9 +136,24 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 			acked = true
 			return med.onFinalize(ctx)
 		}
-		remoteSDP := d.InviteResponse.Body()
+		// The answer of the 2xx's dialog, which its provisional responses
+		// may have given (RFC 3261 section 13.2.1).
+		remoteSDP := d.dialogAnswer(d.InviteResponse)
 		if remoteSDP == nil {
 			return fmt.Errorf("no SDP in response")
+		}
+		if d.earlyKeyingLeft() {
+			// The 2xx of another early dialog than the 183 whose negotiation
+			// was left running: the media ends that negotiation and takes
+			// this dialog's answer, which it completes once the ACK is out.
+			if err = med.onRemoteSDP(ctx, remoteSDP, true); err != nil {
+				return err
+			}
+			if err = d.Ack(ctx); err != nil {
+				return err
+			}
+			acked = true
+			return med.onFinalize(ctx)
 		}
 		if err = sess.RemoteSDP(ctx, remoteSDP, true); err != nil {
 			return err
@@ -193,15 +214,17 @@ func (d *DialogClientSession) registerWebrtcDialogCallbacks(med *DialogWebrtc, o
 // The answer of the 183 stands (RFC 3261 section 13.2.1): a session
 // description in the 2xx is not applied, whether or not it differs from the
 // 183's (RFC 6337 section 3.1.1), and med keeps the transport, the keys and
-// the codecs the 183 set up. Only the 2xx of another early dialog, one with
-// another To tag than the 183, has its description applied to med in place;
-// one that cannot be applied is acknowledged and the call ended with a BYE,
-// and the error returned.
+// the codecs the 183 set up, and a 2xx without one is answered. Only the 2xx
+// of another early dialog, one with another To tag than the 183, has an
+// answer applied to med in place: that dialog's own, the first session
+// description its responses carried (RFC 3261 sections 12.1 and 13.2.1). One
+// that cannot be applied is acknowledged and the call ended with a BYE, and
+// the error returned.
 func (d *DialogClientSession) WaitAnswerWebrtc(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if med == nil || med.MediaSession() == nil {
 		return fmt.Errorf("dialog WebRTC media is not initialized")
 	}
-	if err := d.DialogClientSession.WaitAnswer(ctx, opts); err != nil {
+	if err := d.awaitInviteAnswer(ctx, opts, d.DialogClientSession.WaitAnswer); err != nil {
 		return err
 	}
 	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {
