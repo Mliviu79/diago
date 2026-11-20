@@ -194,9 +194,10 @@ type sessionTimerOffer struct {
 }
 
 // parseSessionTimerOffer reads Session-Expires and Min-SE off a request or a
-// response. sipgo
-// carries no typed accessors for these headers, so they are read generically and
-// parsed here. A malformed or out-of-range value is treated as absent rather
+// response. sipgo's messages have typed accessors for both headers
+// (SessionExpires and MinSE); this reads through headerGetter instead and parses
+// the values here, so one parser serves any message that can look a header up
+// by name. A malformed or out-of-range value is treated as absent rather
 // than as an error: a timer header is never worth failing an otherwise valid
 // INVITE over.
 // ok is false when the peer sent no Session-Expires at all (timer-unaware).
