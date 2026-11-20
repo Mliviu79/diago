@@ -318,7 +318,7 @@ func (r *ReferTransaction) Accept(ctx context.Context, opts InviteClientOptions)
 	//    request).
 
 	err = func() error {
-		if h := req.GetHeader("refered-by"); h != nil {
+		if h := req.GetHeader("referred-by"); h != nil {
 			opts.Headers = append(opts.Headers, sip.HeaderClone(h))
 		}
 		if h := req.GetHeader("replaces"); h != nil {
