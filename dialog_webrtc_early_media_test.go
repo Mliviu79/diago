@@ -294,8 +294,12 @@ func TestIntegrationDialogWebrtcEarlyMediaKeyedByCaller(t *testing.T) {
 		if err != nil {
 			return
 		}
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-answerNow:
+		case <-ctx.Done():
+			return
 		case <-callee.Context().Done():
 			return
 		}
@@ -304,7 +308,12 @@ func TestIntegrationDialogWebrtcEarlyMediaKeyedByCaller(t *testing.T) {
 		if err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -358,7 +367,12 @@ func TestIntegrationDialogWebrtcEarlyMediaIgnoredByCaller(t *testing.T) {
 		if err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -518,7 +532,7 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 	calleeEnded := make(chan error, 1)
 	answerNow := make(chan struct{})
 	byeRead := make(chan struct{})
-	d := newWebrtcCallPair(t, func(_ context.Context, callee *DialogServerSession) {
+	d := newWebrtcCallPair(t, func(serveCtx context.Context, callee *DialogServerSession) {
 		ctx := callee.Context()
 		conf, err := prepareWebrtcConfig(loopbackWebrtcConfig())
 		if err != nil {
@@ -547,8 +561,12 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 				return err
 			}
 			close(calleeSetUp)
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
 			select {
 			case <-answerNow:
+			case <-serveCtx.Done():
+				return context.Cause(serveCtx)
 			case <-ctx.Done():
 				return context.Cause(ctx)
 			}
@@ -556,7 +574,12 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 			if err := callee.DialogServerSession.Respond(ctx, sip.StatusOK, "OK", final, contentType); err != nil {
 				return err
 			}
-			<-ctx.Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-ctx.Done():
+			}
 			close(byeRead)
 			return nil
 		}()
