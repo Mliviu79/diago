@@ -391,6 +391,10 @@ func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
 				return
 			}
 			defer med.Close()
+			// Echo takes no ctx, so the handler ends with its ctx by closing
+			// the media Echo runs on.
+			stop := context.AfterFunc(ctx, func() { med.Close() })
+			defer stop()
 
 			err = med.Echo()
 			slog.Info("Echo finished with", "error", err)
@@ -473,6 +477,10 @@ func TestIntegrationDiagoSRTPCall(t *testing.T) {
 				return
 			}
 			defer med.Close()
+			// Echo takes no ctx, so the handler ends with its ctx by closing
+			// the media Echo runs on.
+			stop := context.AfterFunc(ctx, func() { med.Close() })
+			defer stop()
 
 			err = med.Echo()
 			slog.Info("Echo finished with", "error", err)
@@ -572,6 +580,10 @@ func TestIntegrationDiagoDTLSCall(t *testing.T) {
 				return
 			}
 			defer med.Close()
+			// Echo takes no ctx, so the handler ends with its ctx by closing
+			// the media Echo runs on.
+			stop := context.AfterFunc(ctx, func() { med.Close() })
+			defer stop()
 
 			err = med.Echo()
 			slog.Info("Echo finished with", "error", err)

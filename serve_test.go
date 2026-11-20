@@ -4,7 +4,6 @@ package diago
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 )
@@ -32,27 +31,17 @@ func waitEnded(t testing.TB, ended <-chan struct{}) {
 // "address already in use". Serving returns only once its listener is closed.
 // dg serves a single transport, since serving returns with its first
 // listener.
+//
+// A dialog is ended by its handler, never by the helper: the handler's ctx
+// ends with serving, the handler returns, and diago hangs the call up and
+// closes it after the handler. A DialogServerSession is used by one goroutine
+// at a time, so a hang-up from another goroutine while the handler still
+// responds would race with it.
 func serveBackground(t testing.TB, dg *Diago, ctx context.Context, f ServeDialogFunc) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(ctx)
-	var terminations sync.WaitGroup
 	if f != nil {
-		// A dialog ends with the run its handler was given: the call is ended
-		// with a BYE, which is bounded since its peer may be gone, and its
-		// media closed, which frees a handler blocked in it. It ends so even
-		// when the handler returned before, as the request run waits for the
-		// BYE diago sends after the handler.
-		dg.HandleFunc(func(ctx context.Context, d *DialogServerSession) {
-			terminations.Add(1)
-			context.AfterFunc(ctx, func() {
-				defer terminations.Done()
-				hangupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-				defer cancel()
-				_ = d.Hangup(hangupCtx)
-				_ = d.Close()
-			})
-			f(ctx, d)
-		})
+		dg.HandleFunc(f)
 	}
 	ready := make(chan struct{})
 	done := make(chan struct{})
@@ -69,17 +58,10 @@ func serveBackground(t testing.TB, dg *Diago, ctx context.Context, f ServeDialog
 	}()
 	t.Cleanup(func() {
 		cancel()
-		// A handler registers its termination before it runs, and the request run
-		// returns only after every handler has, so no registration is left when
-		// the wait for terminations starts. The wait is longer than the 10
-		// seconds diago allows a handler's hang-up after the handler returns.
+		// The request run returns only after every handler has, and after the
+		// hang-up diago makes when a handler returns, so its end is the end
+		// of every dialog it served.
 		waitEnded(t, requestsDone)
-		terminated := make(chan struct{})
-		go func() {
-			defer close(terminated)
-			terminations.Wait()
-		}()
-		waitEnded(t, terminated)
 		waitEnded(t, done)
 	})
 

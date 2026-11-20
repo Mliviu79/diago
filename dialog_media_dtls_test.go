@@ -887,8 +887,10 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 // continues the association: acknowledging it runs no second handshake, and
 // the media after the answer stays encrypted.
 func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
+	// Serving ends after the call is hung up below: the BYE needs the callee
+	// serving to be answered.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
 	callee := newDTLSDiago(t, 16455, testdata.ServerCertificate())
 	answered := make(chan *DialogMedia, 1)
@@ -1264,8 +1266,10 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 // is keyed, well within its KeyTimeout, the early media is encrypted both
 // ways, and after the answer the media stays encrypted.
 func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
+	// Serving ends after the call is hung up below: the BYE needs the callee
+	// serving to be answered.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
 	callee := newDTLSDiago(t, 16459, testdata.ServerCertificate())
 
