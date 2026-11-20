@@ -62,13 +62,11 @@ func (s *sessionState) earlyAnswerStands(final *sip.Response) bool {
 // each early dialog, which a provisional response with a To tag creates
 // (section 12.1), has its own. A provisional response without a To tag
 // creates no dialog, and its description is no dialog's answer. A non-2xx
-// final response ends every early dialog of the INVITE (section 12.3), and
-// their answers with them.
+// final response ends every early dialog of the INVITE (section 12.3), see
+// endEarlyDialogs.
 func (s *sessionState) noteDialogAnswer(res *sip.Response) {
 	if res.StatusCode >= 300 {
-		s.answeringMu.Lock()
-		s.earlyDialogAnswers = nil
-		s.answeringMu.Unlock()
+		s.endEarlyDialogs()
 		return
 	}
 	if res.StatusCode <= sip.StatusTrying || res.StatusCode >= 200 {
@@ -88,6 +86,26 @@ func (s *sessionState) noteDialogAnswer(res *sip.Response) {
 		s.earlyDialogAnswers = make(map[string][]byte)
 	}
 	s.earlyDialogAnswers[tag] = bytes.Clone(body)
+}
+
+// endEarlyDialogs forgets every early dialog of our INVITE, at a non-2xx final
+// response to it, which ends them all (RFC 3261 section 12.3): the answer each
+// gave our offer, and which of them gave the answer applied to the call's
+// media. An INVITE sent again, as after a digest challenge (section 22.2), is
+// a new request, whose responses form new early dialogs: the first session
+// description one of them carries is its answer (section 13.2.1), also when
+// its To tag is that of an ended one.
+//
+// What the media took from an ended early dialog stays with the media until
+// an answer of the new request is applied, which takes its place: a keyed
+// early media session is forked to that answer, and a handshake left running
+// is ended before that answer is applied (earlyKeyingLeft stays set for it).
+func (s *sessionState) endEarlyDialogs() {
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	s.earlyDialogAnswers = nil
+	s.earlyAnswerApplied = false
+	s.earlyAnswerTag = ""
 }
 
 // dialogAnswer returns the answer to our offer of the dialog res, a response

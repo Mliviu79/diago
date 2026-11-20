@@ -104,7 +104,8 @@ type sessionState struct {
 	// our INVITE was applied to its media, and earlyAnswerTag is the To tag of
 	// that 183, the early dialog the answer belongs to. The first session
 	// description is the answer (RFC 3261 section 13.2.1), so no later one in
-	// a response of that dialog to the INVITE is applied.
+	// a response of that dialog to the INVITE is applied. A non-2xx final
+	// response clears both, see endEarlyDialogs.
 	earlyAnswerApplied bool
 	earlyAnswerTag     string
 	// earlyDialogAnswers holds, on an outbound call, the first session
