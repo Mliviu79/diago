@@ -216,7 +216,7 @@ func (d *DialogServerSession) answerWithin(ctx context.Context, answering chan s
 			return
 		}
 		mu.Unlock()
-		d.endAbandonedAnswer(err)
+		d.endAbandonedAnswer(ctx, err)
 	})
 
 	select {
@@ -243,18 +243,23 @@ func (d *DialogServerSession) answerWithin(ctx context.Context, answering chan s
 
 // endAbandonedAnswer ends the call of an answer whose caller stopped waiting,
 // once that answer's exchange is over, err being how it ended. A dialog the
-// ACK, or the ACK wait passing without one, has confirmed is ended with a BYE,
-// whose wait is bounded by its transaction's Timer F (RFC 3261 section
-// 17.1.2.2). A dialog that ended meanwhile, on the peer's BYE, on a CANCEL
-// that took the INVITE's transaction, on a refusal, or on the BYE that ends a
-// call the ACK left without usable media, needs none.
-func (d *DialogServerSession) endAbandonedAnswer(err error) {
+// ACK, or the ACK wait passing without one, has confirmed is ended with a BYE.
+// A dialog that ended meanwhile, on the peer's BYE, on a CANCEL that took the
+// INVITE's transaction, on a refusal, or on the BYE that ends a call the ACK
+// left without usable media, needs none.
+//
+// ctx is the answer's, which has ended: that is why nobody waits. This
+// teardown is owned by the answer's goroutine, so the BYE runs detached from
+// ctx's end and is bounded by its transaction's Timer F (RFC 3261 section
+// 17.1.2.2), and the wait for its answer goes on past the end of the dialog
+// the BYE ends.
+func (d *DialogServerSession) endAbandonedAnswer(ctx context.Context, err error) {
 	state := d.LoadState()
 	if state < sip.DialogStateEstablished || state == sip.DialogStateEnded {
 		return
 	}
 	d.logger().Debug("Ending the call of an answer nobody waits for", "call_id", d.callID(), "answer_error", err)
-	ctx, cancel := context.WithTimeout(d.Context(), sip.Timer_F)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sip.Timer_F)
 	defer cancel()
 	if byeErr := d.Bye(ctx); byeErr != nil {
 		d.logger().Warn("Ending the call of an answer nobody waits for failed", "call_id", d.callID(), "error", byeErr)

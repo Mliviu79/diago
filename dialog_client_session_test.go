@@ -89,7 +89,7 @@ func TestIntegrationDialogClient(t *testing.T) {
 		if d.ToUser() == "hanguper" {
 			d.Trying(ctx)
 			_, _ = d.Answer(AnswerOptions{})
-			d.Hangup(d.Context())
+			d.Hangup(ctx)
 			return
 		}
 
@@ -697,7 +697,7 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 					if err := referDialog.Ack(ctx); err != nil {
 						return err
 					}
-					return referDialog.Hangup(referDialog.Context())
+					return referDialog.Hangup(ctx)
 				},
 			})
 			<-d.Context().Done()
@@ -757,7 +757,7 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15071}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
@@ -775,7 +775,7 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15071}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "noanswer", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
@@ -793,7 +793,7 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15071}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		referState := make(chan int)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "busy", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{

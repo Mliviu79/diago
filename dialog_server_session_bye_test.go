@@ -84,7 +84,7 @@ func confirm(t *testing.T, d *DialogServerSession) {
 	t.Helper()
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
-	require.NoError(t, d.ReadAck(ack, newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), ack, newByeServerTx()))
 	require.Equal(t, sip.DialogStateConfirmed, d.LoadState())
 }
 

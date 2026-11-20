@@ -143,7 +143,7 @@ func TestDialogReInviteWaitsForPeerMediaUpdate(t *testing.T) {
 	handled := make(chan error, 1)
 	go func() {
 		handled <- d.handleReInvite(t.Context(), peerReInvite, newAckedServerTx(&loggedPeerTx{byeServerTx: newByeServerTx(), h: h}, func() {
-			_ = d.handleReInviteACK(newReInviteAck(peerReInvite, nil), newByeServerTx())
+			_ = d.handleReInviteACK(t.Context(), newReInviteAck(peerReInvite, nil), newByeServerTx())
 		}))
 	}()
 	select {

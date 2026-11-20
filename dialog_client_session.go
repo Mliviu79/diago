@@ -676,7 +676,7 @@ func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Reque
 			d.abortMedia()
 		}
 		if ackErr != nil {
-			err = errors.Join(err, ackErr, d.hangupNoMedia())
+			err = errors.Join(err, ackErr, d.hangupNoMedia(ctx))
 		}
 		if endUpdate != nil {
 			endUpdate()
@@ -731,8 +731,8 @@ func (d *DialogClientSession) handleReInvite(ctx context.Context, req *sip.Reque
 // An ACK cannot be refused, so media that the ACK leaves unusable ends the
 // call with a BYE, and the error returned wraps errMediaUpdateAfterAnswer. A
 // dialog that ended while the media committed the update has no call left to
-// end, and that is no error.
-func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
+// end, and that is no error. That BYE is started from ctx, see hangupNoMedia.
+func (d *DialogClientSession) handleReInviteACK(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	// A copy of an ACK already read, sent for a retransmission of our 2xx,
 	// brings the media nothing more.
 	ackHandled, first, answerDue := d.ackPeerReInvite(req)
@@ -741,7 +741,7 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 	}
 	defer ackHandled()
 	if answerDue {
-		return d.readReInviteAnswerAck(req)
+		return d.readReInviteAnswerAck(ctx, req)
 	}
 
 	mediaHanshaker := d.mediaHanshakerLocked()
@@ -762,7 +762,7 @@ func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerT
 		if err = updateFailedAfterAnswer(&d.Dialog, err); err == nil {
 			return nil
 		}
-		return errors.Join(err, d.hangupNoMedia())
+		return errors.Join(err, d.hangupNoMedia(ctx))
 	}
 	return nil
 }

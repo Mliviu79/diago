@@ -584,7 +584,7 @@ func TestDialogServerReInviteNewAssociationFailureHangsUp(t *testing.T) {
 	peerDone := make(chan error, 1)
 	go func() { peerDone <- peer.Finalize() }()
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newReInviteAck(req, nil), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx()) }()
 
 	select {
 	case err := <-acked:
@@ -655,7 +655,7 @@ func TestDialogByeEndsNewAssociationHandshake(t *testing.T) {
 		t.Fatal("the re-INVITE was not answered")
 	}
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newReInviteAck(req, nil), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx()) }()
 	// We answered actpass with active, so our side sends the ClientHello.
 	requireClientHello(t, peer)
 	require.Same(t, answerer, med.MediaSession(), "a fork without keys was installed")
@@ -845,7 +845,7 @@ func TestDialogClientReInviteDuringAckHandshake(t *testing.T) {
 		// passive end of the association, and keep that role (RFC 8842
 		// section 5.3).
 		require.Equal(t, "a=setup:passive", sdpLineWithPrefix(t, res.Body(), "a=setup:"), "the answer did not continue the association")
-		require.NoError(t, d.handleReInviteACK(newReInviteAck(req, nil), newByeServerTx()))
+		require.NoError(t, d.handleReInviteACK(t.Context(), newReInviteAck(req, nil), newByeServerTx()))
 		select {
 		case err := <-handled:
 			require.NoError(t, err)

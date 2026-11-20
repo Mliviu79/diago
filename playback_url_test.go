@@ -63,7 +63,7 @@ func TestIntegrationPlaybackURL(t *testing.T) {
 		}
 
 		log("Done playing", urlStr)
-		in.Hangup(in.Context())
+		in.Hangup(ctx)
 	})
 	require.NoError(t, err)
 

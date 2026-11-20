@@ -34,7 +34,7 @@ func TestDialogMediaUpdateHooks(t *testing.T) {
 		ackErr := make(chan error, 1)
 		inner := newByeServerTx()
 		tx := newAckedServerTx(inner, func() {
-			ackErr <- d.handleReInviteACK(newReInviteAck(req, ackBody), nil)
+			ackErr <- d.handleReInviteACK(t.Context(), newReInviteAck(req, ackBody), nil)
 		})
 		handleErr := d.handleReInvite(t.Context(), req, tx)
 		if len(inner.responses) == 0 {
@@ -183,7 +183,7 @@ func TestDialogMediaUpdateHooksAnswerInACKInbound(t *testing.T) {
 
 	answerer := newMediaSessionForTest(t)
 	require.NoError(t, answerer.RemoteSDP(ok.Body(), false))
-	require.NoError(t, d.ReadAck(newReInviteAck(req, answerer.LocalSDP(true)), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newReInviteAck(req, answerer.LocalSDP(true)), newByeServerTx()))
 	select {
 	case err := <-handled:
 		require.NoError(t, err)

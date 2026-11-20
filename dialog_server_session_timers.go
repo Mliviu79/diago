@@ -158,13 +158,17 @@ func (d *DialogServerSession) launchSessionTimers(ta *timerAnswer) {
 }
 
 // expireSession ends the call whose peer let the session expire without a
-// refresh (RFC 4028 section 10). Our BYE ends ctx, the dialog's context, once
-// it is sent and its answer is awaited past that end, so a failure is logged
-// whatever ctx's state; only ctx's cancellation, which means the dialog ended
-// before our BYE went out, is not a failure of ours.
+// refresh (RFC 4028 section 10). It runs on the session timer's goroutine, on
+// ctx, the dialog's context, and owns this teardown: our BYE ends the dialog
+// and so ctx as it is sent, so the BYE runs detached from ctx's end and is
+// bounded by its transaction's Timer F (RFC 3261 section 17.1.2.2), and the
+// wait for its answer goes on past the end of the dialog. A dialog that ended
+// before the BYE went out needs none, and Hangup returns nil for it.
 func (d *DialogServerSession) expireSession(ctx context.Context) {
 	d.logger().Warn("The peer did not refresh the session, ending the call", "call_id", d.callID())
-	if err := d.Hangup(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sip.Timer_F)
+	defer cancel()
+	if err := d.Hangup(ctx); err != nil {
 		d.logger().Warn("Ending the call whose session expired failed", "call_id", d.callID(), "error", err)
 	}
 }
@@ -223,7 +227,7 @@ func (d *DialogServerSession) refreshSession(ctx context.Context, t *sessionTime
 		switch {
 		case status == sip.StatusRequestTimeout || status == sip.StatusCallTransactionDoesNotExists || errors.Is(err, sip.ErrTransactionTimeout):
 			log.Warn("Session refresh failed, ending the call", "call_id", d.callID(), "status", status, "error", err)
-			if herr := d.hangupNoMedia(); herr != nil {
+			if herr := d.hangupNoMedia(ctx); herr != nil {
 				log.Warn("Ending the call after a failed session refresh failed", "call_id", d.callID(), "error", herr)
 			}
 			return refreshEnded

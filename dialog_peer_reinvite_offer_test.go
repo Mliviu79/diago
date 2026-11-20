@@ -38,7 +38,7 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 				return med, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1), func(req *sip.Request, tx sip.ServerTransaction) error {
 						return d.handleReInvite(t.Context(), req, tx)
 					},
-					func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) }
+					func(ack *sip.Request) error { return d.ReadAck(t.Context(), ack, newByeServerTx()) }
 			},
 		},
 		{
@@ -48,7 +48,7 @@ func TestDialogAckAnswerAppliedOnFork(t *testing.T) {
 				return med, newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1), func(req *sip.Request, tx sip.ServerTransaction) error {
 						return d.handleReInvite(t.Context(), req, tx)
 					},
-					func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) }
+					func(ack *sip.Request) error { return d.handleReInviteACK(t.Context(), ack, newByeServerTx()) }
 			},
 		},
 	}
@@ -153,7 +153,7 @@ func TestHandleMediaUpdateOfferless(t *testing.T) {
 		t.Helper()
 		inner := newByeServerTx()
 		tx := newAckedServerTx(inner, func() {
-			_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+			_ = d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx())
 		})
 		require.NoError(t, d.handleReInvite(t.Context(), req, tx))
 		require.Len(t, inner.responses, 1)
@@ -267,7 +267,7 @@ var reInviteOfferlessSides = []struct {
 			d, med := newAnsweredTestServerCallOverUA(t, ua)
 			return med, newInDialogReInvite(t, d, d.InviteRequest.CSeq().SeqNo+1),
 				func(req *sip.Request, tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
-				func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
+				func(ack *sip.Request) error { return d.ReadAck(t.Context(), ack, newByeServerTx()) },
 				func() bool { return slices.Contains(sent.sent(), sip.BYE) }
 		},
 	},
@@ -277,7 +277,7 @@ var reInviteOfferlessSides = []struct {
 			d, med, sent := newAnsweredTestClientCall(t)
 			return med, newPeerReInvite(d, d.InviteRequest.CSeq().SeqNo+1),
 				func(req *sip.Request, tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
-				func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
+				func(ack *sip.Request) error { return d.handleReInviteACK(t.Context(), ack, newByeServerTx()) },
 				func() bool { return slices.Contains(sent.sent(), sip.BYE) }
 		},
 	},
@@ -343,7 +343,7 @@ func TestDialogPeerReInviteWithoutOfferTellsTheMedia(t *testing.T) {
 		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 		require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
 
-		ackErr := d.ReadAck(ack(req), newByeServerTx())
+		ackErr := d.ReadAck(t.Context(), ack(req), newByeServerTx())
 		select {
 		case err := <-handled:
 			require.NoError(t, err)

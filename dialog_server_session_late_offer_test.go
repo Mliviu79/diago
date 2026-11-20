@@ -125,7 +125,7 @@ func TestDialogServerLateOfferAckIsAnswer(t *testing.T) {
 	answer := peer.LocalSDP(true)
 	require.Contains(t, string(answer), "RTP/AVP 8 0")
 
-	require.NoError(t, d.ReadAck(newLateAck(d, answer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, answer), newByeServerTx()))
 	late := awaitAnswerLate(t, answered)
 	require.NoError(t, late.err)
 
@@ -149,12 +149,12 @@ func TestDialogServerLateOfferAckCopyAnswersNothing(t *testing.T) {
 	offer, answered := answerLate(t, d, inviteTx)
 	answer := peerAnswer(t, offer)
 
-	require.NoError(t, d.ReadAck(newLateAck(d, answer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, answer), newByeServerTx()))
 	late := awaitAnswerLate(t, answered)
 	require.NoError(t, late.err)
 	sess := late.med.MediaSession()
 
-	require.NoError(t, d.ReadAck(newLateAck(d, answer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, answer), newByeServerTx()))
 	assert.Same(t, sess, late.med.MediaSession(), "a copy of the ACK must not replace the media session")
 	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
 	select {
@@ -227,7 +227,7 @@ func TestDialogServerLateOfferNegotiatesTheSessionTimer(t *testing.T) {
 		assert.Equal(t, "timer", headerValue(res, "Require"), "the 2xx naming the caller the refresher requires timer")
 		assert.Equal(t, "timer", headerValue(res, "Supported"))
 
-		assert.NoError(t, d.ReadAck(newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
+		assert.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
 		assert.NoError(t, awaitAnswerLate(t, answered).err)
 		assert.NotNil(t, d.timer.Load(), "the 2xx started the session timer")
 	})
@@ -260,7 +260,7 @@ func TestDialogServerLateOfferNegotiatesTheSessionTimer(t *testing.T) {
 		assert.Empty(t, headerValue(res, "Session-Expires"))
 		assert.Empty(t, headerValue(res, "Require"))
 
-		assert.NoError(t, d.ReadAck(newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
+		assert.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerAnswer(t, res.Body())), newByeServerTx()))
 		assert.NoError(t, awaitAnswerLate(t, answered).err)
 		assert.Nil(t, d.timer.Load(), "no session timer runs")
 	})
@@ -283,7 +283,7 @@ func TestDialogServerLateOfferAckWithoutAnswerEndsTheCall(t *testing.T) {
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(ack, newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), ack, newByeServerTx()) }()
 
 	assert.ErrorIs(t, awaitAnswerLate(t, answered).err, errAckCarriesNoAnswer)
 	select {
@@ -331,7 +331,7 @@ func TestDialogServerLateOfferHandshakeFailure(t *testing.T) {
 	go func() { peerDone <- peer.Finalize() }()
 
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newLateAck(d, []byte(answer)), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newLateAck(d, []byte(answer)), newByeServerTx()) }()
 	select {
 	case err := <-acked:
 		assert.Error(t, err, "a failed handshake must not be swallowed")

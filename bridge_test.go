@@ -364,14 +364,14 @@ func TestIntegrationBridgingMix(t *testing.T) {
 		dialog1, med1, err := dg.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 5090}, InviteOptions{})
 		require.NoError(t, err)
 		dialogsCreated++
-		defer dialog1.Hangup(dialog1.Context())
+		defer dialog1.Hangup(t.Context())
 		defer dialog1.Close()
 		defer med1.Close()
 
 		dialog2, med2, err := dg.Invite(context.TODO(), sip.Uri{Host: "127.0.0.1", Port: 5090}, InviteOptions{})
 		require.NoError(t, err)
 		dialogsCreated++
-		defer dialog2.Hangup(dialog2.Context())
+		defer dialog2.Hangup(t.Context())
 		defer dialog2.Close()
 		defer med2.Close()
 

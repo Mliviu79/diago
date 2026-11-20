@@ -165,7 +165,7 @@ func TestDialogServerAnswerWebrtcContextAnswers(t *testing.T) {
 	requireWebrtcMediaRunsWith(t, answer.med, peer)
 
 	// A copy of the ACK completes nothing again and the call goes on.
-	require.NoError(t, d.ReadAck(newLateAck(d, nil), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, nil), newByeServerTx()))
 	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
 	select {
 	case req := <-sent:
@@ -199,7 +199,7 @@ func TestDialogServerAnswerWebrtcLateContextAnswers(t *testing.T) {
 	peerAnswer, err := peer.LocalSDP(t.Context(), true)
 	require.NoError(t, err)
 	peerDone := finalizeWebrtcPeer(t, peer)
-	require.NoError(t, d.ReadAck(newLateAck(d, peerAnswer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerAnswer), newByeServerTx()))
 
 	answer := awaitWebrtcAnswer(t, answered)
 	require.NoError(t, answer.err)
@@ -256,7 +256,7 @@ func TestDialogServerAnswerWebrtcLateContextCut(t *testing.T) {
 	peerAnswer, err := peer.LocalSDP(t.Context(), true)
 	require.NoError(t, err)
 	peerDone := finalizeWebrtcPeer(t, peer)
-	require.NoError(t, d.ReadAck(newLateAck(d, peerAnswer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerAnswer), newByeServerTx()))
 	requireWebrtcPeerFinalized(t, peerDone)
 	requireByeEndsDialog(t, d, sent, 5*time.Second)
 	requireCloseJoins(t, d)
@@ -273,7 +273,7 @@ func TestDialogServerAnswerWebrtcLateContextCutAckWithoutAnswer(t *testing.T) {
 		return err
 	})
 
-	assert.ErrorIs(t, d.ReadAck(newLateAck(d, nil), newByeServerTx()), errAckCarriesNoAnswer)
+	assert.ErrorIs(t, d.ReadAck(t.Context(), newLateAck(d, nil), newByeServerTx()), errAckCarriesNoAnswer)
 
 	requireByeEndsDialog(t, d, sent, 5*time.Second)
 	requireCloseJoins(t, d)
@@ -296,7 +296,7 @@ func TestDialogServerAnswerWebrtcLateContextAckWithoutAnswerEndsTheCall(t *testi
 	require.Equal(t, sip.StatusOK, res.StatusCode)
 
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newLateAck(d, nil), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newLateAck(d, nil), newByeServerTx()) }()
 
 	answer := awaitWebrtcAnswer(t, answered)
 	assert.ErrorIs(t, answer.err, errAckCarriesNoAnswer)
@@ -371,7 +371,7 @@ func TestDialogServerAnswerWebrtcNegotiatesTheSessionTimer(t *testing.T) {
 	peerAnswer, err := peer.LocalSDP(t.Context(), true)
 	require.NoError(t, err)
 	peerDone := finalizeWebrtcPeer(t, peer)
-	require.NoError(t, d.ReadAck(newLateAck(d, peerAnswer), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerAnswer), newByeServerTx()))
 	answer := awaitWebrtcAnswer(t, answered)
 	require.NoError(t, answer.err)
 	requireWebrtcPeerFinalized(t, peerDone)
@@ -405,7 +405,7 @@ func TestDialogServerAnswerWebrtcLateContextHandshakeFailure(t *testing.T) {
 	go func() { peerDone <- peer.Finalize(peerCtx) }()
 
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newLateAck(d, peerAnswer), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newLateAck(d, peerAnswer), newByeServerTx()) }()
 	select {
 	case err := <-acked:
 		assert.Error(t, err, "a failed handshake must not be swallowed")

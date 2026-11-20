@@ -72,14 +72,15 @@ func (s *sessionState) ackAnswerError() error {
 
 // endOnAckAnswerError is called by an answer once its 2xx is acknowledged.
 // When the ACK left the call without usable media, ReadAck left ending the
-// call to this answer: it sends the BYE and returns why, joined with the
-// BYE's own failure. Otherwise it returns nil.
-func (d *DialogServerSession) endOnAckAnswerError() error {
+// call to this answer: it sends the BYE, started from ctx as hangupNoMedia
+// describes, and returns why, joined with the BYE's own failure. Otherwise it
+// returns nil.
+func (d *DialogServerSession) endOnAckAnswerError(ctx context.Context) error {
 	ackErr := d.ackAnswerError()
 	if ackErr == nil {
 		return nil
 	}
-	return errors.Join(ackErr, d.hangupNoMedia())
+	return errors.Join(ackErr, d.hangupNoMedia(ctx))
 }
 
 // acksInvite reports whether req, an ACK, acknowledges the 2xx to the INVITE
@@ -122,7 +123,7 @@ func ackSessionDescription(req *sip.Request) []byte {
 // and RFC 5763 section 5 has the media session torn down on a fingerprint
 // mismatch. An answer waiting for this ACK sends the BYE and reports the
 // error itself, so the application learns why and one BYE goes out.
-func (d *DialogServerSession) readInviteAck(req *sip.Request, tx sip.ServerTransaction, handshaker mediaHanshaker) error {
+func (d *DialogServerSession) readInviteAck(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, handshaker mediaHanshaker) error {
 	// Only the ACK confirming the dialog answers the offer in the 2xx to our
 	// INVITE and completes the media. A copy of it read later, sent for a
 	// retransmission of the 2xx, answers nothing more.
@@ -147,7 +148,7 @@ func (d *DialogServerSession) readInviteAck(req *sip.Request, tx sip.ServerTrans
 	if answerWaiting {
 		return err
 	}
-	return errors.Join(err, d.hangupNoMedia())
+	return errors.Join(err, d.hangupNoMedia(ctx))
 }
 
 // completeAnswer hands the media what the ACK confirming the dialog brings
@@ -233,8 +234,13 @@ func (d *DialogServerSession) awaitAnswer(ctx context.Context, tx sip.ServerTran
 // offer/answer exchange was complete by then, so the peer has moved to the new
 // session. RFC 5763 section 5 has the media session torn down at once on a
 // fingerprint mismatch, and with a single audio stream that is the call.
-func (d *DialogServerSession) hangupNoMedia() error {
-	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
+//
+// It owns this teardown, which ctx, the ctx of the work that found the media
+// unusable, does not bound: that work may have failed on ctx's end, and the
+// BYE ends the dialog as it is sent. The BYE is bounded by teardownWait
+// instead, and the wait for its answer goes on past the end of the dialog.
+func (d *DialogServerSession) hangupNoMedia(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownWait)
 	defer cancel()
 	return d.Hangup(ctx)
 }

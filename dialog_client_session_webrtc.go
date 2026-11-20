@@ -203,7 +203,7 @@ func (d *DialogClientSession) WaitAnswerWebrtc(ctx context.Context, med *DialogW
 	}
 	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {
 		// The 2xx is acknowledged and the call it set up ended.
-		return errors.Join(err, d.ackAndBye())
+		return errors.Join(err, d.ackAndBye(ctx))
 	}
 	return d.Ack(ctx)
 }

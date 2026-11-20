@@ -207,7 +207,7 @@ func (d *DialogServerSession) respondSDP(ctx context.Context, body []byte) error
 	if err := d.DialogServerSession.Respond(ctx, 200, "OK", body, headers...); err != nil {
 		return err
 	}
-	if err := d.endOnAckAnswerError(); err != nil {
+	if err := d.endOnAckAnswerError(ctx); err != nil {
 		return err
 	}
 
@@ -403,14 +403,15 @@ func (d *DialogServerSession) AnswerLate() (*DialogMedia, error) {
 // call with a BYE, sent once the ACK is read. For the ACK to the 2xx to a
 // re-INVITE the error returned then wraps errMediaUpdateAfterAnswer, and a
 // dialog that ended while the media committed the update has no call left to
-// end, which is no error.
-func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
+// end, which is no error. That BYE is started from ctx, as hangupNoMedia
+// describes.
+func (d *DialogServerSession) ReadAck(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	d.dialogCallbacks.mu.Lock()
 	mediaHanshaker := d.mediaHanshaker
 	d.dialogCallbacks.mu.Unlock()
 
 	if d.acksInvite(req) {
-		return d.readInviteAck(req, tx, mediaHanshaker)
+		return d.readInviteAck(ctx, req, tx, mediaHanshaker)
 	}
 
 	// A copy of an ACK already read, sent for a retransmission of our 2xx,
@@ -421,7 +422,7 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 	}
 	defer ackHandled()
 	if answerDue {
-		return d.readReInviteAnswerAck(req, tx)
+		return d.readReInviteAnswerAck(ctx, req, tx)
 	}
 
 	var err error
@@ -446,7 +447,7 @@ func (d *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 		// answered call waits for the ACK to its 2xx (RFC 3261 section 15),
 		// which is the one this handler holds.
 		ackErr := d.DialogServerSession.ReadAck(req, tx)
-		return errors.Join(err, ackErr, d.hangupNoMedia())
+		return errors.Join(err, ackErr, d.hangupNoMedia(ctx))
 	}
 
 	return d.DialogServerSession.ReadAck(req, tx)
@@ -670,7 +671,7 @@ func (d *DialogServerSession) handleReInvite(ctx context.Context, req *sip.Reque
 			d.abortMedia()
 		}
 		if ackErr != nil {
-			err = errors.Join(err, ackErr, d.hangupNoMedia())
+			err = errors.Join(err, ackErr, d.hangupNoMedia(ctx))
 		}
 		if endUpdate != nil {
 			endUpdate()

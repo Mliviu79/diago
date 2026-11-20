@@ -505,7 +505,7 @@ func TestHandleMediaUpdateKeepsRTCPMonitorAfterRequestCtxEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	inner := newByeServerTx()
 	tx := newAckedServerTx(inner, func() {
-		_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+		_ = d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx())
 	})
 	require.NoError(t, d.handleReInvite(ctx, req, tx))
 	require.Len(t, inner.responses, 1)

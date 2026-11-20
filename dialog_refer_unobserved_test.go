@@ -269,7 +269,7 @@ func TestIntegrationDialogReferWithoutObserver(t *testing.T) {
 					if err := referDialog.Ack(ctx); err != nil {
 						return err
 					}
-					return referDialog.Hangup(referDialog.Context())
+					return referDialog.Hangup(ctx)
 				},
 			})
 			<-d.Context().Done()

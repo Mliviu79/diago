@@ -59,11 +59,11 @@ func (d *dialogCallbacks) applyAckAnswer(ctx context.Context, ack *sip.Request) 
 // without usable media. The ACK is read before that BYE: the BYE that ends an
 // answered call waits for the ACK to its 2xx (RFC 3261 section 15), which is
 // the one this handler holds.
-func (d *DialogServerSession) readReInviteAnswerAck(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *DialogServerSession) readReInviteAnswerAck(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	err := d.applyAckAnswer(d.Context(), req)
 	ackErr := d.DialogServerSession.ReadAck(req, tx)
 	if err != nil {
-		return errors.Join(err, ackErr, d.hangupNoMedia())
+		return errors.Join(err, ackErr, d.hangupNoMedia(ctx))
 	}
 	return ackErr
 }
@@ -72,9 +72,9 @@ func (d *DialogServerSession) readReInviteAnswerAck(req *sip.Request, tx sip.Ser
 // peer's that carried no offer: it hands the media the answer, see
 // applyAckAnswer, and ends the call with a BYE when the answer leaves it
 // without usable media.
-func (d *DialogClientSession) readReInviteAnswerAck(req *sip.Request) error {
+func (d *DialogClientSession) readReInviteAnswerAck(ctx context.Context, req *sip.Request) error {
 	if err := d.applyAckAnswer(d.Context(), req); err != nil {
-		return errors.Join(err, d.hangupNoMedia())
+		return errors.Join(err, d.hangupNoMedia(ctx))
 	}
 	return nil
 }

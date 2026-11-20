@@ -179,7 +179,7 @@ func TestDialogServerAnswerLateContextCut(t *testing.T) {
 
 	peer := newMediaSessionForTest(t)
 	require.NoError(t, peer.RemoteSDP(res.Body(), false))
-	require.NoError(t, d.ReadAck(newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
 	requireByeEndsDialog(t, d, sent, 5*time.Second)
 	requireCloseJoins(t, d)
 }
@@ -399,7 +399,7 @@ func TestDialogServerAnswerContextAnswers(t *testing.T) {
 			assert.NoError(t, err)
 
 			// A copy of the ACK starts nothing again and the call goes on.
-			require.NoError(t, d.ReadAck(newLateAck(d, nil), newByeServerTx()))
+			require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, nil), newByeServerTx()))
 			assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
 			select {
 			case req := <-sent:
@@ -438,7 +438,7 @@ func TestDialogServerAnswerLateContextAnswers(t *testing.T) {
 
 	peer := newMediaSessionForTest(t)
 	require.NoError(t, peer.RemoteSDP(res.Body(), false))
-	require.NoError(t, d.ReadAck(newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
 
 	answer := awaitContextAnswer(t, answered)
 	require.NoError(t, answer.err)
@@ -563,7 +563,7 @@ func TestDialogServerAnswerLateContextCutAckWithoutAnswer(t *testing.T) {
 
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
-	assert.ErrorIs(t, d.ReadAck(ack, newByeServerTx()), errAckCarriesNoAnswer)
+	assert.ErrorIs(t, d.ReadAck(t.Context(), ack, newByeServerTx()), errAckCarriesNoAnswer)
 
 	requireByeEndsDialog(t, d, sent, 5*time.Second)
 	requireCloseJoins(t, d)

@@ -133,5 +133,5 @@ func (d *DialogClientSession) waitAnswerWebrtcLeaveAck(ctx context.Context, med 
 		return nil
 	}
 	// The 2xx is acknowledged and the call it set up ended.
-	return errors.Join(err, d.ackAndBye())
+	return errors.Join(err, d.ackAndBye(ctx))
 }

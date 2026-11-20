@@ -124,7 +124,7 @@ func TestDialogServerAckMediaNotKeyedEndsTheCall(t *testing.T) {
 
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
-	assert.ErrorIs(t, d.ReadAck(ack, newByeServerTx()), errNotKeyed)
+	assert.ErrorIs(t, d.ReadAck(t.Context(), ack, newByeServerTx()), errNotKeyed)
 
 	select {
 	case err := <-answered:
@@ -162,7 +162,7 @@ func TestDialogServerAckCommitsTheMedia(t *testing.T) {
 	assert.Equal(t, 1, finalized, "the ACK confirming the dialog commits the media")
 	assert.Zero(t, aborted)
 
-	require.NoError(t, d.ReadAck(newLateAck(d, peerSDP()), newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peerSDP()), newByeServerTx()))
 	answers, finalized, _ = med.seen()
 	assert.Empty(t, answers, "a copy of the ACK answers nothing")
 	assert.Equal(t, 1, finalized, "a copy of the ACK commits nothing")
@@ -175,7 +175,7 @@ func TestDialogServerAckCommitsTheMedia(t *testing.T) {
 	tx := newRespondedServerTx()
 	ackRead := make(chan error, 1)
 	require.NoError(t, d.handleReInvite(t.Context(), reInvite, newAckedServerTx(tx, func() {
-		ackRead <- d.ReadAck(newReInviteAck(reInvite, nil), newByeServerTx())
+		ackRead <- d.ReadAck(t.Context(), newReInviteAck(reInvite, nil), newByeServerTx())
 	})))
 	select {
 	case res := <-tx.responded:

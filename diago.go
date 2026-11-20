@@ -374,18 +374,18 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 		dg.serveHandler(ctx, dWrap)
 
-		// Check is dialog closed
-		dialogCtx := dialog.Context()
-		// Always try hanguping call
-		hangupCtx, cancel := context.WithTimeout(dialogCtx, 10*time.Second)
+		// Always try hanguping call. A call that has ended already needs
+		// nothing, and Hangup returns nil for it. The wait for the BYE's
+		// answer runs on ctx, which outlives the dialog the BYE ends.
+		hangupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
 		if err := dWrap.Hangup(hangupCtx); err != nil {
-			if errors.Is(hangupCtx.Err(), context.Canceled) {
-				// Already hangup
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				// Serving stopped, which cut the hang-up short: the
+				// result of our own stop, not a failure.
 				return nil
 			}
-
 			return fmt.Errorf("hanguping call failed: %w", err)
 		}
 		return nil
@@ -414,10 +414,10 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 		if cd != nil {
 			// THis is from REINVITE
-			return cd.handleReInviteACK(req, tx)
+			return cd.handleReInviteACK(ctx, req, tx)
 		}
 
-		return sd.ReadAck(req, tx)
+		return sd.ReadAck(ctx, req, tx)
 	}))
 
 	server.OnBye(errHandler(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
@@ -702,7 +702,7 @@ func (dg *Diago) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		return nil, nil, errors.Join(err, d.ackAndBye(), d.Close())
+		return nil, nil, errors.Join(err, d.ackAndBye(ctx), d.Close())
 	}
 	return d, med, nil
 }
@@ -730,17 +730,17 @@ func (dg *Diago) InviteBridge(ctx context.Context, recipient sip.Uri, bridge *Br
 		RTPNAT:     opts.RTPNAT,
 	})
 	if err != nil {
-		return nil, nil, errors.Join(err, d.Hangup(d.Context()), d.Close())
+		return nil, nil, errors.Join(err, d.Hangup(ctx), d.Close())
 	}
 
 	// Do bridging now. The call is answered already, so a call that fails
 	// from here on is acknowledged and ended with a BYE.
 	if err := bridge.AddDialogMedia(med); err != nil {
-		return nil, nil, errors.Join(err, d.ackAndBye(), d.Close())
+		return nil, nil, errors.Join(err, d.ackAndBye(ctx), d.Close())
 	}
 
 	if err := d.Ack(ctx); err != nil {
-		return nil, nil, errors.Join(err, d.ackAndBye(), d.Close())
+		return nil, nil, errors.Join(err, d.ackAndBye(ctx), d.Close())
 	}
 	return d, med, nil
 }

@@ -119,7 +119,7 @@ func readAck(t *testing.T, d *DialogServerSession) {
 	t.Helper()
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
-	require.NoError(t, d.ReadAck(ack, newByeServerTx()))
+	require.NoError(t, d.ReadAck(t.Context(), ack, newByeServerTx()))
 }
 
 // handleEarly runs handle on another goroutine, calls release once the request
@@ -187,7 +187,7 @@ var inDialogRequests = []struct {
 		},
 		handle: func(ctx context.Context, d *DialogServerSession, req *sip.Request, tx sip.ServerTransaction) error {
 			return d.handleReInvite(ctx, req, newAckedServerTx(tx, func() {
-				_ = d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+				_ = d.ReadAck(ctx, newReInviteAck(req, nil), newByeServerTx())
 			}))
 		},
 		wantState: sip.DialogStateConfirmed,
@@ -540,7 +540,7 @@ func TestDialogServerHangupAnswered(t *testing.T) {
 		ack.SetBody([]byte("v=0\r\n"))
 
 		read := make(chan error, 1)
-		go func() { read <- d.ReadAck(ack, newByeServerTx()) }()
+		go func() { read <- d.ReadAck(t.Context(), ack, newByeServerTx()) }()
 
 		assert.Error(t, requireReturned(t, read, "ReadAck"), "the answer could not be applied")
 		assert.Equal(t, []sip.RequestMethod{sip.BYE}, sent.sent(), "the call was not ended with a BYE")

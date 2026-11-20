@@ -320,8 +320,13 @@ func (s *sessionState) refusePeerReInvite(ctx context.Context, req *sip.Request,
 // moved to the new session. When that was a new DTLS association whose
 // handshake failed, RFC 5763 section 5 has the media session torn down at
 // once, and with a single audio stream that is the call.
-func (d *DialogClientSession) hangupNoMedia() error {
-	ctx, cancel := context.WithTimeout(d.Context(), 10*time.Second)
+//
+// It owns this teardown, which ctx, the ctx of the work that found the media
+// unusable, does not bound: that work may have failed on ctx's end, and the
+// BYE ends the dialog as it is sent. The BYE is bounded by teardownWait
+// instead, and the wait for its answer goes on past the end of the dialog.
+func (d *DialogClientSession) hangupNoMedia(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownWait)
 	defer cancel()
 	return d.Hangup(ctx)
 }

@@ -67,7 +67,7 @@ func TestDialogServerAnswerDTLSEndsWithDialog(t *testing.T) {
 	ack := sip.NewRequest(sip.ACK, d.InviteRequest.Contact().Address)
 	ack.AppendHeader(&sip.CSeqHeader{SeqNo: d.InviteRequest.CSeq().SeqNo, MethodName: sip.ACK})
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(ack, newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), ack, newByeServerTx()) }()
 
 	// We answered actpass with active, so our side sends the ClientHello.
 	requireClientHello(t, peer)
@@ -97,7 +97,7 @@ func TestDialogServerLateOfferDTLSEndsWithDialog(t *testing.T) {
 	answer := withSetup(peer.LocalSDP(true), "passive")
 
 	acked := make(chan error, 1)
-	go func() { acked <- d.ReadAck(newLateAck(d, answer), newByeServerTx()) }()
+	go func() { acked <- d.ReadAck(t.Context(), newLateAck(d, answer), newByeServerTx()) }()
 	requireClientHello(t, peer)
 
 	require.NoError(t, d.ReadBye(t.Context(), newBye(t, d, d.InviteRequest.CSeq().SeqNo+1), newByeServerTx()))

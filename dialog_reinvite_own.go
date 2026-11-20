@@ -41,8 +41,9 @@ type ownReInvite struct {
 	// target and acknowledges its 2xx. A final response other than 2xx is
 	// returned together with sipgo.ErrDialogResponse.
 	send func(ctx context.Context, offer []byte, headers []sip.Header) (*sip.Response, error)
-	// hangup ends a call whose media the answer left unusable.
-	hangup func() error
+	// hangup ends a call whose media the answer left unusable, given the
+	// ctx of the re-INVITE.
+	hangup func(ctx context.Context) error
 }
 
 // run sends the re-INVITE and has the media take the answer in its 2xx. Each
@@ -143,18 +144,23 @@ func (r ownReInvite) applyAnswer(ctx context.Context, res *sip.Response) error {
 	if len(answer) == 0 {
 		return errReInviteAnswerWithoutSDP
 	}
-	// An answer that completes a new DTLS association has the media run its
-	// handshake before it returns: within ctx, and within the call, since a
-	// peer that has hung up never completes it.
-	ctx, stop := endsWithDialog(ctx, r.dialog)
-	defer stop()
-	err := r.handshaker.onRemoteSDP(ctx, answer, true)
+	err := r.keyAnswer(ctx, answer)
 	if errors.Is(err, errMediaKeyingFailed) {
 		// The answer stands, so the peer has moved to a session that has no
 		// keys here.
-		return errors.Join(fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err), r.hangup())
+		return errors.Join(fmt.Errorf("%w: %w", errMediaUpdateAfterAnswer, err), r.hangup(ctx))
 	}
 	return err
+}
+
+// keyAnswer hands the media answer, the description in the 2xx to our
+// re-INVITE. An answer that completes a new DTLS association has the media
+// run its handshake before it returns: within ctx, and within the call, since
+// a peer that has hung up never completes it.
+func (r ownReInvite) keyAnswer(ctx context.Context, answer []byte) error {
+	ctx, stop := endsWithDialog(ctx, r.dialog)
+	defer stop()
+	return r.handshaker.onRemoteSDP(ctx, answer, true)
 }
 
 // reInviteRetryWait waits, bounded by ctx, before a re-INVITE of ours answered

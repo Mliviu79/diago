@@ -597,7 +597,7 @@ func TestDialogServerMediaAllocatesOnTheDialogCtx(t *testing.T) {
 	confirmLate := func(t *testing.T, d *DialogServerSession, res *sip.Response) {
 		peer := newMediaSessionForTest(t)
 		require.NoError(t, peer.RemoteSDP(res.Body(), false))
-		require.NoError(t, d.ReadAck(newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
+		require.NoError(t, d.ReadAck(t.Context(), newLateAck(d, peer.LocalSDP(true)), newByeServerTx()))
 	}
 	for _, tc := range []struct {
 		name string

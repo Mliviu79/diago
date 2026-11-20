@@ -165,7 +165,7 @@ var reInviteAckSides = []struct {
 			}
 			return d.sipState(), req,
 				func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
-				func(ack *sip.Request) error { return d.ReadAck(ack, newByeServerTx()) },
+				func(ack *sip.Request) error { return d.ReadAck(t.Context(), ack, newByeServerTx()) },
 				func(tx sip.ServerTransaction) error {
 					return d.ReadBye(t.Context(), newBye(t, d, req.CSeq().SeqNo+1), tx)
 				},
@@ -184,7 +184,7 @@ var reInviteAckSides = []struct {
 			}
 			return d.sipState(), req,
 				func(tx sip.ServerTransaction) error { return d.handleReInvite(t.Context(), req, tx) },
-				func(ack *sip.Request) error { return d.handleReInviteACK(ack, newByeServerTx()) },
+				func(ack *sip.Request) error { return d.handleReInviteACK(t.Context(), ack, newByeServerTx()) },
 				func(tx sip.ServerTransaction) error {
 					return d.ReadBye(t.Context(), newPeerInDialogRequest(sip.BYE, req.CSeq().SeqNo+1), tx)
 				},
@@ -299,7 +299,7 @@ func TestDialogClientReInviteACKReadsMediaUnderLock(t *testing.T) {
 	}()
 
 	ack := sip.NewRequest(sip.ACK, sip.Uri{User: "dg", Host: "127.0.0.1"})
-	require.NoError(t, d.handleReInviteACK(ack, nil))
+	require.NoError(t, d.handleReInviteACK(t.Context(), ack, nil))
 	<-swapped
 }
 
@@ -359,7 +359,7 @@ func TestDialogPeerReInviteCommitsOrAbortsTheMedia(t *testing.T) {
 		require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
 
 		ackRead := make(chan error, 1)
-		go func() { ackRead <- d.ReadAck(newReInviteAck(req, nil), newByeServerTx()) }()
+		go func() { ackRead <- d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx()) }()
 		select {
 		case <-committing:
 		case <-time.After(5 * time.Second):
@@ -368,7 +368,7 @@ func TestDialogPeerReInviteCommitsOrAbortsTheMedia(t *testing.T) {
 		// A copy of the ACK, sent for a retransmission of the 2xx, arrives
 		// while the first is handled: it has the media commit nothing.
 		copyRead := make(chan error, 1)
-		go func() { copyRead <- d.ReadAck(newReInviteAck(req, nil), newByeServerTx()) }()
+		go func() { copyRead <- d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx()) }()
 		select {
 		case err := <-copyRead:
 			require.NoError(t, err)
@@ -445,7 +445,7 @@ func TestDialogPeerReInviteCommitsOrAbortsTheMedia(t *testing.T) {
 		// The answer is out, so the peer has moved to a session the media
 		// could not complete: the reading of the ACK says so and ends the
 		// call.
-		err := d.ReadAck(newReInviteAck(req, nil), newByeServerTx())
+		err := d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx())
 		require.ErrorIs(t, err, errMediaUpdateAfterAnswer)
 		require.ErrorIs(t, err, errNotKeyed)
 		select {
@@ -475,7 +475,7 @@ func TestDialogPeerReInviteCommitsOrAbortsTheMedia(t *testing.T) {
 		go func() { handled <- d.handleReInvite(t.Context(), req, tx) }()
 		require.Equal(t, sip.StatusOK, nextTransmission(t, tx, 5*time.Second))
 
-		require.NoError(t, d.ReadAck(newReInviteAck(req, nil), newByeServerTx()), "the end of the dialog is no failure of the update")
+		require.NoError(t, d.ReadAck(t.Context(), newReInviteAck(req, nil), newByeServerTx()), "the end of the dialog is no failure of the update")
 		require.NoError(t, byeErr)
 		select {
 		case err := <-handled:

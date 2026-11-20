@@ -1118,7 +1118,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 					if err := referDialog.Ack(ctx); err != nil {
 						return err
 					}
-					return referDialog.Hangup(referDialog.Context())
+					return referDialog.Hangup(ctx)
 				},
 			})
 			<-d.Context().Done()
@@ -1198,7 +1198,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15081}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		// Returns only once the terminal sipfrag says the transfer completed.
 		require.NoError(t, d.ReferAndWait(d.Context(), sip.Uri{Host: "127.0.0.1", Port: 15082}))
@@ -1208,7 +1208,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15081}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		err = d.ReferAndWait(d.Context(), sip.Uri{User: "busy", Host: "127.0.0.1", Port: 15082})
 		require.Error(t, err, "refer to a busy target must not report success")
@@ -1227,7 +1227,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 		d, _, err := dg.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 15083}, InviteOptions{})
 		require.NoError(t, err)
 		defer d.Close()
-		defer d.Hangup(d.Context())
+		defer d.Hangup(ctx)
 
 		// The REFER is accepted (202) and 100 Trying arrives with a 60s
 		// subscription, but no terminal sipfrag ever does; the caller gives the
@@ -1325,7 +1325,7 @@ func (tr *observedReferTransferee) onRefer(referDialog *DialogClientSession) err
 	if err := referDialog.Ack(tr.ctx); err != nil {
 		return err
 	}
-	return referDialog.Hangup(referDialog.Context())
+	return referDialog.Hangup(tr.ctx)
 }
 
 // holdNextReferral makes the next referral wait until release is called.
