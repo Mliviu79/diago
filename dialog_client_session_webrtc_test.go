@@ -42,7 +42,7 @@ func TestIntegrationDialogWebrtcBidirectionalRTP(t *testing.T) {
 
 	serverMedia := make(chan *DialogWebrtc, 1)
 	serverErr := make(chan error, 1)
-	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(serveCtx context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{
 			WebrtcConfig: webRTCConfig,
 		})
@@ -51,7 +51,12 @@ func TestIntegrationDialogWebrtcBidirectionalRTP(t *testing.T) {
 			return
 		}
 		serverMedia <- med
-		<-dialog.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-dialog.Context().Done():
+		}
 	}))
 	require.NotZero(t, server.transports[0].BindPort)
 
@@ -149,14 +154,19 @@ func TestIntegrationDialogWebrtcClientReInviteKeepsMediaWrappers(t *testing.T) {
 	}))
 	serverMedia := make(chan *DialogWebrtc, 1)
 	serverErr := make(chan error, 1)
-	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(serveCtx context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{WebrtcConfig: webRTCConfig})
 		if answerErr != nil {
 			serverErr <- answerErr
 			return
 		}
 		serverMedia <- med
-		<-dialog.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-dialog.Context().Done():
+		}
 	}))
 
 	clientUA, err := sipgo.NewUA(sipgo.WithUserAgent("voip-webrtc-reinvite-client"))
@@ -356,8 +366,12 @@ func TestIntegrationDialogWebrtcEarlyMedia(t *testing.T) {
 			return
 		}
 
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-allowAnswer:
+		case <-ctx.Done():
+			return
 		case <-dialog.Context().Done():
 			return
 		}
@@ -366,7 +380,12 @@ func TestIntegrationDialogWebrtcEarlyMedia(t *testing.T) {
 			return
 		}
 		close(serverAnswered)
-		<-dialog.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-dialog.Context().Done():
+		}
 	}))
 
 	clientUA, err := sipgo.NewUA(sipgo.WithUserAgent("voip-webrtc-early-media-client"))
