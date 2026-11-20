@@ -82,7 +82,12 @@ func TestIntegrationDialogClient(t *testing.T) {
 			defer med.Close()
 
 			dialogEcho(med)
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-ctx.Done():
+			case <-d.Context().Done():
+			}
 			return
 		}
 
@@ -95,7 +100,12 @@ func TestIntegrationDialogClient(t *testing.T) {
 
 		d.Respond(ctx, sip.StatusForbidden, "Forbidden", nil)
 
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	require.NoError(t, err)
 
@@ -198,7 +208,12 @@ func TestIntegrationDialogClientCancel(t *testing.T) {
 		d.Trying(runCtx)
 		d.Ringing(runCtx)
 
-		<-ctx.Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-runCtx.Done():
+		case <-ctx.Done():
+		}
 	})
 
 	{
@@ -336,12 +351,17 @@ func TestIntegrationDialogClientReinvite(t *testing.T) {
 			},
 		))
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			log("Call received")
 			d.Answer(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -378,12 +398,17 @@ func TestIntegrationDialogClientReinviteKeepAlive(t *testing.T) {
 			},
 		))
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			log("Call received")
 			d.Answer(AnswerOptions{OnMediaUpdate: func(d *DialogMedia) {
 
 			}})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -485,7 +510,12 @@ func TestIntegrationDialogClientReinviteMedia(t *testing.T) {
 
 			// beepEncoded, _ := media.ReadAll(ar, 160)
 			// audioReceived <- beepEncoded
-			<-ctx.Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-runCtx.Done():
+			case <-ctx.Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -619,13 +649,18 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 		)
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			log("Call received")
 			if _, err := d.Answer(AnswerOptions{}); err != nil {
 				log("Error on answer", err)
 				return
 			}
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
