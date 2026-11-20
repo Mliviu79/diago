@@ -30,15 +30,15 @@ func (c *AudioMuterReader) Mute(mute bool) {
 }
 
 type AudioMuterWriter struct {
-	Writer io.Writer
-	muted  atomic.Bool
+	Writer  io.Writer
+	muted   atomic.Bool
+	zeroBuf atomic.Pointer[[]byte]
 }
 
 func (c *AudioMuterWriter) Write(b []byte) (n int, err error) {
 	if c.muted.Load() {
-		for i := range b {
-			b[i] = 0
-		}
+		// io.Writer forbids modifying b, so the silence comes from a buffer of our own.
+		return c.Writer.Write(c.silence(len(b)))
 	}
 
 	return c.Writer.Write(b)
