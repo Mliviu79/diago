@@ -26,3 +26,27 @@ func (m *MediaSessionWebrtc) forkCodecsLocked() []Codec {
 	}
 	return slices.Clone(m.Codecs)
 }
+
+// restoreSetupCodecsLocked puts back into Codecs the codecs the session was
+// set up with, which its offer carried, when a negotiation narrowed them: the
+// answer applied next answers that same offer, and is matched against every
+// codec it carried, not only those an earlier answer kept (RFC 3264 section
+// 6.1). The caller holds m.mu.
+func (m *MediaSessionWebrtc) restoreSetupCodecsLocked() {
+	if m.setupCodecs != nil {
+		m.Codecs = slices.Clone(m.setupCodecs)
+	}
+}
+
+// RestoreOfferCodecs readies the session for another answer to the offer it
+// made, as the 2xx of another early dialog than the one whose answer the
+// session took carries (RFC 3261 sections 12.1 and 13.2.1): that answer is
+// matched against every codec the offer carried, not only those the first
+// answer kept (RFC 3264 section 6.1). The codec the session runs on stays
+// until the next answer is applied and finalized. A session that took no
+// answer is left as it is.
+func (m *MediaSessionWebrtc) RestoreOfferCodecs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreSetupCodecsLocked()
+}

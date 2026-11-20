@@ -4,7 +4,6 @@ package media
 
 import (
 	"fmt"
-	"slices"
 
 	"github.com/pion/dtls/v3"
 )
@@ -42,12 +41,7 @@ func (m *MediaSessionWebrtc) AbandonNegotiation() error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.setupCodecs != nil {
-		// The answer that follows answers the same offer, which carried
-		// every codec the session was set up with, and not only those the
-		// ended answer kept (RFC 3264 section 6.1).
-		m.Codecs = slices.Clone(m.setupCodecs)
-	}
+	m.restoreSetupCodecsLocked()
 	ended, endedTr := m.dtlsConn, m.dtlsTr
 	tr := m.dtlsTransport()
 	var conn *dtls.Conn

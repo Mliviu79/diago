@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -106,4 +107,55 @@ func TestDialogClientWebrtcOtherEarlyDialogSameEndpointOtherCodec(t *testing.T) 
 			require.NoError(t, d.Hangup(ctx))
 		})
 	}
+}
+
+// TestDialogClientWebrtcOtherEarlyDialogAfterKeyedEarlyMediaOtherCodec is a
+// WebRTC call with EarlyMediaDetect whose 183, from early dialog a, is keyed
+// early media on PCMU, and whose 200 comes from early dialog b of the same
+// endpoint, with the same ICE credentials and fingerprint, answering PCMA.
+// Both answer the one offer, which carried both codecs (RFC 3264 section
+// 6.1): the call is confirmed on PCMA and sends it.
+func TestDialogClientWebrtcOtherEarlyDialogAfterKeyedEarlyMediaOtherCodec(t *testing.T) {
+	codecs := []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw}
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	peer := newLoopbackWebrtcSession(t, codecs)
+	keyed := make(chan error, 1)
+	confirm := make(chan struct{})
+	d := newStagedCallerDialog(t, Transport{}, func(req *sip.Request, deliver func(*sip.Response)) {
+		answer := webrtcAnswerOf(t, peer, req)
+		progress := earlyDialogResponse(req, sip.StatusSessionInProgress, "Session Progress", "a", withOnlyFormat(t, answer, media.CodecAudioUlaw.PayloadType))
+		ok := earlyDialogResponse(req, sip.StatusOK, "OK", "b", withOnlyFormat(t, answer, media.CodecAudioAlaw.PayloadType))
+		go func() {
+			deliver(progress)
+			keyed <- peer.Finalize(ctx)
+			select {
+			case <-confirm:
+			case <-ctx.Done():
+				return
+			}
+			deliver(ok)
+		}()
+	})
+	d.mediaConfig.Codecs = codecs
+
+	med, err := d.InviteWebrtc(ctx, InviteWebrtcOptions{
+		EarlyMediaDetect:     true,
+		EarlyMediaKeyTimeout: 20 * time.Second,
+		WebrtcConfig:         loopbackWebrtcConfig(),
+	})
+	require.ErrorIs(t, err, ErrClientEarlyMedia)
+	require.NoError(t, awaitWebrtcResult(t, keyed, "the peer's negotiation"))
+	require.Equal(t, media.CodecAudioUlaw.Name, med.MediaSession().Codec().Name, "the early media does not run on the codec of the 183's dialog")
+
+	close(confirm)
+	require.NoError(t, d.WaitAnswerWebrtc(ctx, med, sipgo.AnswerOptions{}), "the 200's answer was refused")
+	assert.Equal(t, media.CodecAudioAlaw.Name, med.MediaSession().Codec().Name, "the call does not run on the codec of the 200's dialog")
+
+	_, err = med.RTPPacketWriter.Write(make([]byte, 160))
+	require.NoError(t, err)
+	pkt := (&webrtcHandlePeer{sess: peer, laddr: peer.Laddr}).recv(t)
+	assert.Equal(t, media.CodecAudioAlaw.PayloadType, pkt.PayloadType, "the call sends the codec of the 183's dialog")
+	require.NoError(t, d.Hangup(ctx))
 }
