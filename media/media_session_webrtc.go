@@ -677,6 +677,7 @@ func (m *MediaSessionWebrtc) RemoteSDP(_ context.Context, body []byte, offered b
 
 	m.localSetup = localSetup
 	dtlsConf := m.Config.DTLS.ToLibConf(fingerprints)
+	m.dtlsLibConf = dtlsConf
 	dtlsTr := m.dtlsTransport()
 	if localDTLSClient {
 		m.dtlsConn, err = dtls.Client(dtlsTr, conn.RemoteAddr(), dtlsConf)

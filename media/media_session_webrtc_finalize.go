@@ -62,6 +62,12 @@ func (m *MediaSessionWebrtc) finalize(ctx context.Context) error {
 	if kept != nil {
 		return kept
 	}
+	if err := m.negotiate(ctx, true); err != nil {
+		return err
+	}
+	// An answer applied after AbandonNegotiation ended a negotiation was
+	// staged, as one that continues the transport is, and is committed now
+	// that the transport is negotiated.
 	return m.negotiate(ctx, true)
 }
 

@@ -77,13 +77,16 @@ func firstLocalSDP(ctx context.Context, sess *media.MediaSessionWebrtc, answered
 // An answer after the one whose negotiation onFinalizeWithin left running is
 // the answer of another early dialog of our offer, whose 2xx confirms it (RFC
 // 3261 sections 12.1 and 13.2.1): that negotiation is ended before the answer
-// is applied, as nothing else may use sess while it runs.
+// is applied, as nothing else may use sess while it runs, and onFinalize then
+// negotiates afresh for this answer.
 func firstRemoteSDP(ctx context.Context, sess *media.MediaSessionWebrtc, remoteSDP []byte, offered bool) error {
 	if remoteSDP == nil {
 		return nil
 	}
 	if offered {
-		sess.AbandonNegotiation()
+		if err := sess.AbandonNegotiation(); err != nil {
+			return err
+		}
 	}
 	return sess.RemoteSDP(ctx, remoteSDP, offered)
 }

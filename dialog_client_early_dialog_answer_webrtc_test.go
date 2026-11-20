@@ -4,10 +4,12 @@ package diago
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/require"
 )
@@ -201,6 +203,93 @@ func TestDialogClientWebrtcOtherEarlyDialogEndsLeftNegotiation(t *testing.T) {
 			require.Nil(t, med)
 			require.Less(t, time.Since(start), 10*time.Second, "the negotiation of the 183 was waited for")
 			require.Equal(t, sip.DialogStateEnded, d.LoadState(), "the call of the 200 was not ended")
+		})
+	}
+}
+
+// ackSignalRequester hands every request to next, and closes acked at the
+// first ACK it is handed: the ACK of a 2xx goes through the requester, with
+// no transaction, as it goes to the transport.
+type ackSignalRequester struct {
+	next  sipgo.ClientTransactionRequester
+	once  sync.Once
+	acked chan struct{}
+}
+
+func (r *ackSignalRequester) Request(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	if req.IsAck() {
+		r.once.Do(func() { close(r.acked) })
+	}
+	return r.next.Request(ctx, req)
+}
+
+// TestDialogClientWebrtcOtherEarlyDialogSameEndpoint is a WebRTC call with
+// EarlyMediaDetect whose 183 and 200 come from two early dialogs of one
+// endpoint: both carry the same answer, with the same ICE credentials and
+// fingerprint. The callee takes part in the negotiation only once the ACK is
+// out, so the negotiation the 183 started is left running and then ended for
+// the 200. The call is keyed by a negotiation run afresh for the 200's
+// dialog, and carries audio both ways.
+func TestDialogClientWebrtcOtherEarlyDialogSameEndpoint(t *testing.T) {
+	for _, tc := range webrtcInvites {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+			defer cancel()
+
+			peer := newLoopbackWebrtcSession(t, []media.Codec{media.CodecAudioUlaw})
+			acked := make(chan struct{})
+			peerDone := make(chan error, 1)
+			peerJoined := make(chan struct{})
+			defer func() {
+				cancel()
+				<-peerJoined
+			}()
+			go func() {
+				defer close(peerJoined)
+				select {
+				case <-acked:
+					peerDone <- peer.Finalize(ctx)
+				case <-ctx.Done():
+					peerDone <- context.Cause(ctx)
+				}
+			}()
+			d := newStagedCallerDialog(t, Transport{}, func(req *sip.Request, deliver func(*sip.Response)) {
+				if err := peer.RemoteSDP(ctx, req.Body(), false); err != nil {
+					t.Errorf("the peer took no offer: %v", err)
+					return
+				}
+				answer, err := peer.LocalSDP(ctx, true)
+				if err != nil {
+					t.Errorf("the peer gave no answer: %v", err)
+					return
+				}
+				progress := earlyDialogResponse(req, sip.StatusSessionInProgress, "Session Progress", "a", answer)
+				ok := earlyDialogResponse(req, sip.StatusOK, "OK", "b", answer)
+				go func() {
+					deliver(progress)
+					deliver(ok)
+				}()
+			})
+
+			// The callee takes part once the ACK is out: the negotiation the
+			// 183 started has been ended by then.
+			requester := &ackSignalRequester{next: d.UA.Client.TxRequester, acked: acked}
+			d.UA.Client.TxRequester = requester
+
+			med, err := tc.invite(ctx, d, InviteWebrtcOptions{
+				EarlyMediaDetect:     true,
+				EarlyMediaKeyTimeout: 300 * time.Millisecond,
+				WebrtcConfig:         loopbackWebrtcConfig(),
+			})
+			require.NoError(t, err, "the 200's dialog was not keyed")
+			select {
+			case err := <-peerDone:
+				require.NoError(t, err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("the callee's negotiation did not complete")
+			}
+			requireWebrtcAudioBothWays(t, med, &webrtcHandlePeer{sess: peer, laddr: peer.Laddr})
+			require.NoError(t, d.Hangup(ctx))
 		})
 	}
 }

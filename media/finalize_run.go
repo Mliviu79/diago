@@ -195,3 +195,28 @@ func (l *negotiationLeftRunning) stop() {
 	<-run.done
 	l.forget(run)
 }
+
+// abandon ends a negotiation left running, as stop does, and then forgets
+// what became of it, the error kept of one that failed included, so that the
+// session's next Finalize runs a negotiation of its own rather than report
+// that one. It reports whether there was a negotiation to forget: one left
+// running, or the error of one that failed.
+func (l *negotiationLeftRunning) abandon() bool {
+	run, _ := l.current()
+	if run != nil {
+		run.cancel()
+		<-run.done
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.run == run {
+		l.run = nil
+	}
+	started := run != nil || l.err != nil
+	l.err = nil
+	// Nothing runs any more whose keys a write would wait for: the session
+	// refuses to send until a negotiation keys it, as one that never left a
+	// negotiation running does.
+	l.unkeyed.Store(false)
+	return started
+}

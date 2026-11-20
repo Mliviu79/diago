@@ -2,7 +2,11 @@
 
 package media
 
-import "io"
+import (
+	"io"
+
+	"github.com/pion/dtls/v3"
+)
 
 // webrtcSessionState is the state a MediaSessionWebrtc keeps beside the ICE,
 // DTLS and SRTP fields it negotiates with. MediaSessionWebrtc.mu guards it,
@@ -16,6 +20,11 @@ type webrtcSessionState struct {
 	// can take the DTLS stream of the mux back from the DTLS stack once the
 	// keying material is exported.
 	dtlsTr *dtlsKeyExchangeConn
+
+	// dtlsLibConf is the configuration dtlsConn was built with, which holds
+	// the peer's fingerprints. AbandonNegotiation builds a fresh conn from it
+	// for a handshake it ended.
+	dtlsLibConf *dtls.Config
 
 	// dtlsAssociationState is the DTLS association of this ICE generation,
 	// which the session negotiates once and every later description has to
