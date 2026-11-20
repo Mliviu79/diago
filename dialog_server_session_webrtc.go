@@ -80,8 +80,12 @@ func (d *DialogServerSession) AnswerWebrtc(opts AnswerWebrtcOptions) (*DialogWeb
 			return err
 		}
 		rtpSess := media.NewRTPSessionWebrtc(sess)
-		med.Init(sess, rtpSess)
-		if err = rtpSess.MonitorBackgroundContext(d.Context()); err != nil {
+		// Set up and started under the lock Close takes: a Close made by
+		// the dialog's end meanwhile found no transport to close, and
+		// nothing may start on closed media.
+		if err = med.initMonitored(sess, rtpSess, func() error {
+			return rtpSess.MonitorBackgroundContext(d.Context())
+		}); err != nil {
 			return err
 		}
 		return nil

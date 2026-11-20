@@ -347,17 +347,20 @@ func (d *DialogWebrtc) replaceMediaSession(sess *media.MediaSessionWebrtc) error
 	}
 
 	rtpSession := oldRTPSession.Fork(sess)
-	if err := rtpSession.MonitorBackground(); err != nil {
-		_ = sess.Close()
-		return err
-	}
 
 	d.mu.Lock()
 	if d.closed || d.pendingMediaSession != sess {
 		d.mu.Unlock()
-		_ = rtpSession.MonitorClose()
 		_ = sess.Close()
 		return fmt.Errorf("dialog WebRTC media replacement was canceled")
+	}
+	// Started under the lock Close takes, once the media is known not to be
+	// closed: started before, it could start after a Close that did not know
+	// it. MonitorBackground only starts the monitor's goroutines.
+	if err := rtpSession.MonitorBackground(); err != nil {
+		d.mu.Unlock()
+		_ = sess.Close()
+		return err
 	}
 	// The deadlines StopRTP and StartRTP last set go first: moving the packet
 	// reader ends a read waiting on the replaced transport, and that read is

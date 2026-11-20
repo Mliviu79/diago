@@ -169,8 +169,10 @@ func finalizeWebrtcMedia(ctx context.Context, sess *media.MediaSessionWebrtc, me
 		return err
 	}
 	rtpSess := media.NewRTPSessionWebrtc(sess)
-	med.Init(sess, rtpSess)
-	if err := rtpSess.MonitorBackground(); err != nil {
+	// Set up and started under the lock Close takes: a Close made by the
+	// dialog's end meanwhile found no transport to close, and nothing may
+	// start on closed media.
+	if err := med.initMonitored(sess, rtpSess, rtpSess.MonitorBackground); err != nil {
 		return errors.Join(err, rtpSess.Close())
 	}
 	return nil

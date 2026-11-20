@@ -96,20 +96,19 @@ func (d *DialogWebrtc) finalizeFirstExchange(ctx context.Context, sess *media.Me
 // installFirstExchange sets sess, the completed transport of the media's
 // first exchange, up as the media of the call, with its RTP session, reader
 // and writer, and starts its RTCP monitor.
+//
+// The monitor is started under the lock Close takes, as the transport is set
+// up, so a Close either finds it running and stops it or has closed the
+// transport before and leaves nothing to start.
 func (d *DialogWebrtc) installFirstExchange(sess *media.MediaSessionWebrtc) error {
 	rtpSess := media.NewRTPSessionWebrtc(sess)
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed || d.pendingMediaSession != sess {
 		// Close took the transport and closed it.
-		d.mu.Unlock()
 		return errMediaClosed
 	}
-	codec := sess.Codec()
 	d.pendingMediaSession = nil
-	d.mediaSession = sess
-	d.rtpSession = rtpSess
-	d.RTPPacketReader = media.NewRTPPacketReader(rtpSess, codec)
-	d.RTPPacketWriter = media.NewRTPPacketWriter(rtpSess, codec)
-	d.mu.Unlock()
+	d.installUnsafe(sess, rtpSess)
 	return rtpSess.MonitorBackground()
 }
