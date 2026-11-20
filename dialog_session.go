@@ -303,7 +303,13 @@ func (r *ReferTransaction) Accept(ctx context.Context, opts InviteClientOptions)
 	log := dg.log
 	log.Info("Accepting refer")
 	if err := r.tx.Respond(ctx, sip.NewResponseFromRequest(req, 202, "Accepted", nil)); err != nil {
-		return nil, fmt.Errorf("failed to send 202 Accepted")
+		return nil, fmt.Errorf("failed to send 202 Accepted: %w", err)
+	}
+
+	// The accepted REFER is an implicit subscription, and its notifier sends
+	// a NOTIFY at once (RFC 3515 section 2.4.4; RFC 6665 section 4.2.1).
+	if err := r.sendNotify(ctx, 100, "Trying", subState{state: "active", expires: 60}); err != nil {
+		return nil, fmt.Errorf("refer NOTIFY 100 failed to send: %w", err)
 	}
 
 	referDialog, err := dg.NewDialog(referToUri, NewDialogOptions{})
@@ -325,38 +331,15 @@ func (r *ReferTransaction) Accept(ctx context.Context, opts InviteClientOptions)
 			opts.Headers = append(opts.Headers, sip.HeaderClone(h))
 		}
 
-		if _, err := referDialog.Invite(ctx, opts); err != nil {
-			return err
-		}
-
-		dg.log.Info("OnReferDialog handling failed with", "error", err)
-		var resErr *sipgo.ErrDialogResponse
-		if errors.As(err, &resErr) {
-			return r.sendNotify(ctx, resErr.Res.StatusCode, resErr.Res.Reason, subState{
-				state:  "terminated",
-				reason: "noresource",
-			})
-		}
-
-		// If call failed to be established but not yet confirmed
-		state := referDialog.LoadState()
-		if state == 0 || state == sip.DialogStateEstablished {
-			return r.sendNotify(ctx, 400, "Bad Request", subState{
-				state:  "terminated",
-				reason: "noresource",
-			})
-		}
-		return r.sendNotify(ctx, 200, "OK", subState{
-			state:  "terminated",
-			reason: "noresource",
-		})
+		_, err := referDialog.Invite(ctx, opts)
+		return err
 	}()
+	// One terminating NOTIFY, carrying the INVITE's outcome, follows on
+	// every path (RFC 3515 section 2.4.5).
+	if nerr := r.sendFinalNotify(ctx, referDialog, err); nerr != nil {
+		err = errors.Join(err, nerr)
+	}
 	if err != nil {
-		r.sendNotify(ctx, 200, "OK", subState{
-			state:  "terminated",
-			reason: "noresource",
-		})
-
 		referDialog.Close()
 		return nil, err
 	}
@@ -435,6 +418,7 @@ func dialogHandleReferTransaction(ctx context.Context, d DialogSession, dg *Diag
 	}
 
 	rtx := ReferTransaction{
+		d:            d,
 		dg:           dg,
 		tx:           tx,
 		referTo:      referToUri,
