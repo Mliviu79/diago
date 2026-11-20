@@ -1109,7 +1109,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			d.Answer(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if _, err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
@@ -1121,7 +1121,12 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 					return referDialog.Hangup(ctx)
 				},
 			})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -1139,7 +1144,7 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			switch d.ToUser() {
 			case "busy":
 				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
@@ -1147,7 +1152,12 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			default:
 				d.Answer(AnswerOptions{})
 			}
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -1170,14 +1180,19 @@ func TestIntegrationDialogReferWaitsForOutcome(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			d.Answer(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					<-stuckRefer
 					return nil
 				},
 			})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}

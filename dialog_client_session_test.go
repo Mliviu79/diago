@@ -687,7 +687,7 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		))
 
 		log := asyncLog(t)
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			log("Call received")
 			d.Answer(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
@@ -700,7 +700,12 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 					return referDialog.Hangup(ctx)
 				},
 			})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -734,7 +739,12 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 				_, _ = d.Answer(AnswerOptions{})
 			}
 
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-ctx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -759,7 +769,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(ctx)
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
@@ -777,7 +788,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(ctx)
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "noanswer", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
@@ -795,7 +807,8 @@ func TestIntegrationDialogClientRefer(t *testing.T) {
 		defer d.Close()
 		defer d.Hangup(ctx)
 
-		referState := make(chan int)
+		// Buffered: a NOTIFY after the two this expects must not hold its handler.
+		referState := make(chan int, 4)
 		err = d.ReferOptions(d.Context(), sip.Uri{User: "busy", Host: "127.0.0.1", Port: 15072}, ReferClientOptions{
 			OnNotify: func(statusCode int) {
 				referState <- statusCode
