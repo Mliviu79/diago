@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -96,10 +97,8 @@ func (s *sessionState) noteDialogAnswer(res *sip.Response) {
 // description one of them carries is its answer (section 13.2.1), also when
 // its To tag is that of an ended one.
 //
-// What the media took from an ended early dialog stays with the media until
-// an answer of the new request is applied, which takes its place: a keyed
-// early media session is forked to that answer, and a handshake left running
-// is ended before that answer is applied (earlyKeyingLeft stays set for it).
+// What the media took from the ended early dialogs is stopped by the media
+// itself, see endEarlyMedia.
 func (s *sessionState) endEarlyDialogs() {
 	s.answeringMu.Lock()
 	defer s.answeringMu.Unlock()
@@ -140,17 +139,39 @@ func sessionDescription(res *sip.Response) []byte {
 
 // awaitInviteAnswer waits for the final response to our INVITE with wait, as
 // opts asks, and records the answer each early dialog gives our offer on the
-// way, see noteDialogAnswer.
-func (d *DialogClientSession) awaitInviteAnswer(ctx context.Context, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
+// way, see noteDialogAnswer. At a non-2xx final response, which ends every
+// early dialog, keyer, the media of the INVITE, stops the media it took from
+// them before anything else is done with that response, the INVITE sent again
+// after a challenge included: see endEarlyMedia.
+func (d *DialogClientSession) awaitInviteAnswer(ctx context.Context, keyer mediaEarlyKeyer, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
 	onResponse := opts.OnResponse
 	opts.OnResponse = func(res *sip.Response) error {
 		d.noteDialogAnswer(res)
+		if res.StatusCode >= 300 {
+			if err := d.endEarlyMedia(keyer); err != nil {
+				return err
+			}
+		}
 		if onResponse == nil {
 			return nil
 		}
 		return onResponse(res)
 	}
 	return wait(ctx, opts)
+}
+
+// endEarlyMedia has keyer, the media of our INVITE, stop what it took from
+// the early dialogs a non-2xx final response ended (RFC 3261 section 12.3):
+// nothing of an ended dialog's media runs after it. The INVITE sent again
+// after a challenge carries the same offer, and a 183 to it is taken as early
+// media again, as the first one was.
+func (d *DialogClientSession) endEarlyMedia(keyer mediaEarlyKeyer) error {
+	if err := keyer.endEarlyMedia(); err != nil {
+		return fmt.Errorf("end the media of the ended early dialogs: %w", err)
+	}
+	// A handshake left running was ended with the rest.
+	d.forgetEarlyKeyingLeft()
+	return nil
 }
 
 // toTag returns the tag of res's To header, empty when it has none.

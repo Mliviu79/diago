@@ -157,6 +157,9 @@ func (k *scriptedKeyer) onFinalizeWithin(_ context.Context, wait time.Duration) 
 	return k.results[i]
 }
 
+// endEarlyMedia has nothing to stop: the media is scripted.
+func (k *scriptedKeyer) endEarlyMedia() error { return nil }
+
 // TestDialogServerKeyEarlyMedia pins what the session makes of each result of
 // the keying: keyed, left running, failed.
 func TestDialogServerKeyEarlyMedia(t *testing.T) {

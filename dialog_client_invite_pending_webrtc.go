@@ -41,7 +41,7 @@ func (d *DialogClientSession) WaitAnswerWebrtcLeavePending(ctx context.Context, 
 	if med == nil || med.MediaSession() == nil {
 		return errors.New("dialog WebRTC media is not initialized")
 	}
-	if err := d.awaitInviteAnswer(ctx, opts, d.DialogClientSession.WaitAnswerLeavePending); err != nil {
+	if err := d.awaitInviteAnswer(ctx, med, opts, d.DialogClientSession.WaitAnswerLeavePending); err != nil {
 		return err
 	}
 	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {

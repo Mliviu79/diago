@@ -324,7 +324,6 @@ func (d *DialogClientSession) WaitAnswer(ctx context.Context, med *DialogMedia, 
 }
 
 func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, keyTimeout time.Duration, wait inviteAnswerWait) error {
-	sess := med.mediaSession
 	onResps := opts.OnResponse
 
 	// Add early media check
@@ -361,8 +360,9 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 		}
 
 		// The answer of the early dialog the 183 belongs to, which a
-		// provisional response before it may have given.
-		if err := sess.RemoteSDP(d.dialogAnswer(res), true); err != nil {
+		// provisional response before it may have given, applied through
+		// the handshake.
+		if err := med.onRemoteSDP(ctx, d.dialogAnswer(res), true); err != nil {
 			return err
 		}
 		d.noteEarlyAnswerTaken(res)
@@ -373,6 +373,9 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 			return err
 		}
 
+		// The session the answer went to: the media puts another in place
+		// of the first when a non-2xx final ends its early dialog.
+		sess := med.MediaSession()
 		rtpSess := media.NewRTPSession(sess)
 		med.mu.Lock()
 		med.initRTPSessionUnsafe(sess, rtpSess)
@@ -397,7 +400,7 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, 
 
 // waitAnswerWith is waitAnswer, waiting for the INVITE's answer with wait.
 func (d *DialogClientSession) waitAnswerWith(ctx context.Context, med *DialogMedia, opts sipgo.AnswerOptions, wait inviteAnswerWait) error {
-	if err := d.awaitInviteAnswer(ctx, opts, wait); err != nil {
+	if err := d.awaitInviteAnswer(ctx, med, opts, wait); err != nil {
 		return err
 	}
 

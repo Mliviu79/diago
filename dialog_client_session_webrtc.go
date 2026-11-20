@@ -123,7 +123,7 @@ func (d *DialogClientSession) inviteWebrtcWith(ctx context.Context, opts InviteW
 				return d.takeEarlyWebrtcAnswer(ctx, med, res, opts.EarlyMediaKeyTimeout)
 			}
 		}
-		if err = d.awaitInviteAnswer(ctx, answerOpts, wait); err != nil {
+		if err = d.awaitInviteAnswer(ctx, med, answerOpts, wait); err != nil {
 			return err
 		}
 		answered = true
@@ -224,7 +224,7 @@ func (d *DialogClientSession) WaitAnswerWebrtc(ctx context.Context, med *DialogW
 	if med == nil || med.MediaSession() == nil {
 		return fmt.Errorf("dialog WebRTC media is not initialized")
 	}
-	if err := d.awaitInviteAnswer(ctx, opts, d.DialogClientSession.WaitAnswer); err != nil {
+	if err := d.awaitInviteAnswer(ctx, med, opts, d.DialogClientSession.WaitAnswer); err != nil {
 		return err
 	}
 	if err := d.applyEarlyWebrtcFinalAnswer(ctx, med); err != nil {

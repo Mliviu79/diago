@@ -20,6 +20,12 @@ func (d *DialogWebrtc) initMonitored(sess *media.MediaSessionWebrtc, rtpSess *me
 	if d.closed {
 		return errMediaClosed
 	}
+	if d.pendingMediaSession == sess {
+		// The transport the media took for its first exchange, from a 183
+		// whose early dialog has ended since: installed, it is no longer the
+		// exchange's.
+		d.pendingMediaSession = nil
+	}
 	d.installUnsafe(sess, rtpSess)
 	return monitor()
 }

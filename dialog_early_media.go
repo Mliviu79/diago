@@ -45,6 +45,20 @@ type mediaEarlyKeyer interface {
 	// Nothing else may be asked of the media between a call that left the
 	// negotiation running and the onFinalize that completes it.
 	onFinalizeWithin(ctx context.Context, wait time.Duration) error
+
+	// endEarlyMedia has the media stop what it took from the answer of an
+	// early dialog of our offer, at a non-2xx final response that ended every
+	// early dialog (RFC 3261 section 12.3): early RTP stops, with its RTCP
+	// monitor, and a negotiation onFinalizeWithin left running is ended. The
+	// packet reader and writer handed out for that early media refuse from
+	// then on, so nothing more is sent to the ended dialog's peer. The media
+	// is left as our offer left it, on the sockets the offer named, so the
+	// answer to the same offer, sent again in a new INVITE, is taken as the
+	// first one was.
+	//
+	// Media that took no answer, and closed media, have nothing to stop and
+	// return nil.
+	endEarlyMedia() error
 }
 
 // earlyAnswer is what a session keeps of the answer the 183 of ProgressMedia
@@ -83,6 +97,14 @@ func (s *sessionState) noteEarlyKeyingLeft() {
 	s.answeringMu.Lock()
 	defer s.answeringMu.Unlock()
 	s.earlyUnkeyed = true
+}
+
+// forgetEarlyKeyingLeft records that no handshake of early media is left
+// running, once the media has ended the one noteEarlyKeyingLeft recorded.
+func (s *sessionState) forgetEarlyKeyingLeft() {
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	s.earlyUnkeyed = false
 }
 
 // earlyKeyingLeft reports whether the handshake of early media was left
