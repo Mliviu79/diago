@@ -63,7 +63,12 @@ func TestDialogClientInviteWebrtcLeavePending(t *testing.T) {
 		if err := callee.Ringing(ctx); err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	errGaveUp := errors.New("the caller gave up")
