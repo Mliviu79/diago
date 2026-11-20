@@ -68,7 +68,12 @@ func TestIntegrationClientSourcesFromBindPortOnceServing(t *testing.T) {
 		default:
 		}
 		_ = d.Respond(ctx, sip.StatusBusyHere, "Busy Here", nil)
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	if err != nil {
 		t.Fatalf("peer ServeBackground: %v", err)
