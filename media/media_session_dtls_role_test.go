@@ -247,6 +247,34 @@ func TestSDPSetupRoleOverrideStillWins(t *testing.T) {
 	}
 }
 
+// TestDTLSAnswerSetupTakesOneSide pins that an answer of ours carries active
+// or passive whatever SDPSetupRole returns, and the side the session plays:
+// RFC 5763 section 5, "The answerer MUST use either a setup attribute value of
+// setup:active or setup:passive". The WebRTC type writes the same value, see
+// TestDTLSWebrtcSetupTakesOneSide.
+func TestDTLSAnswerSetupTakesOneSide(t *testing.T) {
+	for _, override := range []string{"", "active", "passive", "actpass", "holdconn"} {
+		for _, remote := range []string{"active", "passive", "actpass", ""} {
+			for _, role := range []DTLSEndpointRole{DTLSEndpointRoleUnknown, DTLSEndpointRoleOfferer, DTLSEndpointRoleAnswerer} {
+				s := &MediaSession{
+					SecureRTP:   SecureRTPModeDTLS,
+					DTLSRole:    role,
+					remoteProto: "UDP/TLS/RTP/SAVP",
+				}
+				if override != "" {
+					s.DTLSConf.SDPSetupRole = func(bool) string { return override }
+				}
+				s.dtlsRemoteSetup = remote
+				got := s.localDTLSSetup(true)
+				assert.Contains(t, []string{"active", "passive"}, got,
+					"remote=%q override=%q role=%d", remote, override, role)
+				assert.Equal(t, got == "active", s.dtlsActsAsClient(),
+					"remote=%q override=%q role=%d: the value written and the role played disagree", remote, override, role)
+			}
+		}
+	}
+}
+
 // TestSDPSetupRoleYieldsToThePeersSide pins where SDPSetupRole is not asked: a
 // peer that said active or passive has taken a side, and RFC 4145 section 4.1
 // leaves us the other one. Taking the same side has both endpoints wait for a
@@ -418,6 +446,9 @@ func TestDTLSSetupRoleChoicesCompleteHandshake(t *testing.T) {
 		{name: "defaults", wantOffer: "actpass", wantAnswer: "active"},
 		{name: "answerer_chooses_passive", answer: "passive", wantOffer: "actpass", wantAnswer: "passive"},
 		{name: "answerer_chooses_active", answer: "active", wantOffer: "actpass", wantAnswer: "active"},
+		// RFC 5763 section 5 has the answerer use active or passive, so a
+		// choice of actpass is written as the server's side it plays.
+		{name: "answerer_chooses_actpass", answer: "actpass", wantOffer: "actpass", wantAnswer: "passive"},
 		{name: "offerer_chooses_actpass,_answered_passive", offer: "actpass", answer: "passive", wantOffer: "actpass", wantAnswer: "passive"},
 		{name: "offerer_chooses_active", offer: "active", wantOffer: "active", wantAnswer: "passive"},
 		{name: "offerer_chooses_passive", offer: "passive", wantOffer: "passive", wantAnswer: "active"},

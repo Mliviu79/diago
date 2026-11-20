@@ -139,8 +139,11 @@ func (s *MediaSession) dtlsSetupFor(role DTLSEndpointRole, peer string) string {
 // offer changes it whenever the choice falls the other way: a subsequent
 // offer carries actpass (section 5.5), which leaves the choice to this
 // endpoint again. A session starting a new association has no record of one,
-// and takes its role from the offer. A subsequent offer of ours keeps
-// actpass, which is what section 5.5 asks of the offerer.
+// and takes its role from the offer, written as the side it plays
+// (dtlsSide): RFC 5763 section 5 has the answerer use active or passive, so
+// an actpass that DTLSConfig.SDPSetupRole chose is answered passive, the
+// server's side dtlsActsAsClient gives the session for it. A subsequent offer
+// of ours keeps actpass, which is what section 5.5 asks of the offerer.
 func (s *MediaSession) localDTLSSetup(answered bool) string {
 	if !answered {
 		return s.dtlsSetupFor(s.dtlsEndpointRoleAs(true), "")
@@ -148,7 +151,7 @@ func (s *MediaSession) localDTLSSetup(answered bool) string {
 	if s.dtlsAssoc != nil {
 		return s.dtlsAssoc.setup
 	}
-	return s.dtlsSetupFor(s.dtlsEndpointRoleAs(false), s.dtlsRemoteSetup)
+	return dtlsSide(s.dtlsSetupFor(s.dtlsEndpointRoleAs(false), s.dtlsRemoteSetup))
 }
 
 // dtlsActsAsClient reports whether this endpoint sends the ClientHello against

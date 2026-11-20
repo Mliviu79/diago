@@ -72,8 +72,5 @@ func (m *MediaSessionWebrtc) dtlsSetupAgainst(setup string, offered bool) (strin
 	}
 	// offered says the body answers an offer of ours, which makes us the
 	// offerer of the exchange.
-	if conf.setupFor(offered, setup) == dtlsSetupActive {
-		return dtlsSetupActive, nil
-	}
-	return dtlsSetupPassive, nil
+	return dtlsSide(conf.setupFor(offered, setup)), nil
 }

@@ -34,6 +34,21 @@ func checkAnswerDTLSSetup(setup string) error {
 	return nil
 }
 
+// dtlsSide returns the side of the handshake an endpoint whose a=setup
+// decision is setup takes, as the a=setup value an answer of it carries:
+// active when setup is active, and it sends the ClientHello, passive
+// otherwise, since an endpoint that is not the client waits for the
+// ClientHello as the server (RFC 5763 section 5). An answer must carry one of
+// the two, "The answerer MUST use either a setup attribute value of
+// setup:active or setup:passive" (RFC 5763 section 5), so an actpass that
+// setupFor took from DTLSConfig.SDPSetupRole is written as the side played.
+func dtlsSide(setup string) string {
+	if setup == dtlsSetupActive {
+		return dtlsSetupActive
+	}
+	return dtlsSetupPassive
+}
+
 // setupFor is the one place the DTLS role is decided, for every media type: it
 // returns the a=setup value of this endpoint in an exchange where offerer says
 // whether it made the offer and the peer sent the a=setup value peer, empty

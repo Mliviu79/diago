@@ -60,7 +60,9 @@ type DTLSConfig struct {
 	// and RemoteSDP say. It is asked where the exchange leaves a choice: for
 	// an offer, and for the answer to an offer of actpass. A peer that said
 	// active or passive is given the other value without asking (RFC 4145
-	// section 4.1).
+	// section 4.1). An answer carries active or passive only (RFC 5763
+	// section 5), so a choice other than active is answered passive, the
+	// server's side the session then plays.
 	// Values: active,passive,actpass
 	// Default: an offerer advertises actpass (RFC 5763 section 5), and
 	// actpass is answered active.
