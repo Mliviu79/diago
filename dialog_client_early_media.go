@@ -6,7 +6,61 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/emiago/sipgo/sip"
 )
+
+// noteEarlyAnswerTaken records that the answer in res, a 183 to our INVITE,
+// was applied to the call's media: it is the answer to our offer (RFC 3261
+// section 13.2.1), and no later session description in a response of the
+// same early dialog is.
+func (s *sessionState) noteEarlyAnswerTaken(res *sip.Response) {
+	tag := toTag(res)
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	s.earlyAnswerApplied = true
+	s.earlyAnswerTag = tag
+}
+
+// earlyAnswerTaken reports whether the answer in a 183 to our INVITE was
+// applied to the call's media.
+func (s *sessionState) earlyAnswerTaken() bool {
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	return s.earlyAnswerApplied
+}
+
+// earlyAnswerStands reports whether the answer a 183 gave the call's media
+// stands at final, the 2xx to our INVITE, so that a session description final
+// carries is not applied. The UAC "MUST ignore any session descriptions in
+// subsequent responses to the initial INVITE" (RFC 3261 section 13.2.1), and
+// one that differs from the first is taken as equal to it, the UAC not
+// switching to it (RFC 6337 section 3.1.1): the call keeps the codecs, the
+// remote address and the keys of the 183. A 2xx of another early dialog than
+// that 183, one with another To tag, is applied to the media as before.
+// While the handshake the 183 started was left running, the answer of the
+// 183 stands whatever the 2xx.
+func (s *sessionState) earlyAnswerStands(final *sip.Response) bool {
+	tag := toTag(final)
+	s.answeringMu.Lock()
+	defer s.answeringMu.Unlock()
+	if s.earlyUnkeyed {
+		return true
+	}
+	return s.earlyAnswerApplied && s.earlyAnswerTag == tag
+}
+
+// toTag returns the tag of res's To header, empty when it has none.
+func toTag(res *sip.Response) string {
+	to := res.To()
+	if to == nil {
+		return ""
+	}
+	if tag, ok := to.Params.Get("tag"); ok {
+		return tag
+	}
+	return ""
+}
 
 // keyEarlyAnswer has keyer, the media the answer in a 183 was just applied
 // to, keyed by the callee, and reports whether it is: the call has early

@@ -210,7 +210,8 @@ func (d *DialogWebrtc) onRemoteSDP(ctx context.Context, remoteSDP []byte, offere
 	if offered {
 		if pending == nil {
 			// The answer to the offer the running transport made, as the
-			// 2xx after early media carries it: applied in place.
+			// 2xx of another early dialog than the 183 that set the
+			// transport up carries it: applied in place.
 			if err := d.setPendingMediaSession(current); err != nil {
 				return err
 			}

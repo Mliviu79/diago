@@ -36,8 +36,8 @@ var errNoAnswerIn2xx = errors.New("no SDP in response")
 //
 // With EarlyMediaDetect, WebRTC early media the callee keyed within
 // EarlyMediaKeyTimeout is returned with ErrClientEarlyMedia as InviteWebrtc
-// returns it, and WaitAnswerWebrtcLeaveAck goes on waiting for the answer and
-// applies the session description of the 2xx as WaitAnswerWebrtc does. Early
+// returns it, and WaitAnswerWebrtcLeaveAck goes on waiting for the answer,
+// with the answer of the 183 standing as WaitAnswerWebrtc describes. Early
 // media the callee has not keyed by then is not reported: the answer of the
 // 183 stands (RFC 3261 section 13.2.1), the 2xx is returned with the media
 // not set up, and Ack completes the negotiation of the 183.
@@ -114,8 +114,7 @@ func (d *DialogClientSession) inviteWebrtcLeaveAck(ctx context.Context, med *Dia
 
 // waitAnswerWebrtcLeaveAck waits for the INVITE's final response, leaving it
 // pending when ctx ends first, and applies the answer of a 2xx to med. After
-// early media that answer is applied as WaitAnswerWebrtc applies it, and none
-// is applied after a 183 whose negotiation was left running.
+// the answer of a 183 none is applied, as WaitAnswerWebrtc describes.
 func (d *DialogClientSession) waitAnswerWebrtcLeaveAck(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if err := d.DialogClientSession.WaitAnswerLeavePending(ctx, opts); err != nil {
 		return err

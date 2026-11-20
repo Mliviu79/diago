@@ -520,47 +520,60 @@ func TestDialogClientWebrtcEarlyMediaUnkeyedByCallee(t *testing.T) {
 	}
 }
 
-// TestDialogClientWebrtcEarlyMediaFinalAnswerApplied pins that the session
-// description of the 200 after WebRTC early media is applied to the running
-// media: a 200 whose description asks for another DTLS association, which
-// the transport in place cannot take without an ICE restart, is acknowledged,
-// the call ended with a BYE, and WaitAnswerWebrtc returns why.
-func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
-	_, otherOffer := newWebrtcPeerOffer(t)
-	otherFingerprint := sdpLineWithPrefix(t, otherOffer, "a=fingerprint:")
-	calleeSetUp := make(chan struct{})
+// TestDialogClientWebrtcEarlyMediaFinalAnswerIgnored pins that the session
+// description of the 200 after WebRTC early media is not applied: the UAC
+// "MUST ignore any session descriptions in subsequent responses to the
+// initial INVITE" (RFC 3261 section 13.2.1), and does not switch to one that
+// differs from the first (RFC 6337 section 3.1.1). The callee answers the
+// 183 from one transport and the 200 from another, with its own ICE
+// credentials, candidates and fingerprint and another codec. The call is
+// answered and acknowledged, and keeps the transport, the ICE pair, the keys
+// and the codec of the 183, on which audio flows both ways.
+func TestDialogClientWebrtcEarlyMediaFinalAnswerIgnored(t *testing.T) {
+	calleeSetUp := make(chan *webrtcHandlePeer, 1)
 	calleeEnded := make(chan error, 1)
 	answerNow := make(chan struct{})
-	byeRead := make(chan struct{})
 	d := newWebrtcCallPair(t, func(serveCtx context.Context, callee *DialogServerSession) {
 		ctx := callee.Context()
-		conf, err := prepareWebrtcConfig(loopbackWebrtcConfig())
-		if err != nil {
-			calleeEnded <- err
-			return
-		}
-		sess := &media.MediaSessionWebrtc{Codecs: callee.mediaConf.Codecs}
-		if err := sess.Init(ctx, conf); err != nil {
-			calleeEnded <- err
-			return
-		}
-		defer func() { _ = sess.Close() }()
 		calleeEnded <- func() error {
-			if err := sess.RemoteSDP(ctx, callee.InviteRequest.Body(), false); err != nil {
+			conf, err := prepareWebrtcConfig(loopbackWebrtcConfig())
+			if err != nil {
 				return err
 			}
-			answer, err := sess.LocalSDP(ctx, true)
+			early := &media.MediaSessionWebrtc{Codecs: []media.Codec{media.CodecAudioUlaw}}
+			if err := early.Init(ctx, conf); err != nil {
+				return err
+			}
+			defer func() { _ = early.Close() }()
+			other := &media.MediaSessionWebrtc{Codecs: []media.Codec{media.CodecAudioAlaw}}
+			if err := other.Init(ctx, conf); err != nil {
+				return err
+			}
+			defer func() { _ = other.Close() }()
+
+			offer := callee.InviteRequest.Body()
+			if err := early.RemoteSDP(ctx, offer, false); err != nil {
+				return err
+			}
+			earlyAnswer, err := early.LocalSDP(ctx, true)
+			if err != nil {
+				return err
+			}
+			if err := other.RemoteSDP(ctx, offer, false); err != nil {
+				return err
+			}
+			finalAnswer, err := other.LocalSDP(ctx, true)
 			if err != nil {
 				return err
 			}
 			contentType := sip.NewHeader("Content-Type", "application/sdp")
-			if err := callee.DialogServerSession.Respond(ctx, sip.StatusSessionInProgress, "Session Progress", answer, contentType); err != nil {
+			if err := callee.DialogServerSession.Respond(ctx, sip.StatusSessionInProgress, "Session Progress", earlyAnswer, contentType); err != nil {
 				return err
 			}
-			if err := sess.Finalize(ctx); err != nil {
+			if err := early.Finalize(ctx); err != nil {
 				return err
 			}
-			close(calleeSetUp)
+			calleeSetUp <- &webrtcHandlePeer{sess: early, laddr: early.Laddr}
 			// The handler ends with its run as well as with its dialog: a dialog
 			// whose BYE never arrived would otherwise hold serving past the test.
 			select {
@@ -570,17 +583,13 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 			case <-ctx.Done():
 				return context.Cause(ctx)
 			}
-			final := withFingerprint(answer, otherFingerprint)
-			if err := callee.DialogServerSession.Respond(ctx, sip.StatusOK, "OK", final, contentType); err != nil {
+			if err := callee.DialogServerSession.Respond(ctx, sip.StatusOK, "OK", finalAnswer, contentType); err != nil {
 				return err
 			}
-			// The handler ends with its run as well as with its dialog: a dialog
-			// whose BYE never arrived would otherwise hold serving past the test.
 			select {
 			case <-serveCtx.Done():
 			case <-ctx.Done():
 			}
-			close(byeRead)
 			return nil
 		}()
 	})
@@ -589,8 +598,9 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 	defer cancel()
 	med, err := d.InviteWebrtc(ctx, InviteWebrtcOptions{EarlyMediaDetect: true, WebrtcConfig: loopbackWebrtcConfig()})
 	require.ErrorIs(t, err, ErrClientEarlyMedia)
+	var peer *webrtcHandlePeer
 	select {
-	case <-calleeSetUp:
+	case peer = <-calleeSetUp:
 	case err := <-calleeEnded:
 		t.Fatalf("the callee's early media was not set up: %v", err)
 	case <-time.After(20 * time.Second):
@@ -598,17 +608,22 @@ func TestDialogClientWebrtcEarlyMediaFinalAnswerApplied(t *testing.T) {
 	}
 	sess := med.MediaSession()
 	require.NotNil(t, sess)
+	rtpSess := med.RTPSession()
+	raddr := sess.Raddr
 
 	close(answerNow)
-	err = d.WaitAnswerWebrtc(ctx, med, sipgo.AnswerOptions{})
-	require.ErrorIs(t, err, media.ErrWebRTCICERestartRequired)
-	assert.Equal(t, sip.DialogStateEnded, d.LoadState(), "the call is ended")
-	assert.Same(t, sess, med.MediaSession(), "an answer that cannot be applied leaves the media as it was")
-	select {
-	case <-byeRead:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the callee's call did not end with the BYE")
-	}
+	require.NoError(t, d.WaitAnswerWebrtc(ctx, med, sipgo.AnswerOptions{}))
+	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState(), "the call is answered and acknowledged")
+	require.Same(t, sess, med.MediaSession(), "the 200's description moved the call to another transport")
+	require.Same(t, rtpSess, med.RTPSession())
+	assert.Equal(t, raddr, med.MediaSession().Raddr, "the call left the ICE pair of the 183")
+	med.mu.Lock()
+	assert.Nil(t, med.pendingMediaSession, "the 200's description left a transport pending")
+	med.mu.Unlock()
+	// PCMU is the codec of the 183, PCMA the 200's; the keys are the 183's.
+	requireWebrtcAudioBothWays(t, med, peer)
+
+	require.NoError(t, d.Hangup(t.Context()))
 	select {
 	case err := <-calleeEnded:
 		require.NoError(t, err)

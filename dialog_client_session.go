@@ -363,6 +363,7 @@ func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, med *DialogMe
 		if err := sess.RemoteSDP(remoteSDP, true); err != nil {
 			return err
 		}
+		d.noteEarlyAnswerTaken(res)
 
 		// Early media the callee has not keyed in time is none: the call
 		// goes on to its answer, see keyEarlyAnswer.
@@ -417,10 +418,10 @@ func (d *DialogClientSession) waitAnswerWith(ctx context.Context, med *DialogMed
 func (d *DialogClientSession) applyRemoteSDP(med *DialogMedia, remoteSDP []byte) error {
 	sess := med.mediaSession
 
-	// The answer in the 183 stands (RFC 3261 section 13.2.1), and its
-	// handshake is still running on the session, which the media sets up
-	// once Ack has had it keyed.
-	if d.earlyKeyingLeft() {
+	// The answer in the 183 stands (RFC 3261 section 13.2.1): the media keeps
+	// what it set up, or the handshake still running on the session, which
+	// the media sets up once Ack has had it keyed.
+	if d.earlyAnswerStands(d.InviteResponse) {
 		return nil
 	}
 

@@ -190,10 +190,13 @@ func (d *DialogClientSession) registerWebrtcDialogCallbacks(med *DialogWebrtc, o
 // ErrClientEarlyMedia. The early WebRTC transport remains active while this
 // method waits for the final response; on success it sends the ACK.
 //
-// The session description of the 2xx is applied to med in place, as the 2xx
-// after early media of DialogMedia is: a 2xx whose description cannot be
-// applied is acknowledged and the call ended with a BYE, and the error
-// returned. A 2xx without one leaves the media as the 183 set it up.
+// The answer of the 183 stands (RFC 3261 section 13.2.1): a session
+// description in the 2xx is not applied, whether or not it differs from the
+// 183's (RFC 6337 section 3.1.1), and med keeps the transport, the keys and
+// the codecs the 183 set up. Only the 2xx of another early dialog, one with
+// another To tag than the 183, has its description applied to med in place;
+// one that cannot be applied is acknowledged and the call ended with a BYE,
+// and the error returned.
 func (d *DialogClientSession) WaitAnswerWebrtc(ctx context.Context, med *DialogWebrtc, opts sipgo.AnswerOptions) error {
 	if med == nil || med.MediaSession() == nil {
 		return fmt.Errorf("dialog WebRTC media is not initialized")

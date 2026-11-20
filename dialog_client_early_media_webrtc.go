@@ -23,12 +23,13 @@ import (
 // description is the answer (RFC 3261 section 13.2.1).
 func (d *DialogClientSession) takeEarlyWebrtcAnswer(ctx context.Context, med *DialogWebrtc, res *sip.Response, wait time.Duration) error {
 	answer := earlySessionDescription(res)
-	if answer == nil || med.MediaSession() != nil || d.earlyKeyingLeft() {
+	if answer == nil || d.earlyAnswerTaken() {
 		return nil
 	}
 	if err := med.onRemoteSDP(ctx, answer, true); err != nil {
 		return err
 	}
+	d.noteEarlyAnswerTaken(res)
 	keyed, err := d.keyEarlyAnswer(ctx, med, wait)
 	if !keyed {
 		return err
@@ -49,15 +50,16 @@ func earlySessionDescription(res *sip.Response) []byte {
 	return res.Body()
 }
 
-// applyEarlyWebrtcFinalAnswer applies the session description of the 2xx to
-// an INVITE whose 183 set med up to med, in place, as the 2xx after early
-// media of DialogMedia is applied: the answer of the 183 stood for the call
-// so far, and the 2xx describes the session it continues. A 2xx without a
-// session description leaves the media as the 183 set it up. When the
-// negotiation of the 183 was left running, the answer of the 183 stands
-// (RFC 3261 section 13.2.1) and nothing is applied: the ACK completes it.
+// applyEarlyWebrtcFinalAnswer is what the 2xx to an INVITE whose 183 set med
+// up does to med: nothing. The answer of the 183 stands (RFC 3261 section
+// 13.2.1), and a session description in the 2xx, the same or another, is not
+// applied (RFC 6337 section 3.1.1): the call keeps the transport, the ICE
+// pair, the DTLS association and the codecs of the 183, and a negotiation of
+// the 183 left running is completed by the ACK. Only a 2xx of another early
+// dialog than that 183, one with another To tag, has its session description
+// applied to med, in place.
 func (d *DialogClientSession) applyEarlyWebrtcFinalAnswer(ctx context.Context, med *DialogWebrtc) error {
-	if d.earlyKeyingLeft() {
+	if d.earlyAnswerStands(d.InviteResponse) {
 		return nil
 	}
 	answer := d.InviteResponse.Body()

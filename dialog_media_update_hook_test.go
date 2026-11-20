@@ -85,7 +85,9 @@ func TestDialogMediaUpdateHooks(t *testing.T) {
 			}
 			return err
 		}},
-		{name: "AnswerAfterEarlyMedia", replaced: true, update: func(d *DialogClientSession, med *DialogMedia) error {
+		{name: "AnswerOfAnotherEarlyDialog", replaced: true, update: func(d *DialogClientSession, med *DialogMedia) error {
+			// A 2xx of another early dialog than the 183 that set the media up
+			// has its answer applied to the running media.
 			return d.applyRemoteSDP(med, peerSDP())
 		}},
 		{name: "RefusedReInvite", replaced: false, update: func(d *DialogClientSession, _ *DialogMedia) error {

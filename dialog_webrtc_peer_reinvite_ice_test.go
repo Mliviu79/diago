@@ -104,10 +104,11 @@ func TestDialogWebrtcPeerReInviteSameCredentials(t *testing.T) {
 }
 
 // TestDialogWebrtcAnswerRestartingICESurfaced is an answer to an offer the
-// transport in place made, as the 200 after early media carries it, whose
-// ICE credentials are new. The offer asked for no ICE restart, so no
-// transport of ours can meet the answer: the restart error comes back, the
-// call keeps its transport and media flows on it.
+// transport in place made, as the 2xx of another early dialog than the 183
+// that set the transport up carries it, whose ICE credentials are new. The
+// offer asked for no ICE restart, so no transport of ours can meet the
+// answer: the restart error comes back, the call keeps its transport and
+// media flows on it.
 func TestDialogWebrtcAnswerRestartingICESurfaced(t *testing.T) {
 	ctx := t.Context()
 	d, p, offer, _ := newWebrtcICECall(t, true)
