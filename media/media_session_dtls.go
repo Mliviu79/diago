@@ -29,7 +29,9 @@ var DTLSHandshakeTimeout = 30 * time.Second
 // stream's own section, or those of the session level when it has none (RFC
 // 8122 section 5, see mediaDTLSFingerprints). An a=setup value other than
 // active, passive and actpass is refused: RFC 8842 section 5.1 leaves a DTLS
-// association no other. A session with neither a DTLS certificate nor
+// association no other. An answer to an offer of ours that carries actpass is
+// refused with an error that wraps ErrNoCommonCrypto, see
+// checkAnswerDTLSSetup. A session with neither a DTLS certificate nor
 // SecureRTP set to DTLS does nothing.
 func (s *MediaSession) negotiateDTLS(attrs streamAttributes) error {
 	if !s.dtlsSRTP() {
@@ -75,6 +77,11 @@ func (s *MediaSession) negotiateDTLS(attrs streamAttributes) error {
 	}
 	if !knownDTLSSetup(setup) {
 		return fmt.Errorf("unknown setup value %q", setup)
+	}
+	if s.remoteSDPIsAnswer {
+		if err := checkAnswerDTLSSetup(setup); err != nil {
+			return err
+		}
 	}
 	// The peer's value is recorded and not acted on directly. Our own role
 	// governs the handshake, and dtlsSetupFor derives it from this value for

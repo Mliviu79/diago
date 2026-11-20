@@ -496,7 +496,9 @@ func (m *MediaSessionWebrtc) localSDPLocked(codecs []Codec, setup string, includ
 // A description this session cannot meet is refused with an error that wraps
 // ErrNoCommonMedia, when it has no audio stream or carries it over a transport
 // outside the RTP profile family, or ErrNoCommonCodec, when none of its audio
-// formats is one of ours. An a=candidate line the ICE stack cannot read is
+// formats is one of ours. An answer whose a=setup is actpass, which leaves
+// the DTLS handshake without a side for either endpoint, is refused with an
+// error that wraps ErrNoCommonCrypto. An a=candidate line the ICE stack cannot read is
 // left out and the candidates of the other lines are used; a description left
 // with no candidate is refused with an *ICEError that matches
 // ErrICEConnection. The candidates are those of the audio section, or, when

@@ -2,7 +2,10 @@
 
 package media
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // knownDTLSSetup reports whether setup is an a=setup value a DTLS association
 // can be negotiated with: active, passive or actpass, in any case. RFC 4145
@@ -14,6 +17,21 @@ func knownDTLSSetup(setup string) bool {
 		return true
 	}
 	return false
+}
+
+// checkAnswerDTLSSetup refuses setup, the a=setup value of a body that answers
+// an offer of ours, when it is actpass. RFC 5763 section 5: "The answerer MUST
+// use either a setup attribute value of setup:active or setup:passive", and
+// the answers RFC 4145 section 4.1 lists for an offer carry no actpass either;
+// RFC 8842 section 5.3 has the answerer follow those procedures. An answer of
+// actpass leaves the handshake without a client, or with two, so the keying
+// it describes cannot be negotiated and the description is refused with an
+// error that wraps ErrNoCommonCrypto.
+func checkAnswerDTLSSetup(setup string) error {
+	if strings.EqualFold(strings.TrimSpace(setup), dtlsSetupActPass) {
+		return fmt.Errorf("%w: answer carries a=setup:actpass where it must take active or passive", ErrNoCommonCrypto)
+	}
+	return nil
 }
 
 // setupFor is the one place the DTLS role is decided, for every media type: it

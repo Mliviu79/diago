@@ -483,3 +483,30 @@ func TestDTLSRemoteSDPRefusesUnknownSetup(t *testing.T) {
 		})
 	}
 }
+
+// TestDTLSRemoteSDPRefusesActpassAnswer pins that the answer to an offer of
+// ours carrying a=setup:actpass is refused with ErrNoCommonCrypto before the
+// session records it. RFC 5763 section 5 has the answerer "use either a setup
+// attribute value of setup:active or setup:passive", and RFC 8842 section 5.3
+// has it follow RFC 4145, whose answers to an offer carry no actpass. The
+// answer with the side the answerer took is accepted, so the a=setup value is
+// what it is refused for.
+func TestDTLSRemoteSDPRefusesActpassAnswer(t *testing.T) {
+	offerer := newDTLSRoleSession(t, testdata.ClientCertificate())
+	answerer := newDTLSRoleSession(t, testdata.ServerCertificate())
+
+	offer := offerer.LocalSDP(false)
+	require.NoError(t, answerer.RemoteSDP(offer, false))
+	answer := answerer.LocalSDP(true)
+	require.Equal(t, "a=setup:active", sdpSetupLine(t, answer))
+
+	for _, setup := range []string{"actpass", "ActPass"} {
+		body := strings.Replace(string(answer), "a=setup:active", "a=setup:"+setup, 1)
+		err := offerer.RemoteSDP([]byte(body), true)
+		require.ErrorIs(t, err, ErrNoCommonCrypto, "a=setup:%s", setup)
+		assert.Empty(t, offerer.dtlsRemoteSetup, "a refused value was kept")
+	}
+
+	require.NoError(t, offerer.RemoteSDP(answer, true))
+	requireDTLSHandshake(t, offerer, answerer)
+}

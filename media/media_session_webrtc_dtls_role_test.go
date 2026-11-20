@@ -189,6 +189,12 @@ func TestDTLSWebrtcSetupTakesOneSide(t *testing.T) {
 			for _, offered := range []bool{false, true} {
 				m := &MediaSessionWebrtc{Config: webrtcSetupRoleConfig(override)}
 				got, err := m.dtlsSetupAgainst(remote, offered)
+				if offered && remote == "actpass" {
+					// An answer takes a side or is refused, see
+					// TestWebrtcRemoteSDPRefusesActpassAnswer.
+					require.ErrorIs(t, err, ErrNoCommonCrypto)
+					continue
+				}
 				require.NoError(t, err)
 				assert.Contains(t, []string{"active", "passive"}, got,
 					"remote=%q offered=%t override=%q", remote, offered, override)
@@ -251,7 +257,8 @@ func TestDTLSWebrtcSetupRoleYieldsToThePeersSide(t *testing.T) {
 
 // TestDTLSWebrtcSetupRoleIsToldWhetherWeOffer pins what the SDPSetupRole
 // override is passed: whether this endpoint is the offerer of the exchange,
-// which the arguments of LocalSDP and RemoteSDP state.
+// which the arguments of LocalSDP and RemoteSDP state. The answer to an offer
+// of ours leaves no choice to ask it about: it takes a side or is refused.
 func TestDTLSWebrtcSetupRoleIsToldWhetherWeOffer(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -263,10 +270,6 @@ func TestDTLSWebrtcSetupRoleIsToldWhetherWeOffer(t *testing.T) {
 		}},
 		{name: "reading_an_offer", want: false, consult: func(t *testing.T, m *MediaSessionWebrtc) {
 			_, err := m.dtlsSetupAgainst("actpass", false)
-			require.NoError(t, err)
-		}},
-		{name: "reading_the_answer_to_our_offer", want: true, consult: func(t *testing.T, m *MediaSessionWebrtc) {
-			_, err := m.dtlsSetupAgainst("actpass", true)
 			require.NoError(t, err)
 		}},
 	}
@@ -349,54 +352,52 @@ func TestDTLSWebrtcSetupRoleChoicesCompleteHandshake(t *testing.T) {
 	}
 }
 
-// TestDTLSWebrtcAnswerOfActpassIsGivenASide pins what an offerer does with an
+// TestDTLSWebrtcAnswerOfActpassIsRefused pins what an offerer does with an
 // answer that repeats actpass instead of taking a side, which RFC 5763 section
-// 5 does not let an answerer do: the choice is still ours, so the session
-// takes active, or what SDPSetupRole chooses, and the exchange is not refused
-// for it.
-func TestDTLSWebrtcAnswerOfActpassIsGivenASide(t *testing.T) {
-	for _, tc := range []struct {
-		override string
-		want     string
-	}{
-		{override: "", want: "active"},
-		{override: "active", want: "active"},
-		{override: "passive", want: "passive"},
-		// What an offerer's SDPSetupRole usually returns: it leaves the
-		// session the server.
-		{override: "actpass", want: "passive"},
-	} {
-		t.Run("override_"+tc.override, func(t *testing.T) {
+// 5 does not let an answerer do: whatever SDPSetupRole would choose, the
+// answer is refused with ErrNoCommonCrypto, SDPSetupRole is not asked and the
+// session takes no side and builds no DTLS conn.
+func TestDTLSWebrtcAnswerOfActpassIsRefused(t *testing.T) {
+	for _, override := range []string{"", "active", "passive", "actpass"} {
+		t.Run("override_"+override, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
 
+			asked := false
 			var role func(bool) string
-			if tc.override != "" {
-				role = func(bool) string { return tc.override }
+			if override != "" {
+				role = func(bool) string {
+					asked = true
+					return override
+				}
 			}
 			offerer := newSetupRoleWebrtcSession(ctx, t, testdata.ClientCertificate(), role)
 			answerer := newSetupRoleWebrtcSession(ctx, t, testdata.ServerCertificate(), nil)
 
 			offer, err := offerer.LocalSDP(ctx, false)
 			require.NoError(t, err)
+			asked = false
 			require.NoError(t, answerer.RemoteSDP(ctx, withSetupLine(t, offer, "actpass"), false))
 			answer, err := answerer.LocalSDP(ctx, true)
 			require.NoError(t, err)
 
-			require.NoError(t, offerer.RemoteSDP(ctx, withSetupLine(t, answer, "actpass"), true))
+			err = offerer.RemoteSDP(ctx, withSetupLine(t, answer, "actpass"), true)
+			require.ErrorIs(t, err, ErrNoCommonCrypto)
+			assert.False(t, asked, "SDPSetupRole was asked for an answer")
 			offerer.mu.Lock()
-			got := offerer.localSetup
-			offerer.mu.Unlock()
-			assert.Equal(t, tc.want, got)
+			defer offerer.mu.Unlock()
+			assert.Empty(t, offerer.localSetup, "a refused answer gave the session a side")
+			assert.Nil(t, offerer.dtlsConn, "a refused answer built a DTLS conn")
 		})
 	}
 }
 
 // TestDTLSWebrtcRemoteSDPRefusesUnknownSetup pins the a=setup values RemoteSDP
 // takes, in an offer and in an answer: active, passive and actpass in any
-// case, and nothing else. RFC 8842 section 5.3 has an answerer "able to
-// receive initial and subsequent offers with other attribute values" than
-// actpass, and section 5.1 forbids holdconn for a DTLS association.
+// case, and nothing else, actpass in an offer only. RFC 8842 section 5.3 has
+// an answerer "able to receive initial and subsequent offers with other
+// attribute values" than actpass, and section 5.1 forbids holdconn for a DTLS
+// association. RFC 5763 section 5 has an answer carry active or passive.
 func TestDTLSWebrtcRemoteSDPRefusesUnknownSetup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -421,6 +422,10 @@ func TestDTLSWebrtcRemoteSDPRefusesUnknownSetup(t *testing.T) {
 			t.Run(tc.setup+"_in_"+kind, func(t *testing.T) {
 				m := newSetupRoleWebrtcSession(ctx, t, testdata.ServerCertificate(), nil)
 				err := m.RemoteSDP(ctx, withSetupLine(t, body, tc.setup), offered)
+				if offered && strings.EqualFold(tc.setup, "actpass") {
+					require.ErrorIs(t, err, ErrNoCommonCrypto)
+					return
+				}
 				if tc.wantErr {
 					require.ErrorContains(t, err, `invalid DTLS setup role "`+tc.setup+`" in `+kind)
 					m.mu.Lock()
@@ -439,9 +444,10 @@ func TestDTLSWebrtcRemoteSDPRefusesUnknownSetup(t *testing.T) {
 // description of the ICE generation it already negotiated, which continues
 // the DTLS association: RFC 8842 section 5.3 has the answer to such an offer
 // carry a value "that does not change the previously negotiated DTLS roles".
-// A peer that says actpass again leaves the side as it is, without
-// SDPSetupRole being asked for another one; a peer that states the side it
-// has is taken at its word; a peer that takes the other side asks for an
+// A peer that offers actpass again leaves the side as it is, without
+// SDPSetupRole being asked for another one, and an answer of actpass is
+// refused and leaves it as it is too; a peer that states the side it has is
+// taken at its word; a peer that takes the other side asks for an
 // association this session builds only with a new ICE generation.
 func TestDTLSWebrtcSubsequentSDPKeepsTheRole(t *testing.T) {
 	// first is the a=setup value of the peer's first description, which
@@ -482,20 +488,17 @@ func TestDTLSWebrtcSubsequentSDPKeepsTheRole(t *testing.T) {
 			}
 			choice = other
 
-			// The peer leaves the choice open again, in an offer and in an
-			// answer to an offer of ours.
-			for _, offered := range []bool{false, true} {
-				require.NoError(t, m.RemoteSDP(ctx, withSetupLine(t, peer, "actpass"), offered), "offered=%t", offered)
-				if !offered {
-					answer, err := m.LocalSDP(ctx, true)
-					require.NoError(t, err)
-					assert.Equal(t, "a=setup:"+tc.want, sdpSetupLine(t, answer))
-				}
-			}
+			// The peer leaves the choice open again in an offer, and in an
+			// answer to an offer of ours, which may not.
+			require.NoError(t, m.RemoteSDP(ctx, withSetupLine(t, peer, "actpass"), false))
+			answer, err := m.LocalSDP(ctx, true)
+			require.NoError(t, err)
+			assert.Equal(t, "a=setup:"+tc.want, sdpSetupLine(t, answer))
+			require.ErrorIs(t, m.RemoteSDP(ctx, withSetupLine(t, peer, "actpass"), true), ErrNoCommonCrypto)
 			// The peer states the side it has.
 			require.NoError(t, m.RemoteSDP(ctx, withSetupLine(t, peer, other), false))
 			// The peer takes ours.
-			err := m.RemoteSDP(ctx, withSetupLine(t, peer, tc.want), false)
+			err = m.RemoteSDP(ctx, withSetupLine(t, peer, tc.want), false)
 			require.ErrorContains(t, err, "remote DTLS role changed without an ICE restart")
 
 			m.mu.Lock()
@@ -503,4 +506,61 @@ func TestDTLSWebrtcSubsequentSDPKeepsTheRole(t *testing.T) {
 			assert.Equal(t, tc.want, m.localSetup)
 		})
 	}
+}
+
+// TestWebrtcRemoteSDPRefusesActpassAnswer pins that an answer to an offer of
+// ours carrying a=setup:actpass is refused as a negotiation failure of the
+// keying, ErrNoCommonCrypto. RFC 5763 section 5 has the answerer "use either a
+// setup attribute value of setup:active or setup:passive", and RFC 8842
+// section 5.3 has it follow RFC 4145, whose answers to an offer carry no
+// actpass. Taking a side for the peer would have us guess which one it plays.
+// The same body is an offer we accept, and the answer with a side is
+// accepted, so the a=setup value is what the answer is refused for, on the
+// first exchange and on one that continues a negotiated association.
+func TestWebrtcRemoteSDPRefusesActpassAnswer(t *testing.T) {
+	ctx := t.Context()
+	body := webrtcOffer(ctx, t, testdata.ClientCertificate())
+	require.Equal(t, "a=setup:actpass", sdpSetupLine(t, []byte(body)))
+
+	t.Run("accepted_as_an_offer", func(t *testing.T) {
+		m := newCodecsWebrtcSession(ctx, t, testdata.ServerCertificate(), CodecAudioUlaw)
+		require.NoError(t, m.RemoteSDP(ctx, []byte(body), false))
+	})
+
+	t.Run("refused_as_an_answer", func(t *testing.T) {
+		asked := false
+		m := newSetupRoleWebrtcSession(ctx, t, testdata.ServerCertificate(), func(bool) string {
+			asked = true
+			return "active"
+		})
+		_, err := m.LocalSDP(ctx, false)
+		require.NoError(t, err)
+		asked = false
+
+		err = m.RemoteSDP(ctx, []byte(body), true)
+
+		require.ErrorIs(t, err, ErrNoCommonCrypto)
+		assert.NotErrorIs(t, err, ErrNoCommonMedia)
+		assert.NotErrorIs(t, err, ErrNoCommonCodec)
+		assert.Empty(t, m.localSetup, "a refused answer gave the session a side")
+		answer := strings.Replace(body, "a=setup:actpass", "a=setup:active", 1)
+		require.NoError(t, m.RemoteSDP(ctx, []byte(answer), true))
+		assert.Equal(t, dtlsSetupPassive, m.localSetup)
+		assert.False(t, asked, "SDPSetupRole was asked although the answer took a side")
+	})
+
+	t.Run("refused_in_a_subsequent_answer", func(t *testing.T) {
+		m := newCodecsWebrtcSession(ctx, t, testdata.ServerCertificate(), CodecAudioUlaw)
+		_, err := m.LocalSDP(ctx, false)
+		require.NoError(t, err)
+		answer := strings.Replace(body, "a=setup:actpass", "a=setup:active", 1)
+		require.NoError(t, m.RemoteSDP(ctx, []byte(answer), true))
+
+		_, err = m.LocalSDP(ctx, false)
+		require.NoError(t, err)
+		err = m.RemoteSDP(ctx, []byte(body), true)
+
+		require.ErrorIs(t, err, ErrNoCommonCrypto)
+		assert.Equal(t, dtlsSetupPassive, m.localSetup, "a refused answer changed the negotiated side")
+	})
 }

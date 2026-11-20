@@ -24,9 +24,11 @@ var (
 
 	// ErrNoCommonCrypto means the media is negotiable but the keying is not.
 	// The peer asked for secure RTP and no SRTP context could be built from what
-	// it offered. Kept apart from ErrNoCommonCodec because a codec mismatch is a
-	// capability gap while this is a security policy gap. Only
-	// [MediaSession.RemoteSDP] returns it.
+	// it offered, or it answered an offer of DTLS-SRTP with a=setup:actpass,
+	// which takes no side of the handshake. Kept apart from ErrNoCommonCodec
+	// because a codec mismatch is a capability gap while this is a security
+	// policy gap. [MediaSessionWebrtc.RemoteSDP] returns it for the answer of
+	// actpass only.
 	ErrNoCommonCrypto = errors.New("no common crypto")
 
 	// ErrNoCommonMedia means the m= line itself is unusable before codecs are

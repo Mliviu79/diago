@@ -33,15 +33,17 @@ func (m *MediaSessionWebrtc) localDTLSSetup(answered bool) string {
 // active: RFC 4145 section 4.1 leaves the answerer of either nothing else, and
 // RFC 8842 section 5.3 has an answerer "able to receive initial and subsequent
 // offers with other attribute values" than the actpass an offerer is required
-// to send. An offer of actpass leaves the choice to us, and so does an answer
-// that repeats actpass instead of taking a side; DTLSConfig.SDPSetupRole makes
-// that choice when it is set, and active is taken otherwise. Whatever the
-// choice returns, the session ends on one side: anything but active makes it
-// the server, and the value it then writes in an answer is passive, the role
-// it plays, since RFC 5763 section 5 has an answerer use active or passive.
+// to send. An offer of actpass leaves the choice to us; DTLSConfig.SDPSetupRole
+// makes that choice when it is set, and active is taken otherwise. An answer
+// leaves no choice: one that repeats actpass instead of taking a side is
+// refused with an error that wraps ErrNoCommonCrypto (checkAnswerDTLSSetup).
+// Whatever the choice returns, the session ends on one side: anything but
+// active makes it the server, and the value it then writes in an answer is
+// passive, the role it plays, since RFC 5763 section 5 has an answerer use
+// active or passive.
 //
 // A session whose DTLS association is negotiated already has its side, and a
-// peer that says actpass again does not open the choice again: the body
+// peer that offers actpass again does not open the choice again: the body
 // continues the association, and RFC 8842 section 5.3 has the answer to such
 // an offer carry a value "that does not change the previously negotiated DTLS
 // roles".
@@ -54,6 +56,11 @@ func (m *MediaSessionWebrtc) dtlsSetupAgainst(setup string, offered bool) (strin
 			return "", fmt.Errorf("invalid DTLS setup role %q in answer", setup)
 		}
 		return "", fmt.Errorf("invalid DTLS setup role %q in offer", setup)
+	}
+	if offered {
+		if err := checkAnswerDTLSSetup(setup); err != nil {
+			return "", err
+		}
 	}
 
 	m.mu.Lock()
