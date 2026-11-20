@@ -239,21 +239,8 @@ func (d *dialogCallbacks) referNotifyCallback() func(statusCode int) {
 func dialogReferSend(ctx context.Context, d DialogSession, recipient, referTo, referredBy sip.Uri, headers []sip.Header) (*sip.Request, *sip.Response, error) {
 	req := sip.NewRequest(sip.REFER, recipient)
 	// Invite request tags must be preserved but switched
-	req.AppendHeader(sip.NewHeader("Refer-To", uri2Header(referTo)))
-	req.AppendHeader(sip.NewHeader("Referred-By", uri2Header(referredBy)))
-	for _, h := range headers {
-		if h == nil {
-			return nil, nil, fmt.Errorf("refer header is nil")
-		}
-
-		switch h.Name() {
-		// Avoid duplicates
-		case "Refer-To", "refer-to", "Referred-By", "reffered-by":
-			req.ReplaceHeader(h)
-			continue
-		default:
-			req.AppendHeader(h)
-		}
+	if err := appendReferHeaders(req, referTo, referredBy, headers); err != nil {
+		return nil, nil, err
 	}
 
 	res, err := d.Do(ctx, req)

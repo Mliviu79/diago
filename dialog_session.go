@@ -35,21 +35,8 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 
 	req := sip.NewRequest(sip.REFER, recipient)
 	// Invite request tags must be preserved but switched
-	req.AppendHeader(sip.NewHeader("Refer-To", uri2Header(referTo)))
-	req.AppendHeader(sip.NewHeader("Referred-By", uri2Header(refferedBy)))
-	for _, h := range headers {
-		if h == nil {
-			return fmt.Errorf("refer header is nil")
-		}
-
-		switch h.Name() {
-		// Avoid duplicates
-		case "Refer-To", "refer-to", "Referred-By", "reffered-by":
-			req.ReplaceHeader(h)
-			continue
-		default:
-			req.AppendHeader(h)
-		}
+	if err := appendReferHeaders(req, referTo, refferedBy, headers); err != nil {
+		return err
 	}
 
 	res, err := dialogReferDo(ctx, d, req)
