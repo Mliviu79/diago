@@ -38,8 +38,12 @@ func (r *referHeaderRecorder) respond(req *sip.Request) *sip.Response {
 	return sip.NewResponseFromRequest(req, sip.StatusForbidden, "Forbidden", nil)
 }
 
-// lastValues returns the values of every header named name, compared
-// case-insensitively, that the last REFER recorded carried.
+// compactNames maps a header name to its compact form, so lastValues counts
+// a Refer-To sent as "r" and a Referred-By sent as "b".
+var compactNames = map[string]string{"Refer-To": "r", "Referred-By": "b"}
+
+// lastValues returns the values of every header named name or its compact
+// form, compared case-insensitively, that the last REFER recorded carried.
 func (r *referHeaderRecorder) lastValues(t *testing.T, name string) []string {
 	t.Helper()
 	r.mu.Lock()
@@ -47,7 +51,7 @@ func (r *referHeaderRecorder) lastValues(t *testing.T, name string) []string {
 	require.NotEmpty(t, r.headers, "no REFER was sent")
 	var values []string
 	for _, h := range r.headers[len(r.headers)-1] {
-		if strings.EqualFold(h.name, name) {
+		if strings.EqualFold(h.name, name) || strings.EqualFold(h.name, compactNames[name]) {
 			values = append(values, h.value)
 		}
 	}
@@ -57,7 +61,8 @@ func (r *referHeaderRecorder) lastValues(t *testing.T, name string) []string {
 // TestReferHeadersReplaceOursWhateverTheirCase checks, for each session type
 // and each Refer form that takes headers, that a Refer-To or Referred-By the
 // caller passes replaces ours whatever the case of its name (RFC 3261 section
-// 7.3.1), so the REFER carries exactly one of each, and that every other
+// 7.3.1) and also in its compact form "r" or "b" (RFC 3261 section 7.3.3), so
+// the REFER carries exactly one of each, and that every other
 // header the caller passes reaches the wire, a misspelt "reffered-by" among
 // them.
 func TestReferHeadersReplaceOursWhateverTheirCase(t *testing.T) {
@@ -73,6 +78,8 @@ func TestReferHeadersReplaceOursWhateverTheirCase(t *testing.T) {
 		{name: "canonical", referTo: "Refer-To", referredBy: "Referred-By"},
 		{name: "lowercase", referTo: "refer-to", referredBy: "referred-by"},
 		{name: "uppercase", referTo: "REFER-TO", referredBy: "REFERRED-BY"},
+		{name: "compact", referTo: "r", referredBy: "b"},
+		{name: "compact_uppercase", referTo: "R", referredBy: "B"},
 	}
 
 	check := func(t *testing.T, rec *referHeaderRecorder, forms []referForm) {

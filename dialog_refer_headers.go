@@ -14,8 +14,11 @@ import (
 //
 // Header field names are case-insensitive (RFC 3261 section 7.3.1), so a
 // caller's "referred-by" or "REFER-TO" replaces ours just as the canonical
-// spelling does. Only the canonical names are matched: "reffered-by" names
-// no header and is appended like any other.
+// spelling does. A compact form is equivalent to the full name (RFC 3261
+// section 7.3.3): "r" is Refer-To (RFC 3515 section 2.1) and "b" is
+// Referred-By (RFC 3892 section 3), so either replaces ours too. Only these
+// names are matched: "reffered-by" names no header and is appended like any
+// other.
 //
 // A nil header among headers fails the REFER before anything is added.
 func appendReferHeaders(req *sip.Request, referTo, referredBy sip.Uri, headers []sip.Header) error {
@@ -24,10 +27,10 @@ func appendReferHeaders(req *sip.Request, referTo, referredBy sip.Uri, headers [
 			return errors.New("refer header is nil")
 		}
 	}
-	if !namesHeader(headers, "Refer-To") {
+	if !namesHeader(headers, "Refer-To", "r") {
 		req.AppendHeader(sip.NewHeader("Refer-To", uri2Header(referTo)))
 	}
-	if !namesHeader(headers, "Referred-By") {
+	if !namesHeader(headers, "Referred-By", "b") {
 		req.AppendHeader(sip.NewHeader("Referred-By", uri2Header(referredBy)))
 	}
 	for _, h := range headers {
@@ -36,11 +39,11 @@ func appendReferHeaders(req *sip.Request, referTo, referredBy sip.Uri, headers [
 	return nil
 }
 
-// namesHeader reports whether a header among headers is named name, compared
-// case-insensitively.
-func namesHeader(headers []sip.Header, name string) bool {
+// namesHeader reports whether a header among headers is named name or its
+// compact form compact, each compared case-insensitively.
+func namesHeader(headers []sip.Header, name, compact string) bool {
 	for _, h := range headers {
-		if strings.EqualFold(h.Name(), name) {
+		if strings.EqualFold(h.Name(), name) || strings.EqualFold(h.Name(), compact) {
 			return true
 		}
 	}
