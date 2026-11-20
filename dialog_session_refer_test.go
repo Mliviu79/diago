@@ -1417,13 +1417,18 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 				BindPort:  15090,
 			},
 		))
-		require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			if d.ToUser() == "busy" {
 				d.Respond(t.Context(), sip.StatusBusyHere, "Busy Here", nil)
 				return
 			}
 			d.Answer(AnswerOptions{})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		}))
 	}
 
@@ -1441,9 +1446,14 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 					ID:        "udp",
 				},
 			))
-			require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+			require.NoError(t, serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 				d.Answer(AnswerOptions{OnRefer: transferee.onRefer})
-				<-d.Context().Done()
+				// The handler ends with its run as well as with its dialog: a dialog
+				// whose BYE never arrived would otherwise hold serving past the test.
+				select {
+				case <-serveCtx.Done():
+				case <-d.Context().Done():
+				}
 			}))
 		}
 
@@ -1505,13 +1515,18 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 			},
 		))
 		received := make(chan *DialogServerSession)
-		require.NoError(t, serveBackground(t, referrer, ctx, func(_ context.Context, d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, referrer, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			select {
 			case received <- d:
 			case <-ctx.Done():
 				return
 			}
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 		}))
 		t.Cleanup(func() { transferee.awaitHandlers(t) })
 
