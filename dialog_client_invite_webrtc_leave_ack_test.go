@@ -85,7 +85,12 @@ func TestDialogClientInviteWebrtcLeaveAck(t *testing.T) {
 		if err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	inviteCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -130,7 +135,12 @@ func TestDialogClientInviteWebrtcLeaveAckPending(t *testing.T) {
 		if err := callee.Ringing(ctx); err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	errGaveUp := errors.New("the caller gave up")
@@ -207,7 +217,12 @@ func TestDialogClientInviteWebrtcLeaveAckNoAnswer(t *testing.T) {
 		if err := callee.DialogServerSession.Respond(ctx, sip.StatusOK, "OK", nil); err != nil {
 			return
 		}
-		<-callee.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-callee.Context().Done():
+		}
 	})
 
 	inviteCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
