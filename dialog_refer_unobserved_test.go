@@ -136,13 +136,52 @@ func TestDialogReferWithoutObserver(t *testing.T) {
 
 // TestDialogReferNotifyCallbackBesideAttempts pins how a refer NOTIFY is routed
 // on a dialog that has both the OnNotify callback of ReferOptions and REFER
-// attempts: the callback takes every NOTIFY, whichever REFER it is for, an
-// attempt records the NOTIFYs it holds as it does without the callback, and
-// nothing ends the dialog.
+// attempts: the callback takes every NOTIFY, whichever REFER it is for, but one
+// for a subscription an earlier NOTIFY ended, which is answered 481 and
+// reported as unmatched (RFC 6665 section 4.1.3), an attempt records the
+// NOTIFYs it holds as it does without the callback, and nothing ends the
+// dialog.
 func TestDialogReferNotifyCallbackBesideAttempts(t *testing.T) {
 	const terminated = "terminated;reason=noresource"
 
-	t.Run("a REFER sent with the callback holds no attempt", func(t *testing.T) {
+	t.Run("NotifyAfterTheFinalOfACallbackReferIs481", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			event string
+			last  string
+			state string
+			want  []int
+		}{
+			{name: "WithoutEventID", event: "refer", last: "SIP/2.0 486 Busy Here", state: terminated, want: []int{100, 486}},
+			{name: "WithTheRefersEventID", event: "refer;id=1", last: "SIP/2.0 486 Busy Here", state: terminated, want: []int{100, 486}},
+			{name: "AfterA1xxTerminatingTheSubscription", event: "refer;id=1", last: "SIP/2.0 100 Trying", state: terminated, want: []int{100, 100}},
+			{name: "AfterAFinalStatusInAnActiveSubscription", event: "refer;id=1", last: "SIP/2.0 200 OK", state: "active;expires=60", want: []int{100, 200}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				d := newReferObserveDialog(t, 202, "Accepted")
+				var got []int
+				d.onReferNotify = func(statusCode int) { got = append(got, statusCode) }
+				var reports []ReferNotify
+				d.OnReferNotifyUnmatched(func(n ReferNotify) { reports = append(reports, n) })
+
+				require.NoError(t, referWithoutObserver(t.Context(), d))
+				assert.Equal(t, 1, registeredReferAttempts(&d.sessionState), "the REFER's subscription is not held")
+
+				assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 100 Trying", tc.event, "active;expires=60"))
+				assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, tc.last, tc.event, tc.state))
+				assert.Zero(t, registeredReferAttempts(&d.sessionState), "the ended subscription is still held")
+				assert.Empty(t, reports)
+
+				assert.Equal(t, sip.StatusCallTransactionDoesNotExists, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", tc.event, terminated),
+					"a NOTIFY for a subscription that had ended was accepted")
+				assert.Equal(t, tc.want, got, "a NOTIFY after the subscription ended reached the callback")
+				assert.Len(t, reports, 1, "the NOTIFY after the subscription ended was not reported once")
+				assert.Zero(t, d.hangups.Load(), "a NOTIFY ended the dialog")
+			})
+		}
+	})
+
+	t.Run("NotifyAfterTheFinalOnAnEndedDialogIs481", func(t *testing.T) {
 		d := newReferObserveDialog(t, 202, "Accepted")
 		var got []int
 		d.onReferNotify = func(statusCode int) { got = append(got, statusCode) }
@@ -150,16 +189,42 @@ func TestDialogReferNotifyCallbackBesideAttempts(t *testing.T) {
 		d.OnReferNotifyUnmatched(func(n ReferNotify) { reports = append(reports, n) })
 
 		require.NoError(t, referWithoutObserver(t.Context(), d))
-		assert.Zero(t, registeredReferAttempts(&d.sessionState), "a REFER whose NOTIFYs the callback takes was given an attempt")
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", terminated))
+		d.sipDialog.InitWithState(sip.DialogStateEnded)
 
-		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 100 Trying", "refer", "active;expires=60"))
-		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer", terminated))
-		// The callback is the dialog's, not one REFER's: it also takes a NOTIFY
-		// that comes after the final one.
-		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer", terminated))
-		assert.Equal(t, []int{100, 486, 486}, got)
-		assert.Zero(t, d.hangups.Load(), "a NOTIFY the callback took ended the dialog")
-		assert.Empty(t, reports, "a NOTIFY the callback took was reported as unmatched")
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=1", terminated))
+		assert.Equal(t, []int{200}, got)
+		assert.Len(t, reports, 1)
+	})
+
+	t.Run("NotifyAfterTheFinalOfAnObservedAttemptIs481", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var got []int
+		d.onReferNotify = func(statusCode int) { got = append(got, statusCode) }
+		wait := notifyAfterRefer(t, d,
+			referNotifySpec{body: "SIP/2.0 486 Busy Here", event: "refer;id=1", state: terminated},
+		)
+
+		obs, _, err := observeRefer(t.Context(), d)
+		require.NoError(t, err)
+		assert.Equal(t, []int{sip.StatusOK}, wait())
+		assert.Equal(t, ReferEndFinalNotify, obs.End)
+
+		assert.Equal(t, sip.StatusCallTransactionDoesNotExists, sendReferNotify(t, d, "SIP/2.0 486 Busy Here", "refer;id=1", terminated))
+		assert.Equal(t, []int{486}, got, "a NOTIFY after the subscription ended reached the callback")
+	})
+
+	t.Run("NotifyForNoReferGoesToTheCallback", func(t *testing.T) {
+		d := newReferObserveDialog(t, 202, "Accepted")
+		var got []int
+		d.onReferNotify = func(statusCode int) { got = append(got, statusCode) }
+		var reports []ReferNotify
+		d.OnReferNotifyUnmatched(func(n ReferNotify) { reports = append(reports, n) })
+
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer;id=7", terminated))
+		assert.Equal(t, sip.StatusOK, sendReferNotify(t, d, "SIP/2.0 200 OK", "refer", terminated))
+		assert.Equal(t, []int{200, 200}, got)
+		assert.Empty(t, reports)
 	})
 
 	t.Run("an observed attempt records its NOTIFYs and the callback is told of them", func(t *testing.T) {

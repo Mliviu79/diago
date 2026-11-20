@@ -191,7 +191,10 @@ func parseReferNotify(req *sip.Request) (n ReferNotify, ok bool) {
 // when it has none.
 //
 // A NOTIFY belongs to a REFER d sent when an open REFER attempt of d holds it
-// or d has the callback, which takes every refer NOTIFY of the dialog. Such a
+// or d has the callback, which takes every refer NOTIFY of the dialog but one
+// for a subscription an earlier NOTIFY ended: after the NOTIFY with
+// Subscription-State terminated, or a final sipfrag status, the subscription
+// is over (RFC 6665 section 4.1.3; RFC 3515 section 2.4.5). Such a
 // NOTIFY is recorded on its attempt, if one holds it, and handed to
 // dialogHandleReferNotify, which answers it 200. After that 200 an attempt the
 // NOTIFY ended is retired (RFC 6665 section 4.4.1), and then the sipfrag
@@ -228,7 +231,7 @@ func dialogRouteReferNotify(ctx context.Context, d referDialog, req *sip.Request
 	}
 
 	attempt := s.recordReferNotify(n)
-	if attempt == nil && onReferNotify == nil {
+	if attempt == nil && (onReferNotify == nil || s.referNotifyAfterItsEnd(n)) {
 		tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Subscription Does Not Exist", nil))
 		s.reportUnmatchedReferNotify(n)
 		return

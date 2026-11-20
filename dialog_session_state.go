@@ -36,8 +36,8 @@ type sessionState struct {
 	// dialog is handed out and not changed after.
 	uncache func() error
 
-	// referMu guards referAttempts, referHighestCSeq, referLatest, the
-	// attempts they hold and onReferNotifyUnmatched. It is a lock of the
+	// referMu guards referAttempts, referHighestCSeq, referLatest,
+	// referEndedByNotify, the attempts they hold and onReferNotifyUnmatched. It is a lock of the
 	// session's own, so observing a REFER NOTIFY contends with nothing else of
 	// the call.
 	referMu sync.Mutex
@@ -53,6 +53,11 @@ type sessionState struct {
 	// retired, so a NOTIFY without an Event id is never given to an older
 	// attempt once a newer one has started.
 	referLatest *referAttempt
+	// referEndedByNotify are the retired attempts whose subscription a NOTIFY
+	// ended, so a NOTIFY that comes for one of them after that is answered
+	// 481 also on a dialog whose OnNotify callback takes every other refer
+	// NOTIFY (RFC 6665 section 4.1.3).
+	referEndedByNotify []*referAttempt
 	// onReferNotifyUnmatched is told of a refer NOTIFY no open attempt holds.
 	// Set by OnReferNotifyUnmatched.
 	onReferNotifyUnmatched func(ReferNotify)

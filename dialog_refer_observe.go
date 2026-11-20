@@ -365,15 +365,15 @@ func dialogReferWait(ctx context.Context, d referDialog, recipient sip.Uri, refe
 // dialogReferDo sends req, the REFER of a Refer or ReferOptions call, which
 // return once it is accepted and leave its outcome to the dialog.
 //
-// A dialog with the OnNotify callback of ReferOptions hands that callback
-// every refer NOTIFY, so its REFER is sent as it is. Without the callback
-// nobody observes the REFER, and an attempt is kept for it until a NOTIFY ends
-// its refer subscription (see referAttempt.unobserved): a NOTIFY is answered
-// 200 only for a REFER the dialog sent (RFC 6665 section 4.1.3), and it is
-// that attempt's final NOTIFY that hangs the call up.
+// An attempt is kept for the REFER until a NOTIFY ends its refer subscription
+// (see referAttempt.unobserved), so a NOTIFY after that one is answered 481
+// (RFC 6665 section 4.1.3). Without the OnNotify callback of ReferOptions a
+// NOTIFY is answered 200 only for a REFER the dialog sent, and it is that
+// attempt's final NOTIFY that hangs the call up; with the callback, the
+// callback takes the NOTIFYs.
 func dialogReferDo(ctx context.Context, d DialogSession, req *sip.Request) (*sip.Response, error) {
 	rd, ok := d.(referDialog)
-	if !ok || rd.referNotifyCallback() != nil {
+	if !ok {
 		return d.Do(ctx, req)
 	}
 

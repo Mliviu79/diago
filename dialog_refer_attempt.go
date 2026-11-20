@@ -26,13 +26,15 @@ import (
 // registered. An attempt nobody observes has no deadline, see unobserved.
 type referAttempt struct {
 	// unobserved is true for the attempt of a REFER nobody waits on: one Refer
-	// or ReferOptions sent while the dialog had no OnNotify callback. It holds
-	// the REFER's subscription so the NOTIFYs of that REFER are told from the
-	// NOTIFYs of none, and its final NOTIFY hangs the call up, which is what
-	// those two calls do with a transfer outcome nobody takes. They do so
-	// whenever that outcome comes, so such an attempt has no deadline: it ends
-	// on the NOTIFY that ends its subscription and on nothing else. Set before
-	// the attempt is registered and not changed after.
+	// or ReferOptions sent. It holds the REFER's subscription so the NOTIFYs of
+	// that REFER are told from the NOTIFYs of none, and from those that come
+	// after the one that ended it. On a dialog without the OnNotify callback
+	// its final NOTIFY hangs the call up, which is what those two calls do with
+	// a transfer outcome nobody takes; on one with the callback the callback
+	// takes its NOTIFYs. Either takes the outcome whenever it comes, so such an
+	// attempt has no deadline: it ends on the NOTIFY that ends its subscription
+	// and on nothing else. Set before the attempt is registered and not changed
+	// after.
 	unobserved bool
 	// cseq is the CSeq of the sent REFER. RFC 3515 makes the NOTIFY's Event id
 	// the CSeq of the REFER that created the subscription, so this is what an
@@ -67,6 +69,12 @@ type referAttempt struct {
 	// done is closed when the attempt is retired: ended on a NOTIFY, after the
 	// 200 to it has been sent, or at its deadline.
 	done chan struct{}
+}
+
+// endedByNotify reports whether e is an end a NOTIFY gave the attempt: a final
+// sipfrag status or a terminated subscription.
+func (e ReferEnd) endedByNotify() bool {
+	return e == ReferEndFinalNotify || e == ReferEndSubscriptionEnded
 }
 
 // beginReferAttempt registers a new REFER attempt as the most recent one and
@@ -217,18 +225,45 @@ func (s *sessionState) retireEndedReferAttempt(a *referAttempt) {
 
 // referNotifyExpected reports whether a NOTIFY carrying req's Event header has
 // a REFER sent on this dialog to go to: onNotify, the OnNotify callback of
-// ReferOptions, when the dialog has one, or an open attempt it is routed to.
+// ReferOptions, when the dialog has one and the NOTIFY is not for a
+// subscription a NOTIFY already ended, or an open attempt it is routed to.
 func (s *sessionState) referNotifyExpected(req *sip.Request, onNotify func(statusCode int)) bool {
-	if onNotify != nil {
-		return true
-	}
-
 	var n ReferNotify
 	n.EventID, n.HasEventID = parseReferNotifyEventID(req)
 	s.referMu.Lock()
 	defer s.referMu.Unlock()
+	if onNotify != nil {
+		return !s.referEndedByNotifyLocked(n)
+	}
 	a := s.referNotifyTargetLocked(n)
 	return a != nil && a.end == 0
+}
+
+// referNotifyAfterItsEnd reports whether n is for a REFER subscription that an
+// earlier NOTIFY ended: RFC 6665 section 4.1.3 has the subscriber consider the
+// subscription terminated at that NOTIFY, so n matches none.
+func (s *sessionState) referNotifyAfterItsEnd(n ReferNotify) bool {
+	s.referMu.Lock()
+	defer s.referMu.Unlock()
+	return s.referEndedByNotifyLocked(n)
+}
+
+// referEndedByNotifyLocked reports whether the attempt n belongs to, by the
+// rules of referNotifyTargetLocked applied to retired attempts as well, is one a
+// NOTIFY ended: still registered until that NOTIFY's 200 is out, or retired
+// after it. With an Event id it is the attempt whose known CSeq equals it;
+// without one it is the most recent attempt. Called with referMu held.
+func (s *sessionState) referEndedByNotifyLocked(n ReferNotify) bool {
+	if a := s.referNotifyTargetLocked(n); a != nil {
+		return a.end.endedByNotify()
+	}
+	if !n.HasEventID {
+		latest := s.referLatest
+		return latest != nil && latest.end.endedByNotify()
+	}
+	return slices.ContainsFunc(s.referEndedByNotify, func(a *referAttempt) bool {
+		return a.cseqKnown && a.cseq == n.EventID
+	})
 }
 
 // referNotifyTargetLocked returns the registered attempt n belongs to, or nil.
@@ -329,6 +364,9 @@ func (s *sessionState) retireReferAttemptLocked(a *referAttempt) {
 	}
 	a.registered = false
 	s.referAttempts = slices.DeleteFunc(s.referAttempts, func(r *referAttempt) bool { return r == a })
+	if a.end.endedByNotify() {
+		s.referEndedByNotify = append(s.referEndedByNotify, a)
+	}
 	close(a.done)
 }
 
@@ -342,7 +380,8 @@ func (s *sessionState) retireReferAttemptLocked(a *referAttempt) {
 // before; nil, the default, reports nothing.
 //
 // A dialog that carries the OnNotify callback of ReferOptions hands that
-// callback every refer NOTIFY, so none is unmatched on it.
+// callback every refer NOTIFY but one for a subscription a NOTIFY already
+// ended, so only such a NOTIFY is unmatched on it.
 //
 // Both DialogServerSession and DialogClientSession have this method.
 func (s *sessionState) OnReferNotifyUnmatched(f func(ReferNotify)) {
