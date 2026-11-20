@@ -105,7 +105,7 @@ func newRefreshPeer(t *testing.T, setup func(d *DialogServerSession)) *refreshPe
 	// The run outlives the test's own ctx, which ends before the cleanups run:
 	// the cleanup below has the peer answer the BYE that ends the call, while
 	// the request run waits for the handler that sends it.
-	require.NoError(t, serveBackground(t, dg, context.WithoutCancel(t.Context()), func(_ context.Context, d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, dg, context.WithoutCancel(t.Context()), func(serveCtx context.Context, d *DialogServerSession) {
 		defer close(p.handlerDone)
 		if setup != nil {
 			setup(d)
@@ -116,7 +116,11 @@ func newRefreshPeer(t *testing.T, setup func(d *DialogServerSession)) *refreshPe
 		}
 		p.media = med
 		p.dialogs <- d
+		// The handler ends with its run as well as with its dialog or the
+		// test's stop: a stop that never came would otherwise hold serving
+		// past the test.
 		select {
+		case <-serveCtx.Done():
 		case <-d.Context().Done():
 		case <-p.stop:
 			// The call ends here, so its BYE has its answer before the handler
