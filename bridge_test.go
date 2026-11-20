@@ -144,8 +144,11 @@ func TestIntegrationBridging(t *testing.T) {
 			hcancel()
 		}()
 
-		// This is beauty, as you can even easily detect who hangups
+		// This is beauty, as you can even easily detect who hangups. The
+		// handler ends with its run as well: a dialog whose BYE never arrived
+		// would otherwise hold serving past the test.
 		select {
+		case <-runCtx.Done():
 		case <-inCtx.Done():
 		case <-outCtx.Done():
 		}
@@ -169,7 +172,7 @@ func TestIntegrationBridging(t *testing.T) {
 			},
 		))
 
-		err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			ctx := d.Context()
 			med, err := d.Answer(AnswerOptions{})
 			if err != nil {
@@ -194,7 +197,12 @@ func TestIntegrationBridging(t *testing.T) {
 			}
 			echoed <- nil
 
-			<-ctx.Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-ctx.Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -296,7 +304,12 @@ func TestIntegrationBridgingMix(t *testing.T) {
 			}
 		}()
 
-		<-in.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-in.Context().Done():
+		}
 	})
 	assert.NoError(t, err)
 
