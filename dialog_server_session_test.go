@@ -72,6 +72,13 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 		dialog, med, err := dialer.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15010}, InviteOptions{
 			OnResponse: func(res *sip.Response) error {
 				log("Received resp", res.StatusCode)
+				// The server transaction sends 100 Trying on its own when the
+				// handler has not answered within 200 ms (RFC 3261 section
+				// 17.2.1), which a loaded machine can take. Only the responses
+				// the session sends are asserted.
+				if res.StatusCode == sip.StatusTrying {
+					return nil
+				}
 				allResponses = append(allResponses, *res.Clone())
 				return nil
 			},
@@ -122,9 +129,11 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// The calling side runs on its own goroutine, so its Invite error is
-	// handed to the test rather than asserted there.
+	// The calling side runs on its own goroutine. Its Invite error is handed
+	// to the test, and since it logs once the hangup ends its dialog, the test
+	// waits for it to end before it returns.
 	inviteErr := make(chan error, 1)
+	dialogDone := make(chan struct{})
 	log := asyncLog(t)
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
@@ -143,6 +152,7 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 		require.NoError(t, err)
 
 		go func() {
+			defer close(dialogDone)
 			dialog, _, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{})
 			inviteErr <- err
 			if err != nil {
@@ -190,6 +200,11 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	require.NoError(t, err)
 
 	d.Hangup(context.TODO())
+	select {
+	case <-dialogDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("calling side dialog did not end after hangup")
+	}
 }
 
 func TestIntegrationDialogServerHoldUnholdKeepsAudio(t *testing.T) {
