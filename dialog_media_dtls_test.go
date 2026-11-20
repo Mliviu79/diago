@@ -74,7 +74,7 @@ func newDTLSCall(t *testing.T, calleePort int, callerPort int) dtlsCall {
 	calleeUpdated := make(chan struct{}, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		med, err := d.AnswerOptions(t.Context(), AnswerOptions{OnMediaUpdate: func(*DialogMedia) {
 			select {
@@ -87,8 +87,11 @@ func newDTLSCall(t *testing.T, calleePort int, callerPort int) dtlsCall {
 			return
 		}
 		answered <- answeredCall{d: d, med: med}
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-release:
+		case <-serveCtx.Done():
 		case <-d.Context().Done():
 		}
 	}))
@@ -897,7 +900,7 @@ func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
 	answerErr := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{})
 		if err != nil {
@@ -909,8 +912,11 @@ func TestIntegrationDialogDTLSEarlyMediaAnswerKeepsSRTP(t *testing.T) {
 			return
 		}
 		answered <- med
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-release:
+		case <-serveCtx.Done():
 		case <-d.Context().Done():
 		}
 	}))
@@ -1177,7 +1183,7 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 	answered := make(chan answerResult, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		start := time.Now()
 		med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{KeyTimeout: time.Second})
@@ -1197,8 +1203,11 @@ func TestIntegrationDialogDTLSEarlyMediaIgnoredByCaller(t *testing.T) {
 		if r.err != nil {
 			return
 		}
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-release:
+		case <-serveCtx.Done():
 		case <-d.Context().Done():
 		}
 	}))
@@ -1282,15 +1291,19 @@ func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
 	answered := make(chan error, 1)
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	require.NoError(t, serveBackground(t, callee, ctx, func(_ context.Context, d *DialogServerSession) {
+	require.NoError(t, serveBackground(t, callee, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		defer close(handlerDone)
 		med, err := d.ProgressMedia(t.Context(), ProgressMediaOptions{KeyTimeout: 5 * time.Second})
 		progressed <- progressResult{med: med, err: err}
 		if err != nil {
 			return
 		}
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-answerNow:
+		case <-serveCtx.Done():
+			return
 		case <-d.Context().Done():
 			return
 		}
@@ -1299,8 +1312,11 @@ func TestIntegrationDialogDTLSEarlyMediaKeyedByCaller(t *testing.T) {
 		if err != nil {
 			return
 		}
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
 		select {
 		case <-release:
+		case <-serveCtx.Done():
 		case <-d.Context().Done():
 		}
 	}))
