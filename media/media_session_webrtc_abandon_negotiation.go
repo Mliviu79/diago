@@ -4,6 +4,7 @@ package media
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/pion/dtls/v3"
 )
@@ -26,8 +27,9 @@ import (
 // not leaves the ICE agent checking, as a Finalize that gave up leaves it,
 // and the DTLS conn it ended is replaced by a fresh one on the same transport
 // and with the same configuration, which the next Finalize runs a handshake
-// on. An answer with other ICE credentials needs an ICE restart, which
-// RemoteSDP refuses.
+// on, and the answer applied next is matched against every codec of the
+// offer, as the first answer was. An answer with other ICE credentials needs
+// an ICE restart, which RemoteSDP refuses.
 //
 // It must not be called beside a Finalize or a FinalizeWithin of the session.
 func (m *MediaSessionWebrtc) AbandonNegotiation() error {
@@ -39,6 +41,12 @@ func (m *MediaSessionWebrtc) AbandonNegotiation() error {
 	if m.closed || m.ready || m.dtlsConn == nil {
 		m.mu.Unlock()
 		return nil
+	}
+	if m.setupCodecs != nil {
+		// The answer that follows answers the same offer, which carried
+		// every codec the session was set up with, and not only those the
+		// ended answer kept (RFC 3264 section 6.1).
+		m.Codecs = slices.Clone(m.setupCodecs)
 	}
 	ended, endedTr := m.dtlsConn, m.dtlsTr
 	tr := m.dtlsTransport()
