@@ -96,8 +96,9 @@ type DialogMedia struct {
 	// session in place carries the media meanwhile.
 	stagedMediaSession *media.MediaSession
 	// mediaUpdating is set while an exchange waits, with mu released, for
-	// the handshake of a new DTLS association. No other exchange is taken
-	// meanwhile, see errMediaUpdateInProgress.
+	// the handshake of a new DTLS association, or for the end of a handshake
+	// another answer replaces (replaceEarlyAnswerUnsafe). No other exchange
+	// is taken meanwhile, see errMediaUpdateInProgress.
 	mediaUpdating bool
 	// discardErr is what closing a fork an abort discarded reported. The
 	// abort has nowhere to return it, so Close does.

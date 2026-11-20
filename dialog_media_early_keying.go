@@ -85,15 +85,30 @@ func (d *DialogMedia) setOnMediaUpdate(f func(*DialogMedia)) {
 // another early dialog of the offer, whose 2xx confirms it (RFC 3261 sections
 // 12.1 and 13.2.1). That handshake is ended first, as nothing else may use
 // the media session while it runs, and a fork of the session, on the sockets
-// the offer named, takes remoteSDP. The fork is put in the session's place at
-// once: nothing carries media meanwhile, and onFinalize keys it and sets it
+// the offer named, takes remoteSDP. The fork is put in the session's place
+// once the handshake has returned, so nothing of it runs beside the fork:
+// nothing carries media meanwhile, and onFinalize keys the fork and sets it
 // up, as it does the session it replaces. A fork that refuses remoteSDP is
-// dropped and leaves the session with no handshake to complete. Must be
-// called with d.mu held.
+// dropped and leaves the session with no handshake to complete.
+//
+// Must be called with d.mu held. The lock is released while the handshake is
+// ended and joined, which waits for its goroutine, and mediaUpdating keeps
+// other exchanges out meanwhile. Media closed meanwhile is left as Close left
+// it, with errMediaClosed.
 func (d *DialogMedia) replaceEarlyAnswerUnsafe(remoteSDP []byte) error {
 	replaced := d.mediaSession
-	if err := replaced.AbandonNegotiation(); err != nil {
-		return err
+	d.mediaUpdating = true
+	d.mu.Unlock()
+	abandonErr := replaced.AbandonNegotiation()
+	d.mu.Lock()
+	d.mediaUpdating = false
+
+	if d.closed {
+		// Close has closed the sockets the fork would run on.
+		return errors.Join(errMediaClosed, abandonErr)
+	}
+	if abandonErr != nil {
+		return abandonErr
 	}
 	msess := replaced.Fork()
 	if err := msess.RemoteSDP(remoteSDP, true); err != nil {

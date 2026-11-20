@@ -21,7 +21,9 @@ package media
 // transport retired: a handshake that loses a flight to it sends it again
 // (RFC 6347 section 4.2.4).
 //
-// It must not be called beside any other use of the session.
+// It must not be called beside any other use of the session but Close, which
+// may run beside it: both wait for the handshake to return, and Close touches
+// nothing of the session but that wait and the sockets.
 func (s *MediaSession) AbandonNegotiation() error {
 	s.leftRunning.stop()
 	s.onFinalize = nil
