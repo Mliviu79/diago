@@ -325,7 +325,7 @@ func TestIntegrationDialogReferWithoutObserver(t *testing.T) {
 				ID:        "udp",
 			},
 		))
-		require.NoError(t, serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+		require.NoError(t, serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 			d.Answer(AnswerOptions{
 				OnRefer: func(referDialog *DialogClientSession) error {
 					if _, err := referDialog.Invite(referDialog.Context(), InviteClientOptions{}); err != nil {
@@ -337,7 +337,12 @@ func TestIntegrationDialogReferWithoutObserver(t *testing.T) {
 					return referDialog.Hangup(ctx)
 				},
 			})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-serveCtx.Done():
+			case <-d.Context().Done():
+			}
 			transfereeEnded <- struct{}{}
 		}))
 	}
@@ -360,7 +365,12 @@ func TestIntegrationDialogReferWithoutObserver(t *testing.T) {
 				return
 			}
 			d.Answer(AnswerOptions{})
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-ctx.Done():
+			case <-d.Context().Done():
+			}
 		}))
 	}
 
