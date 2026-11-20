@@ -201,11 +201,8 @@ type sessionTimerOffer struct {
 // INVITE over.
 // ok is false when the peer sent no Session-Expires at all (timer-unaware).
 func parseSessionTimerOffer(msg headerGetter) (offer sessionTimerOffer, ok bool) {
+	// sipgo's lookup also finds the compact form x (RFC 4028 section 4).
 	h := msg.GetHeader("Session-Expires")
-	if h == nil {
-		// Compact form of Session-Expires per RFC 4028 §4.
-		h = msg.GetHeader("x")
-	}
 	if h == nil {
 		return sessionTimerOffer{}, false
 	}
