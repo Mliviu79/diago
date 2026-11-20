@@ -290,8 +290,10 @@ func (d *DialogClientSession) doInvite(ctx context.Context, sd []byte) error {
 	inviteReq.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	inviteReq.SetBody(sd)
 
-	// We allow changing full from header, but we need to make sure it is correctly set
-	if fromHDR := inviteReq.From(); fromHDR != nil {
+	// We allow changing full from header, but we need to make sure it is correctly set.
+	// A tag the caller set is kept: the caller may have keyed the dialog by it
+	// before the INVITE goes out (RFC 3261 section 8.1.1.3 lets the UAC pick it).
+	if fromHDR := inviteReq.From(); fromHDR != nil && !fromHDR.Params.Has("tag") {
 		fromHDR.Params.Add("tag", sip.GenerateTagN(16))
 	}
 
