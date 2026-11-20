@@ -57,10 +57,15 @@ func TestIntegrationDialogServerEarlyMedia(t *testing.T) {
 
 	log := asyncLog(t)
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	require.NoError(t, err)
 
@@ -175,10 +180,15 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	))
 
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	require.NoError(t, err)
 	var d *DialogServerSession
@@ -306,7 +316,7 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 		err    error
 	}
 	answerCh := make(chan answerResult, 1)
-	err := serveBackground(t, uas, ctx, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, uas, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		// This is the reported role: the peer sends the initial INVITE and
 		// Diago answers it as the UAS. RTP NAT must not change the SIP flow.
 		med, err := d.Answer(AnswerOptions{
@@ -325,7 +335,12 @@ func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 		go func() {
 			_, _ = reader.Read(make([]byte, 160))
 		}()
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	require.NoError(t, err)
 	require.NotZero(t, uas.transports[0].BindPort)
@@ -480,7 +495,12 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 				_, _ = d.Answer(AnswerOptions{})
 			}
 
-			<-d.Context().Done()
+			// The handler ends with its run as well as with its dialog: a dialog
+			// whose BYE never arrived would otherwise hold serving past the test.
+			select {
+			case <-ctx.Done():
+			case <-d.Context().Done():
+			}
 		})
 		require.NoError(t, err)
 	}
@@ -498,10 +518,15 @@ func TestIntegrationDialogServerRefer(t *testing.T) {
 
 	log := asyncLog(t)
 	waitDialog := make(chan *DialogServerSession, 1)
-	err := serveBackground(t, dg, ctx, func(_ context.Context, d *DialogServerSession) {
+	err := serveBackground(t, dg, ctx, func(serveCtx context.Context, d *DialogServerSession) {
 		log("Call received")
 		waitDialog <- d
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	require.NoError(t, err)
 
