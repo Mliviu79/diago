@@ -139,7 +139,12 @@ func newReferPeerCallingUs(t *testing.T) *referPeer {
 			return
 		}
 		dialogs <- answered{d: d, med: med}
-		<-hold
+		// The handler ends with its run as well as with the test's release:
+		// a release that never came would otherwise hold serving past the test.
+		select {
+		case <-ctx.Done():
+		case <-hold:
+		}
 		// The request run waits for this handler, so the call is ended here
 		// and not after the handler returns, while the peer still answers.
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
