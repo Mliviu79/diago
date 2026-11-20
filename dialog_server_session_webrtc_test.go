@@ -49,7 +49,7 @@ func TestIntegrationDialogWebrtcICEControlsBidirectionalRTP(t *testing.T) {
 	serverMedia := make(chan *DialogWebrtc, 1)
 	serverErr := make(chan error, 1)
 	serverConnected := make(chan struct{}, 1)
-	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(serveCtx context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{
 			WebrtcConfig: webRTCConfig,
 			OnICEStateChange: func(state ice.ConnectionState) {
@@ -66,7 +66,12 @@ func TestIntegrationDialogWebrtcICEControlsBidirectionalRTP(t *testing.T) {
 			return
 		}
 		serverMedia <- med
-		<-dialog.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-dialog.Context().Done():
+		}
 	}))
 	require.NotZero(t, server.transports[0].BindPort)
 
@@ -185,14 +190,19 @@ func TestIntegrationDialogWebrtcServerReInviteKeepsMediaWrappers(t *testing.T) {
 	}
 	serverCallReady := make(chan serverCall, 1)
 	serverErr := make(chan error, 1)
-	require.NoError(t, serveBackground(t, server, ctx, func(_ context.Context, dialog *DialogServerSession) {
+	require.NoError(t, serveBackground(t, server, ctx, func(serveCtx context.Context, dialog *DialogServerSession) {
 		med, answerErr := dialog.AnswerWebrtc(AnswerWebrtcOptions{WebrtcConfig: webRTCConfig})
 		if answerErr != nil {
 			serverErr <- answerErr
 			return
 		}
 		serverCallReady <- serverCall{dialog: dialog, media: med}
-		<-dialog.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-dialog.Context().Done():
+		}
 	}))
 
 	clientUA, err := sipgo.NewUA(sipgo.WithUserAgent("webrtc-client-reinvite-peer"))
