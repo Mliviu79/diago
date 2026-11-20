@@ -219,14 +219,19 @@ func TestIntegrationDialogWebrtcInPlaceReInvites(t *testing.T) {
 	}
 	calls := make(chan serverCall, 1)
 	answerErr := make(chan error, 1)
-	dialog := newWebrtcCallPair(t, func(_ context.Context, d *DialogServerSession) {
+	dialog := newWebrtcCallPair(t, func(serveCtx context.Context, d *DialogServerSession) {
 		med, err := d.AnswerWebrtc(AnswerWebrtcOptions{WebrtcConfig: loopbackWebrtcConfig()})
 		if err != nil {
 			answerErr <- err
 			return
 		}
 		calls <- serverCall{dialog: d, media: med}
-		<-d.Context().Done()
+		// The handler ends with its run as well as with its dialog: a dialog
+		// whose BYE never arrived would otherwise hold serving past the test.
+		select {
+		case <-serveCtx.Done():
+		case <-d.Context().Done():
+		}
 	})
 	callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer callCancel()
