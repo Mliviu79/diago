@@ -95,3 +95,23 @@ func TestDialogMediaLaterExchangeForks(t *testing.T) {
 	assert.NotSame(t, sess, med.MediaSession(), "an update replaces the media session")
 	assert.Equal(t, 1, updates)
 }
+
+// TestDialogMediaFirstExchangeClosedBeforeCommit pins that media closed
+// between the exchange that set up its RTP session and the commit starts no
+// RTCP monitor: the commit reports the media closed, and the monitor of the
+// RTP session Close stopped is never started.
+func TestDialogMediaFirstExchangeClosedBeforeCommit(t *testing.T) {
+	med := newUnnegotiatedDialogMedia(t)
+	peer := newMediaSessionForTest(t)
+
+	require.NoError(t, med.onRemoteSDP(t.Context(), peer.LocalSDP(false), false))
+	_, err := med.onLocalSDP(t.Context(), true, "")
+	require.NoError(t, err)
+	rtpSess := med.RTPSession()
+	require.NotNil(t, rtpSess)
+
+	require.NoError(t, med.Close())
+	require.ErrorIs(t, med.onFinalize(t.Context()), errMediaClosed)
+	require.NoError(t, med.onFinalize(t.Context()), "a later commit has nothing left to start")
+	assert.Error(t, rtpSess.MonitorBackground(), "the RTP session stays closed to a monitor")
+}

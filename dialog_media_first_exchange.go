@@ -77,13 +77,21 @@ func (d *DialogMedia) stageFirstRTPSessionUnsafe() {
 // exchange made through the handshaker set up, once: a later call, and a call
 // on media set up any other way, starts nothing. It needs the remote
 // description, so it runs once both the offer and the answer are in.
+//
+// Closed media starts nothing and reports errMediaClosed. The monitor is
+// started under the lock Close takes, so a Close either finds it running and
+// stops it, or has run before and leaves nothing to start: MonitorBackground
+// only starts the monitor's goroutines and does not wait for them.
 func (d *DialogMedia) startFirstExchange() error {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	rtpSess := d.unstartedRTPSession
 	d.unstartedRTPSession = nil
-	d.mu.Unlock()
 	if rtpSess == nil {
 		return nil
+	}
+	if d.closed {
+		return errMediaClosed
 	}
 	return rtpSess.MonitorBackground()
 }
