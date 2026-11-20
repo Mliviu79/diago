@@ -1289,9 +1289,11 @@ var (
 )
 
 // observedReferCall is one answered call whose dialog refers the far end, with
-// the Contact each side put on the INVITE transaction.
+// our address-of-record in the dialog and the Contact each side put on the
+// INVITE transaction.
 type observedReferCall struct {
 	dialog        observingReferrer
+	ourAOR        sip.Uri
 	ourContact    sip.Uri
 	farEndContact sip.Uri
 }
@@ -1397,7 +1399,7 @@ func requireNoIntOnlyNotifyCallback(t *testing.T, d referDialog) {
 // each session type as the referrer. A refused transfer and an outcome held for
 // a while both leave the referring dialog confirmed, the held outcome is applied
 // whenever the subscription delivers it, and the Referred-By the transferee
-// receives names our Contact.
+// receives names our address-of-record (RFC 3892 section 2).
 func TestIntegrationDialogReferAndObserve(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -1479,6 +1481,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 			})
 			return observedReferCall{
 				dialog:        d,
+				ourAOR:        d.InviteRequest.From().Address,
 				ourContact:    d.InviteRequest.Contact().Address,
 				farEndContact: d.InviteResponse.Contact().Address,
 			}
@@ -1565,6 +1568,7 @@ func TestIntegrationDialogReferAndObserve(t *testing.T) {
 			}
 			return observedReferCall{
 				dialog:        d,
+				ourAOR:        d.InviteRequest.To().Address,
 				ourContact:    d.InviteResponse.Contact().Address,
 				farEndContact: d.InviteRequest.Contact().Address,
 			}
@@ -1687,7 +1691,7 @@ func runObservedReferCases(t *testing.T, dial func(t *testing.T) observedReferCa
 		assert.Equal(t, obs.Response, got[0])
 	})
 
-	t.Run("Referred-By names our own contact", func(t *testing.T) {
+	t.Run("referred_by_names_our_address_of_record", func(t *testing.T) {
 		call := dial(t)
 
 		answering := target
@@ -1706,11 +1710,9 @@ func runObservedReferCases(t *testing.T, dial func(t *testing.T) observedReferCa
 		_, err = sip.ParseAddressValue(value, &referrer, &params)
 		require.NoError(t, err)
 
-		assert.Equal(t, call.ourContact.User, referrer.User)
-		assert.Equal(t, call.ourContact.Host, referrer.Host)
-		assert.Equal(t, call.ourContact.Port, referrer.Port)
-		farEnd := call.farEndContact
-		assert.False(t, referrer.User == farEnd.User && referrer.Host == farEnd.Host && referrer.Port == farEnd.Port,
-			"Referred-By names the far end %s", farEnd.String())
+		assert.Equal(t, call.ourAOR.String(), referrer.String(), "Referred-By is our address-of-record")
+		assert.Equal(t, 0, params.Length(), "Referred-By carries no header parameters, got %q", value)
+		assert.NotEqual(t, call.ourContact.String(), referrer.String(), "Referred-By names our Contact")
+		assert.NotEqual(t, call.farEndContact.String(), referrer.String(), "Referred-By names the far end")
 	})
 }

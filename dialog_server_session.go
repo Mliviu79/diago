@@ -603,6 +603,10 @@ type ReferServerOptions struct {
 	OnNotify func(statusCode int)
 }
 
+// ReferOptions sends a blind REFER for referTo, as Refer does, with the
+// headers and NOTIFY callback of opts. Referred-By names this side: our
+// address-of-record, the URI of the To we answered the INVITE with (RFC 3892
+// section 2); a Referred-By among the headers replaces it.
 func (d *DialogServerSession) ReferOptions(ctx context.Context, referTo sip.Uri, opts ReferServerOptions) error {
 	cont := d.RemoteContact()
 	d.dialogCallbacks.mu.Lock()
@@ -610,7 +614,11 @@ func (d *DialogServerSession) ReferOptions(ctx context.Context, referTo sip.Uri,
 		d.onReferNotify = opts.OnNotify
 	}
 	d.dialogCallbacks.mu.Unlock()
-	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.Headers...)
+	referredBy, err := d.referrerAOR()
+	if err != nil {
+		return err
+	}
+	return dialogRefer(ctx, d, cont.Address, referTo, referredBy, opts.Headers...)
 }
 
 func (d *DialogServerSession) handleReferNotify(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {

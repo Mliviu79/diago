@@ -408,8 +408,11 @@ func referAccepted(status int) bool {
 // Unlike Refer it never ends the dialog, so what follows the outcome is the
 // caller's decision, and it installs no callback on the dialog.
 func (d *DialogClientSession) ReferAndWait(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
-	// Referred-By carries the URI ReferOptions puts there.
-	return dialogReferWait(ctx, d, d.remoteTarget(), referTo, d.ackTarget(), headers...)
+	referredBy, err := d.referrerAOR()
+	if err != nil {
+		return err
+	}
+	return dialogReferWait(ctx, d, d.remoteTarget(), referTo, referredBy, headers...)
 }
 
 // ReferAndWait sends a blind REFER for referTo, as Refer does, and blocks until
@@ -422,7 +425,11 @@ func (d *DialogClientSession) ReferAndWait(ctx context.Context, referTo sip.Uri,
 // caller's decision, and it installs no callback on the dialog.
 func (d *DialogServerSession) ReferAndWait(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
 	cont := d.RemoteContact()
-	return dialogReferWait(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, headers...)
+	referredBy, err := d.referrerAOR()
+	if err != nil {
+		return err
+	}
+	return dialogReferWait(ctx, d, cont.Address, referTo, referredBy, headers...)
 }
 
 // ReferAndObserve sends a blind REFER for referTo and returns what the far end
@@ -432,15 +439,16 @@ func (d *DialogServerSession) ReferAndWait(ctx context.Context, referTo sip.Uri,
 // past a BYE on the dialog, or until ctx ends; a NOTIFY after that is answered 481
 // and reported through OnReferNotifyUnmatched. Neither this method nor any NOTIFY
 // of its attempt ends the dialog, so what follows the outcome is the caller's
-// decision. Referred-By names this side: the Contact of the INVITE we sent. It
-// installs no callback on the dialog, so it does not change what a later Refer or
-// ReferOptions call reports.
+// decision. Referred-By names this side: our address-of-record, the URI of the
+// From of the INVITE we sent (RFC 3892 section 2). It installs no callback on
+// the dialog, so it does not change what a later Refer or ReferOptions call
+// reports.
 func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {
-	ourContact := d.InviteRequest.Contact()
-	if ourContact == nil {
-		return ReferObservation{}, fmt.Errorf("refer: dialog has no local contact")
+	referredBy, err := d.referrerAOR()
+	if err != nil {
+		return ReferObservation{}, err
 	}
-	obs, _, err := dialogReferObserve(ctx, d, d.remoteTarget(), referTo, ourContact.Address, opts)
+	obs, _, err := dialogReferObserve(ctx, d, d.remoteTarget(), referTo, referredBy, opts)
 	return obs, err
 }
 
@@ -451,18 +459,19 @@ func (d *DialogClientSession) ReferAndObserve(ctx context.Context, referTo sip.U
 // past a BYE on the dialog, or until ctx ends; a NOTIFY after that is answered 481
 // and reported through OnReferNotifyUnmatched. Neither this method nor any NOTIFY
 // of its attempt ends the dialog, so what follows the outcome is the caller's
-// decision. Referred-By names this side: the Contact of the 200 OK we answered
-// with. It installs no callback on the dialog, so it does not change what a later
-// Refer or ReferOptions call reports.
+// decision. Referred-By names this side: our address-of-record, the URI of the
+// To we answered the INVITE with (RFC 3892 section 2). It installs no callback
+// on the dialog, so it does not change what a later Refer or ReferOptions call
+// reports.
 func (d *DialogServerSession) ReferAndObserve(ctx context.Context, referTo sip.Uri, opts ReferObserveOptions) (ReferObservation, error) {
 	recipient := d.RemoteContact()
-	ourContact := d.InviteResponse.Contact()
 	if recipient == nil {
 		return ReferObservation{}, fmt.Errorf("refer: dialog has no remote contact")
 	}
-	if ourContact == nil {
-		return ReferObservation{}, fmt.Errorf("refer: dialog has no local contact")
+	referredBy, err := d.referrerAOR()
+	if err != nil {
+		return ReferObservation{}, err
 	}
-	obs, _, err := dialogReferObserve(ctx, d, recipient.Address, referTo, ourContact.Address, opts)
+	obs, _, err := dialogReferObserve(ctx, d, recipient.Address, referTo, referredBy, opts)
 	return obs, err
 }
