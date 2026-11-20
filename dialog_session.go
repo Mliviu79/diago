@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -208,6 +209,19 @@ func dialogReferInvite(d DialogSession, dg *Diago, referToUri sip.Uri, remoteTar
 		return nil
 	}
 
+	// The NOTIFY with Subscription-State terminated ends the subscription, and
+	// the notifier sends none after it (RFC 6665 section 4.1.3; RFC 3515
+	// section 2.4.5), so whichever path reaches the final NOTIFY first sends
+	// it and every later one sends nothing: the refer dialog ending after it
+	// was confirmed in particular.
+	var finalSent atomic.Bool
+	sendFinalNotify := func(ctx context.Context, statusCode int, reason string, sub subState) error {
+		if !finalSent.CompareAndSwap(false, true) {
+			return nil
+		}
+		return sendNotify(ctx, statusCode, reason, sub)
+	}
+
 	ctx := d.Context()
 
 	// TODO  Mutliple Refers require IDs in NOTIFY event header
@@ -242,7 +256,7 @@ func dialogReferInvite(d DialogSession, dg *Diago, referToUri sip.Uri, remoteTar
 	//    request).
 	referDialog.OnState(func(s sip.DialogState) {
 		if s == sip.DialogStateConfirmed || s == sip.DialogStateEnded {
-			if err := sendNotify(ctx, 200, "OK", subState{
+			if err := sendFinalNotify(ctx, 200, "OK", subState{
 				state:  "terminated",
 				reason: "noresource",
 			}); err != nil {
@@ -262,7 +276,7 @@ func dialogReferInvite(d DialogSession, dg *Diago, referToUri sip.Uri, remoteTar
 		dg.log.Info("OnReferDialog handling failed with", "error", err)
 		var resErr *sipgo.ErrDialogResponse
 		if errors.As(err, &resErr) {
-			return sendNotify(ctx, resErr.Res.StatusCode, resErr.Res.Reason, subState{
+			return sendFinalNotify(ctx, resErr.Res.StatusCode, resErr.Res.Reason, subState{
 				state:  "terminated",
 				reason: "noresource",
 			})
@@ -271,7 +285,7 @@ func dialogReferInvite(d DialogSession, dg *Diago, referToUri sip.Uri, remoteTar
 		// If call failed to be established but not yet confirmed
 		state := referDialog.LoadState()
 		if state == 0 || state == sip.DialogStateEstablished {
-			return sendNotify(ctx, 400, "Bad Request", subState{
+			return sendFinalNotify(ctx, 400, "Bad Request", subState{
 				state:  "terminated",
 				reason: "noresource",
 			})
